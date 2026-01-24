@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Simple A* Step by Step</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin-top: 20px;
+    }
+    #grid {
+      display: grid;
+      grid-template-columns: repeat(5, 40px);
+      grid-template-rows: repeat(5, 40px);
+      gap: 4px;
+      margin-bottom: 10px;
+    }
+    .cell {
+      width: 40px;
+      height: 40px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    .start { background: #4caf50; }   /* 起点 */
+    .goal { background: #f44336; }    /* 终点 */
+    .open { background: #8bc34a; }    /* open list */
+    .closed { background: #9e9e9e; }  /* closed list */
+    .path { background: #ffeb3b; }    /* 最终路径 */
+    .current { outline: 2px solid #000; } /* 当前节点 */
+  </style>
+</head>
+<body>
+  <h3>Simple A* (5x5, step by step)</h3>
+  <div id="grid"></div>
+  <div style="margin-bottom:8px;">
+    <button id="initBtn">重新开始</button>
+    <button id="stepBtn">下一步</button>
+  </div>
+  <div id="info" style="margin-top:10px;"></div>
+
+  <script>
+    const SIZE = 5;
+    const goalX = 4, goalY = 4;
+    const gridEl = document.getElementById("grid");
+    const infoEl = document.getElementById("info");
+    const initBtn = document.getElementById("initBtn");
+    const stepBtn = document.getElementById("stepBtn");
+
+    // 创建 5x5 网格
+    const cells = [];
+    for (let y = 0; y < SIZE; y++) {
+      cells[y] = [];
+      for (let x = 0; x < SIZE; x++) {
+        const div = document.createElement("div");
+        div.className = "cell";
+        gridEl.appendChild(div);
+        cells[y][x] = div;
+      }
+    }
+
+    function clearClasses() {
+      for (let y = 0; y < SIZE; y++) {
+        for (let x = 0; x < SIZE; x++) {
+          cells[y][x].className = "cell";
+        }
+      }
+    }
+
+    function heuristic(x, y, gx, gy) {
+      return Math.abs(x - gx) + Math.abs(y - gy);
+    }
+
+    function inBounds(x, y) {
+      return x >= 0 && x < SIZE && y >= 0 && y < SIZE;
+    }
+
+    function getLowestF(list) {
+      let best = list[0];
+      for (const n of list) {
+        if (n.g + n.h < best.g + best.h) best = n;
+      }
+      return best;
+    }
+
+    function getFromList(list, x, y) {
+      return list.find(n => n.x === x && n.y === y);
+    }
+
+    function buildPath(node) {
+      const path = [];
+      for (let n = node; n; n = n.parent) {
+        path.push({ x: n.x, y: n.y });
+      }
+      return path.reverse();
+    }
+
+    // 返回所有步骤
+    function aStarSteps() {
+      class Node {
+        constructor(x, y, g, h, parent) {
+          this.x = x;
+          this.y = y;
+          this.g = g;
+          this.h = h;
+          this.parent = parent;
+        }
+      }
+
+      const steps = [];
+      const start = new Node(0, 0, 0, heuristic(0, 0, goalX, goalY), null);
+      const open = [start];
+      const closed = [];
+
+      while (open.length > 0) {
+        const current = getLowestF(open);
+        open.splice(open.indexOf(current), 1);
+        closed.push(current);
+
+        steps.push({
+          current: { x: current.x, y: current.y },
+          open: open.map(n => ({ x: n.x, y: n.y })),
+          closed: closed.map(n => ({ x: n.x, y: n.y })),
+          path: null
+        });
+
+        if (current.x === goalX && current.y === goalY) {
+          const path = buildPath(current);
+          steps.push({
+            current: { x: current.x, y: current.y },
+            open: open.map(n => ({ x: n.x, y: n.y })),
+            closed: closed.map(n => ({ x: n.x, y: n.y })),
+            path: path
+          });
+          break;
+        }
+
+        const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+        for (const [dx, dy] of dirs) {
+          const nx = current.x + dx;
+          const ny = current.y + dy;
+          if (!inBounds(nx, ny)) continue;
+          if (getFromList(closed, nx, ny)) continue;
+
+          const ng = current.g + 1;
+          let neighbor = getFromList(open, nx, ny);
+          if (!neighbor) {
+            neighbor = new Node(nx, ny, ng, heuristic(nx, ny, goalX, goalY), current);
+            open.push(neighbor);
+          } else if (ng < neighbor.g) {
+            neighbor.g = ng;
+            neighbor.parent = current;
+          }
+        }
+      }
+      return steps;
+    }
+
+    function renderStep(step, index, total) {
+      clearClasses();
+
+      cells[0][0].classList.add("start");
+      cells[goalY][goalX].classList.add("goal");
+
+      for (const c of step.closed) {
+        cells[c.y][c.x].classList.add("closed");
+      }
+      for (const o of step.open) {
+        cells[o.y][o.x].classList.add("open");
+      }
+      if (step.path) {
+        for (const p of step.path) {
+          cells[p.y][p.x].classList.add("path");
+        }
+      }
+      if (step.current) {
+        cells[step.current.y][step.current.x].classList.add("current");
+      }
+
+      const openStr = step.open.map(p => `(${p.x},${p.y})`).join(" ");
+      const closedStr = step.closed.map(p => `(${p.x},${p.y})`).join(" ");
+      infoEl.textContent =
+        `Step ${index + 1} / ${total} | Open: [${openStr}] | Closed: [${closedStr}]`;
+    }
+
+    // 单步执行相关状态
+    let steps = [];
+    let stepIndex = 0;
+
+    // 重新开始：重新计算 steps，并显示第 1 步
+    initBtn.onclick = () => {
+      steps = aStarSteps();
+      stepIndex = 0;
+      if (steps.length > 0) {
+        renderStep(steps[0], 0, steps.length);
+        stepIndex = 1;
+      }
+    };
+
+    // 下一步：每点一下前进一步
+    stepBtn.onclick = () => {
+      if (steps.length === 0) {
+        infoEl.textContent = "请先点击“重新开始”。";
+        return;
+      }
+      if (stepIndex >= steps.length) {
+        infoEl.textContent = "已经到最后一步了，可以点击“重新开始”再来一次。";
+        return;
+      }
+      renderStep(steps[stepIndex], stepIndex, steps.length);
+      stepIndex++;
+    };
+  </script>
+</body>
+</html>
