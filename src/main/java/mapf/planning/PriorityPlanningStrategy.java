@@ -229,11 +229,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // NEW: Try clearing blocking agents before giving up
                     boolean clearedPath = false;
                     if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING) {
+                        int planSizeBefore = fullPlan.size();
                         clearedPath = tryIdleAgentClearing(fullPlan, currentState, level, 
                                 numAgents, unsatisfied);
                         if (clearedPath) {
-                            Action[] lastAction = fullPlan.get(fullPlan.size() - 1);
-                            currentState = applyJointAction(lastAction, currentState, level, numAgents);
+                            // Apply all new actions to update currentState
+                            for (int i = planSizeBefore; i < fullPlan.size(); i++) {
+                                currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
+                            }
                             stuckCount = 0;
                             System.err.println(getName() + ": Cleared blocking agent path");
                         }
@@ -615,11 +618,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /**
      * Estimates total cost for an agent using true distance heuristic.
+     * Includes both box goals and agent position goals.
      */
     private int estimateAgentCost(int agentId, State state, Level level) {
         int cost = 0;
         Color agentColor = level.getAgentColor(agentId);
         
+        // Calculate box goal costs
         for (Map.Entry<Position, Character> box : state.getBoxes().entrySet()) {
             char boxType = box.getValue();
             if (level.getBoxColor(boxType) == agentColor) {
@@ -649,6 +654,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 
                 if (minDist < Integer.MAX_VALUE) {
                     cost += minDist;
+                }
+            }
+        }
+        
+        // Calculate agent position goal cost (if any)
+        Position agentPos = state.getAgentPosition(agentId);
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                if (level.getAgentGoal(row, col) == agentId) {
+                    Position goalPos = new Position(row, col);
+                    if (!agentPos.equals(goalPos)) {
+                        cost += getDistance(agentPos, goalPos, level);
+                    }
+                    break;
                 }
             }
         }
@@ -1116,9 +1135,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             Arrays.fill(jointAction, Action.noOp());
             jointAction[blockingAgentId] = action;
             
-            // Let other completed agents also move if beneficial
-            jointAction = addOtherAgentMoves(jointAction, workingState, level, 
-                    numAgents, blockingAgentId, forbiddenPositions);
+            // Note: Don't let other agents move during clearing to avoid conflicts
+            // The clearing path was planned based on initial state, so adding other
+            // agent moves could invalidate the path
             
             jointAction = resolveConflicts(jointAction, workingState, level);
             plan.add(jointAction);
@@ -1265,6 +1284,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /**
      * Adds moves for other completed agents that can help clear the path.
+     * Only moves agents that have completed box tasks but are blocking critical paths.
      */
     private Action[] addOtherAgentMoves(Action[] jointAction, State state, Level level,
                                          int numAgents, int primaryAgent, 
@@ -1273,7 +1293,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (agentId == primaryAgent) continue;
             if (jointAction[agentId].type != Action.ActionType.NOOP) continue;
             
-            // Only move completed agents
+            // Skip if agent has completed ALL goals (no need to move at all)
+            if (isAgentGoalSatisfied(agentId, state, level)) continue;
+            
+            // Only move agents that have completed their box tasks
             if (!hasCompletedBoxTasks(agentId, state, level)) continue;
             
             Position agentPos = state.getAgentPosition(agentId);
