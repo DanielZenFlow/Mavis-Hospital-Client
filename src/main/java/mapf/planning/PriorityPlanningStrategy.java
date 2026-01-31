@@ -121,15 +121,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     break;
                 }
                 
-                // Find the best box to move to this goal
-                Position boxToMove = findBestBoxForGoal(subgoal, currentState, level);
-                if (boxToMove == null) {
-                    continue;
-                }
+                List<Action> path = null;
                 
-                // Search for a path to move this box to the goal
-                List<Action> path = searchForSubgoal(subgoal.agentId, boxToMove, 
-                        subgoal.goalPos, subgoal.boxType, currentState, level);
+                if (subgoal.isAgentGoal) {
+                    // Agent goal: move agent to target position
+                    path = searchForAgentGoal(subgoal.agentId, subgoal.goalPos, currentState, level);
+                } else {
+                    // Box goal: find box and move to goal
+                    Position boxToMove = findBestBoxForGoal(subgoal, currentState, level);
+                    if (boxToMove == null) {
+                        continue;
+                    }
+                    path = searchForSubgoal(subgoal.agentId, boxToMove, 
+                            subgoal.goalPos, subgoal.boxType, currentState, level);
+                }
                 
                 if (path != null && !path.isEmpty()) {
                     // IMPROVEMENT 3: Plan Merging - let other agents act too (slides06)
@@ -148,8 +153,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     
                     madeProgress = true;
                     stuckCount = 0;
-                    System.err.println(getName() + ": Agent " + subgoal.agentId + 
-                            " moved box " + subgoal.boxType + " (path: " + path.size() + " steps)");
+                    if (subgoal.isAgentGoal) {
+                        System.err.println(getName() + ": Agent " + subgoal.agentId + 
+                                " moved to goal position " + subgoal.goalPos + " (path: " + path.size() + " steps)");
+                    } else {
+                        System.err.println(getName() + ": Agent " + subgoal.agentId + 
+                                " moved box " + subgoal.boxType + " (path: " + path.size() + " steps)");
+                    }
                     break;
                 }
             }
@@ -162,8 +172,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             ", remaining subgoals:");
                     for (Subgoal sg : unsatisfied) {
                         int diff = estimateSubgoalDifficulty(sg, currentState, level);
-                        System.err.println("  - Agent " + sg.agentId + " box " + sg.boxType + 
-                                " -> goal " + sg.goalPos + " (difficulty: " + diff + ")");
+                        if (sg.isAgentGoal) {
+                            System.err.println("  - Agent " + sg.agentId + " -> goal position " + 
+                                    sg.goalPos + " (difficulty: " + diff + ")");
+                        } else {
+                            System.err.println("  - Agent " + sg.agentId + " box " + sg.boxType + 
+                                    " -> goal " + sg.goalPos + " (difficulty: " + diff + ")");
+                        }
                     }
                 }
                 
@@ -174,11 +189,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     Collections.shuffle(unsatisfied, random);
                     
                     for (Subgoal subgoal : unsatisfied) {
-                        Position boxToMove = findBestBoxForGoal(subgoal, currentState, level);
-                        if (boxToMove == null) continue;
+                        List<Action> path = null;
                         
-                        List<Action> path = searchForSubgoal(subgoal.agentId, boxToMove,
-                                subgoal.goalPos, subgoal.boxType, currentState, level);
+                        if (subgoal.isAgentGoal) {
+                            path = searchForAgentGoal(subgoal.agentId, subgoal.goalPos, currentState, level);
+                        } else {
+                            Position boxToMove = findBestBoxForGoal(subgoal, currentState, level);
+                            if (boxToMove == null) continue;
+                            path = searchForSubgoal(subgoal.agentId, boxToMove,
+                                    subgoal.goalPos, subgoal.boxType, currentState, level);
+                        }
                         
                         if (path != null && !path.isEmpty()) {
                             // Execute with plan merging
@@ -191,8 +211,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             }
                             foundWithReorder = true;
                             stuckCount = 0;
-                            System.err.println(getName() + ": Agent " + subgoal.agentId +
-                                    " moved box " + subgoal.boxType + " after reorder (path: " + path.size() + " steps)");
+                            if (subgoal.isAgentGoal) {
+                                System.err.println(getName() + ": Agent " + subgoal.agentId +
+                                        " moved to goal position after reorder (path: " + path.size() + " steps)");
+                            } else {
+                                System.err.println(getName() + ": Agent " + subgoal.agentId +
+                                        " moved box " + subgoal.boxType + " after reorder (path: " + path.size() + " steps)");
+                            }
                             break;
                         }
                     }
@@ -201,10 +226,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 
                 // IMPROVEMENT 2: If still stuck, try greedy step with plan merging
                 if (!foundWithReorder) {
-                    boolean anyMove = tryGreedyStepWithMerging(fullPlan, currentState, level, numAgents);
-                    if (anyMove) {
-                        Action[] lastAction = fullPlan.get(fullPlan.size() - 1);
-                        currentState = applyJointAction(lastAction, currentState, level, numAgents);
+                    // NEW: Try clearing blocking agents before giving up
+                    boolean clearedPath = false;
+                    if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING) {
+                        clearedPath = tryIdleAgentClearing(fullPlan, currentState, level, 
+                                numAgents, unsatisfied);
+                        if (clearedPath) {
+                            Action[] lastAction = fullPlan.get(fullPlan.size() - 1);
+                            currentState = applyJointAction(lastAction, currentState, level, numAgents);
+                            stuckCount = 0;
+                            System.err.println(getName() + ": Cleared blocking agent path");
+                        }
+                    }
+                    
+                    if (!clearedPath) {
+                        boolean anyMove = tryGreedyStepWithMerging(fullPlan, currentState, level, numAgents);
+                        if (anyMove) {
+                            Action[] lastAction = fullPlan.get(fullPlan.size() - 1);
+                            currentState = applyJointAction(lastAction, currentState, level, numAgents);
+                        }
                     }
                 } else {
                     madeProgress = true;
@@ -227,6 +267,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private List<Subgoal> getUnsatisfiedSubgoals(State state, Level level) {
         List<Subgoal> unsatisfied = new ArrayList<>();
         
+        // Phase 1: Box goals
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
@@ -239,7 +280,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         Color boxColor = level.getBoxColor(goalType);
                         int agentId = findAgentForColor(boxColor, level, state.getNumAgents());
                         if (agentId != -1) {
-                            unsatisfied.add(new Subgoal(agentId, goalType, goalPos));
+                            unsatisfied.add(new Subgoal(agentId, goalType, goalPos, false));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Phase 2: Agent goals (only after all box goals are satisfied or when making progress on box goals is blocked)
+        if (unsatisfied.isEmpty()) {
+            for (int row = 0; row < level.getRows(); row++) {
+                for (int col = 0; col < level.getCols(); col++) {
+                    int agentGoal = level.getAgentGoal(row, col);
+                    if (agentGoal >= 0 && agentGoal < state.getNumAgents()) {
+                        Position goalPos = new Position(row, col);
+                        Position agentPos = state.getAgentPosition(agentGoal);
+                        
+                        // Check if agent is not at goal position
+                        if (!agentPos.equals(goalPos)) {
+                            // Use special boxType '\0' to indicate agent goal
+                            unsatisfied.add(new Subgoal(agentGoal, '\0', goalPos, true));
                         }
                     }
                 }
@@ -254,6 +314,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Returns Integer.MAX_VALUE if agent cannot reach any box of the required type.
      */
     private int estimateSubgoalDifficulty(Subgoal subgoal, State state, Level level) {
+        // Handle agent goals (no box involved)
+        if (subgoal.isAgentGoal) {
+            Position agentPos = state.getAgentPosition(subgoal.agentId);
+            return getDistance(agentPos, subgoal.goalPos, level);
+        }
+        
         Position closestBox = findBestBoxForGoal(subgoal, state, level);
         if (closestBox == null) {
             return Integer.MAX_VALUE;
@@ -379,6 +445,66 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null; // No path found
     }
     
+    /**
+     * A* search to move an agent to its goal position (no box involved).
+     * This is Phase 2: Agent Goal Planning.
+     */
+    private List<Action> searchForAgentGoal(int agentId, Position goalPos,
+                                             State initialState, Level level) {
+        Position startPos = initialState.getAgentPosition(agentId);
+        if (startPos.equals(goalPos)) {
+            return Collections.emptyList(); // Already at goal
+        }
+        
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<Position, Integer> bestG = new HashMap<>();  // Only track agent position for agent goals
+        
+        int h = getDistance(startPos, goalPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, null);
+        openList.add(startNode);
+        bestG.put(startPos, 0);
+        
+        int exploredCount = 0;
+        
+        while (!openList.isEmpty() && exploredCount < SearchConfig.MAX_STATES_PER_SUBGOAL) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+            
+            // Check if agent reached goal
+            Position currentAgentPos = current.state.getAgentPosition(agentId);
+            if (currentAgentPos.equals(goalPos)) {
+                return reconstructPath(current);
+            }
+            
+            // Only try Move actions for agent goals
+            for (Direction dir : Direction.values()) {
+                Action action = Action.move(dir);
+                
+                if (!current.state.isApplicable(action, agentId, level)) {
+                    continue;
+                }
+                
+                State newState = current.state.apply(action, agentId);
+                Position newAgentPos = newState.getAgentPosition(agentId);
+                int newG = current.g + 1;
+                
+                // Skip if we've seen this position with lower cost
+                Integer existingG = bestG.get(newAgentPos);
+                if (existingG != null && existingG <= newG) {
+                    continue;
+                }
+                
+                bestG.put(newAgentPos, newG);
+                
+                int newH = getDistance(newAgentPos, goalPos, level);
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, null);
+                openList.add(newNode);
+            }
+        }
+        
+        return null; // No path found
+    }
+
     /**
      * Computes heuristic for subgoal: minimum distance of any matching box to goal.
      */
@@ -604,17 +730,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     // ========== Helper Classes ==========
     
     /**
-     * Represents a subgoal: moving a box type to a specific goal position.
+     * Represents a subgoal: moving a box type to a specific goal position,
+     * or moving an agent to its goal position.
      */
     private static class Subgoal {
         final int agentId;
-        final char boxType;
+        final char boxType;  // '\0' for agent goals
         final Position goalPos;
+        final boolean isAgentGoal;  // true if this is an agent position goal
         
-        Subgoal(int agentId, char boxType, Position goalPos) {
+        Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal) {
             this.agentId = agentId;
             this.boxType = boxType;
             this.goalPos = goalPos;
+            this.isAgentGoal = isAgentGoal;
+        }
+        
+        // Backward compatibility constructor for box goals
+        Subgoal(int agentId, char boxType, Position goalPos) {
+            this(agentId, boxType, goalPos, false);
         }
     }
     
@@ -811,5 +945,371 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         
         return false;
+    }
+    
+    // ========== Idle Agent Clearing System ==========
+    
+    /**
+     * Attempts to clear blocking agents by moving them to parking positions.
+     * This handles the case where completed agents block paths of other agents.
+     * 
+     * Algorithm:
+     * 1. For each stuck subgoal, find path requirements (positions needed)
+     * 2. Identify completed agents that are blocking these positions
+     * 3. Find safe parking positions for blocking agents
+     * 4. Plan and execute clearing moves
+     */
+    private boolean tryIdleAgentClearing(List<Action[]> plan, State state, Level level,
+                                          int numAgents, List<Subgoal> stuckSubgoals) {
+        // Find agents that have completed their box tasks
+        Set<Integer> completedAgents = findCompletedAgents(state, level, numAgents);
+        
+        if (completedAgents.isEmpty()) {
+            return false; // No idle agents to clear
+        }
+        
+        // For each stuck subgoal, check if a completed agent is blocking
+        for (Subgoal subgoal : stuckSubgoals) {
+            Position boxPos = findBestBoxForGoal(subgoal, state, level);
+            if (boxPos == null) continue;
+            
+            // Find positions along potential paths from box to goal
+            Set<Position> criticalPositions = findCriticalPositions(
+                    state.getAgentPosition(subgoal.agentId), boxPos, subgoal.goalPos, level);
+            
+            // Check which completed agents are blocking
+            for (int blockingAgentId : completedAgents) {
+                if (blockingAgentId == subgoal.agentId) continue;
+                
+                Position blockingPos = state.getAgentPosition(blockingAgentId);
+                if (criticalPositions.contains(blockingPos)) {
+                    // Found a blocking agent! Try to move it
+                    boolean cleared = clearBlockingAgent(plan, state, level, numAgents,
+                            blockingAgentId, criticalPositions);
+                    if (cleared) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Finds agents that have completed all their box tasks.
+     */
+    private Set<Integer> findCompletedAgents(State state, Level level, int numAgents) {
+        Set<Integer> completed = new HashSet<>();
+        
+        for (int agentId = 0; agentId < numAgents; agentId++) {
+            if (hasCompletedBoxTasks(agentId, state, level)) {
+                completed.add(agentId);
+            }
+        }
+        
+        return completed;
+    }
+    
+    /**
+     * Checks if an agent has completed all its box-moving tasks.
+     */
+    private boolean hasCompletedBoxTasks(int agentId, State state, Level level) {
+        Color agentColor = level.getAgentColor(agentId);
+        
+        // Check all box goals for this agent's color
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                char goalType = level.getBoxGoal(row, col);
+                if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
+                    Position pos = new Position(row, col);
+                    Character actualBox = state.getBoxes().get(pos);
+                    if (actualBox == null || actualBox != goalType) {
+                        return false; // Still has unsatisfied box goals
+                    }
+                }
+            }
+        }
+        
+        return true; // All box tasks complete
+    }
+    
+    /**
+     * Finds critical positions that might be needed for moving a box to its goal.
+     * Uses BFS to explore a corridor of positions.
+     */
+    private Set<Position> findCriticalPositions(Position agentPos, Position boxPos, 
+                                                  Position goalPos, Level level) {
+        Set<Position> critical = new HashSet<>();
+        
+        // Add direct path positions using BFS
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        // Start from box position towards goal
+        queue.add(boxPos);
+        visited.add(boxPos);
+        critical.add(boxPos);
+        
+        while (!queue.isEmpty() && critical.size() < SearchConfig.MAX_PARKING_DISTANCE * 4) {
+            Position current = queue.poll();
+            
+            if (current.equals(goalPos)) {
+                continue; // Reached goal, stop expanding from here
+            }
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                
+                if (!visited.contains(next) && !level.isWall(next)) {
+                    visited.add(next);
+                    critical.add(next);
+                    queue.add(next);
+                    
+                    // Stop if we've reached the goal area
+                    if (next.manhattanDistance(goalPos) <= 1) {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Also add positions near the agent
+        for (Direction dir : Direction.values()) {
+            Position adjAgent = agentPos.move(dir);
+            if (!level.isWall(adjAgent)) {
+                critical.add(adjAgent);
+            }
+        }
+        
+        return critical;
+    }
+    
+    /**
+     * Attempts to move a blocking agent to a parking position.
+     */
+    private boolean clearBlockingAgent(List<Action[]> plan, State state, Level level,
+                                        int numAgents, int blockingAgentId, 
+                                        Set<Position> forbiddenPositions) {
+        Position currentPos = state.getAgentPosition(blockingAgentId);
+        
+        // Find a safe parking position
+        Position parkingPos = findParkingPosition(currentPos, state, level, 
+                forbiddenPositions, blockingAgentId);
+        
+        if (parkingPos == null) {
+            return false; // No parking position found
+        }
+        
+        // Plan path from current position to parking position
+        List<Action> clearingPath = planAgentPath(blockingAgentId, currentPos, parkingPos, 
+                state, level, forbiddenPositions);
+        
+        if (clearingPath == null || clearingPath.isEmpty()) {
+            return false;
+        }
+        
+        // Execute the clearing path
+        State workingState = state;
+        for (Action action : clearingPath) {
+            Action[] jointAction = new Action[numAgents];
+            Arrays.fill(jointAction, Action.noOp());
+            jointAction[blockingAgentId] = action;
+            
+            // Let other completed agents also move if beneficial
+            jointAction = addOtherAgentMoves(jointAction, workingState, level, 
+                    numAgents, blockingAgentId, forbiddenPositions);
+            
+            jointAction = resolveConflicts(jointAction, workingState, level);
+            plan.add(jointAction);
+            workingState = applyJointAction(jointAction, workingState, level, numAgents);
+        }
+        
+        System.err.println(getName() + ": Moved Agent " + blockingAgentId + 
+                " from " + currentPos + " to " + parkingPos + " (clearing path)");
+        
+        return true;
+    }
+    
+    /**
+     * Finds a safe parking position for a blocking agent.
+     * Searches for positions that are:
+     * 1. Not in the forbidden set (critical path positions)
+     * 2. Not walls
+     * 3. Not occupied by boxes or other agents
+     */
+    private Position findParkingPosition(Position start, State state, Level level,
+                                          Set<Position> forbidden, int agentId) {
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        queue.add(start);
+        visited.add(start);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            
+            // Check if this is a valid parking position
+            if (!current.equals(start) && isValidParkingPosition(current, state, level, 
+                    forbidden, agentId)) {
+                return current;
+            }
+            
+            // Expand neighbors (BFS to find closest valid position)
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                
+                if (!visited.contains(next) && !level.isWall(next) && 
+                    visited.size() < SearchConfig.MAX_PARKING_DISTANCE * SearchConfig.MAX_PARKING_DISTANCE) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        
+        return null; // No parking position found
+    }
+    
+    /**
+     * Checks if a position is valid for parking (not blocking, not occupied).
+     */
+    private boolean isValidParkingPosition(Position pos, State state, Level level,
+                                            Set<Position> forbidden, int agentId) {
+        // Not in forbidden positions
+        if (forbidden.contains(pos)) {
+            return false;
+        }
+        
+        // Not a wall
+        if (level.isWall(pos)) {
+            return false;
+        }
+        
+        // Not occupied by a box
+        if (state.getBoxes().containsKey(pos)) {
+            return false;
+        }
+        
+        // Not occupied by another agent
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            if (i != agentId && state.getAgentPosition(i).equals(pos)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Plans a simple path for an agent to move from start to goal.
+     * Uses BFS to find shortest path avoiding obstacles.
+     */
+    private List<Action> planAgentPath(int agentId, Position start, Position goal,
+                                        State state, Level level, Set<Position> forbidden) {
+        if (start.equals(goal)) {
+            return Collections.emptyList();
+        }
+        
+        // BFS to find path
+        Queue<PathNode> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        queue.add(new PathNode(start, null, null));
+        visited.add(start);
+        
+        int explored = 0;
+        
+        while (!queue.isEmpty() && explored < SearchConfig.MAX_STATES_PER_CLEARING) {
+            PathNode current = queue.poll();
+            explored++;
+            
+            if (current.position.equals(goal)) {
+                // Reconstruct path
+                List<Action> path = new ArrayList<>();
+                PathNode node = current;
+                while (node.parent != null) {
+                    path.add(node.action);
+                    node = node.parent;
+                }
+                Collections.reverse(path);
+                return path;
+            }
+            
+            // Try each direction
+            for (Direction dir : Direction.values()) {
+                Position next = current.position.move(dir);
+                
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                
+                // Check if position is free (no box, no other agent)
+                if (state.getBoxes().containsKey(next)) continue;
+                
+                boolean occupiedByOther = false;
+                for (int i = 0; i < state.getNumAgents(); i++) {
+                    if (i != agentId && state.getAgentPosition(i).equals(next)) {
+                        occupiedByOther = true;
+                        break;
+                    }
+                }
+                if (occupiedByOther) continue;
+                
+                visited.add(next);
+                Action moveAction = Action.move(dir);
+                queue.add(new PathNode(next, current, moveAction));
+            }
+        }
+        
+        return null; // No path found
+    }
+    
+    /**
+     * Adds moves for other completed agents that can help clear the path.
+     */
+    private Action[] addOtherAgentMoves(Action[] jointAction, State state, Level level,
+                                         int numAgents, int primaryAgent, 
+                                         Set<Position> forbidden) {
+        for (int agentId = 0; agentId < numAgents; agentId++) {
+            if (agentId == primaryAgent) continue;
+            if (jointAction[agentId].type != Action.ActionType.NOOP) continue;
+            
+            // Only move completed agents
+            if (!hasCompletedBoxTasks(agentId, state, level)) continue;
+            
+            Position agentPos = state.getAgentPosition(agentId);
+            
+            // If this agent is in forbidden positions, try to move it out
+            if (forbidden.contains(agentPos)) {
+                for (Direction dir : Direction.values()) {
+                    Position newPos = agentPos.move(dir);
+                    if (!level.isWall(newPos) && !state.getBoxes().containsKey(newPos) &&
+                        !forbidden.contains(newPos)) {
+                        
+                        Action moveAction = Action.move(dir);
+                        if (state.isApplicable(moveAction, agentId, level)) {
+                            jointAction[agentId] = moveAction;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return jointAction;
+    }
+    
+    /**
+     * Simple path node for BFS pathfinding.
+     */
+    private static class PathNode {
+        final Position position;
+        final PathNode parent;
+        final Action action;
+        
+        PathNode(Position position, PathNode parent, Action action) {
+            this.position = position;
+            this.parent = parent;
+            this.action = action;
+        }
     }
 }

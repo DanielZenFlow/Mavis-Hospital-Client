@@ -48,6 +48,18 @@ public class SearchConfig {
     /** Number of random re-orderings to try when stuck in Priority Planning */
     public static final int MAX_REORDER_ATTEMPTS = 5;
     
+    /** Maximum iterations before attempting idle agent clearing */
+    public static final int STUCK_ITERATIONS_BEFORE_CLEARING = 3;
+    
+    /** Maximum states per idle agent path search */
+    public static final int MAX_STATES_PER_CLEARING = 10_000;
+    
+    /** Maximum clearing attempts before giving up on a blocking agent */
+    public static final int MAX_CLEARING_ATTEMPTS = 5;
+    
+    /** Maximum distance to search for parking positions */
+    public static final int MAX_PARKING_DISTANCE = 10;
+    
     // Instance configuration
     private long timeoutMs = DEFAULT_TIMEOUT_MS;
     private int maxStates = DEFAULT_MAX_STATES;
