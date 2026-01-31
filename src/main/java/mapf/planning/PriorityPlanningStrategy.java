@@ -288,10 +288,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // IMPROVEMENT 3: Plan Merging - let other agents act too (slides06)
                     for (Action action : path) {
                         Action[] jointAction = createJointActionWithMerging(
-                                subgoal.agentId, action, currentState, level, numAgents);
+                                subgoal.agentId, action, currentState, level, numAgents, subgoal.isAgentGoal);
 
-                        // Resolve any conflicts
-                        jointAction = resolveConflicts(jointAction, currentState, level);
+                        // Resolve any conflicts - primary agent has right of way
+                        jointAction = resolveConflicts(jointAction, currentState, level, subgoal.agentId);
+
+                        // SAFETY CHECK: Verify primary agent's action wasn't corrupted
+                        if (jointAction[subgoal.agentId].type != action.type) {
+                            logNormal("[WARNING] Primary agent " + subgoal.agentId +
+                                    "'s action was modified from " + action + " to " +
+                                    jointAction[subgoal.agentId] + " - this should not happen!");
+                        }
 
                         fullPlan.add(jointAction);
 
@@ -299,20 +306,47 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         currentState = applyJointAction(jointAction, currentState, level, numAgents);
                     }
 
-                    madeProgress = true;
-                    stuckCount = 0;
-
-                    // Release any agents that were yielding for this agent
-                    clearYieldingForBeneficiary(subgoal.agentId);
-
+                    // CRITICAL FIX: Validate agent actually reached goal
+                    boolean goalReached = false;
                     if (subgoal.isAgentGoal) {
-                        logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
-                                " moved to goal position " + subgoal.goalPos + " (path: " + path.size() + " steps)");
+                        Position currentPos = currentState.getAgentPosition(subgoal.agentId);
+                        goalReached = currentPos.equals(subgoal.goalPos);
+
+                        if (goalReached) {
+                            logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
+                                    " moved to goal position " + subgoal.goalPos + " (path: " + path.size() + " steps)");
+                        } else {
+                            logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
+                                    " executed path but did NOT reach goal " + subgoal.goalPos +
+                                    " (current: " + currentPos + ", expected: " + subgoal.goalPos + ")");
+                            // Do NOT break - continue trying to complete this goal
+                            continue;  // Go to next subgoal attempt
+                        }
                     } else {
-                        logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
-                                " moved box " + subgoal.boxType + " (path: " + path.size() + " steps)");
+                        // Box goal - verify box is at goal position
+                        char actualBox = currentState.getBoxAt(subgoal.goalPos);
+                        goalReached = (actualBox == subgoal.boxType);
+
+                        if (goalReached) {
+                            logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
+                                    " moved box " + subgoal.boxType + " (path: " + path.size() + " steps)");
+                        } else {
+                            logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
+                                    " executed path but box " + subgoal.boxType + " NOT at goal " +
+                                    subgoal.goalPos);
+                            continue;
+                        }
                     }
-                    break;
+
+                    // Only mark progress if goal was actually reached
+                    if (goalReached) {
+                        madeProgress = true;
+                        stuckCount = 0;
+
+                        // Release any agents that were yielding for this agent
+                        clearYieldingForBeneficiary(subgoal.agentId);
+                        break;
+                    }
                 } else {
                     // Track the highest priority goal that failed
                     // This is the FIRST goal in sorted list (deepest) that failed
@@ -388,23 +422,59 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             // Execute with plan merging
                             for (Action action : path) {
                                 Action[] jointAction = createJointActionWithMerging(
-                                        subgoal.agentId, action, currentState, level, numAgents);
-                                jointAction = resolveConflicts(jointAction, currentState, level);
+                                        subgoal.agentId, action, currentState, level, numAgents, subgoal.isAgentGoal);
+                                // Resolve conflicts - primary agent has right of way
+                                jointAction = resolveConflicts(jointAction, currentState, level, subgoal.agentId);
+
+                                // SAFETY CHECK: Verify primary agent's action wasn't corrupted
+                                if (jointAction[subgoal.agentId].type != action.type) {
+                                    logNormal("[WARNING] Primary agent " + subgoal.agentId +
+                                            "'s action was modified from " + action + " to " +
+                                            jointAction[subgoal.agentId] + " - this should not happen!");
+                                }
+
                                 fullPlan.add(jointAction);
                                 currentState = applyJointAction(jointAction, currentState, level, numAgents);
                             }
-                            foundWithReorder = true;
-                            stuckCount = 0;
-                            clearYieldingForBeneficiary(subgoal.agentId);
+                            // CRITICAL FIX: Validate goal actually reached (same as main path)
+                            boolean goalReached = false;
                             if (subgoal.isAgentGoal) {
-                                logNormal(getName() + ": Agent " + subgoal.agentId +
-                                        " moved to goal position after reorder (path: " + path.size() + " steps)");
+                                Position currentPos = currentState.getAgentPosition(subgoal.agentId);
+                                goalReached = currentPos.equals(subgoal.goalPos);
+
+                                if (goalReached) {
+                                    logNormal(getName() + ": Agent " + subgoal.agentId +
+                                            " moved to goal position after reorder (path: " + path.size() + " steps)");
+                                } else {
+                                    logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
+                                            " executed reordered path but did NOT reach goal " + subgoal.goalPos +
+                                            " (current: " + currentPos + ")");
+                                    continue;  // Try next subgoal in reorder
+                                }
                             } else {
-                                logNormal(getName() + ": Agent " + subgoal.agentId +
-                                        " moved box " + subgoal.boxType + " after reorder (path: " + path.size()
-                                        + " steps)");
+                                // Box goal - verify box is at goal position
+                                char actualBox = currentState.getBoxAt(subgoal.goalPos);
+                                goalReached = (actualBox == subgoal.boxType);
+
+                                if (goalReached) {
+                                    logNormal(getName() + ": Agent " + subgoal.agentId +
+                                            " moved box " + subgoal.boxType + " after reorder (path: " + path.size()
+                                            + " steps)");
+                                } else {
+                                    logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
+                                            " executed reordered path but box " + subgoal.boxType + " NOT at goal " +
+                                            subgoal.goalPos);
+                                    continue;
+                                }
                             }
-                            break;
+
+                            // Only mark success if goal was actually reached
+                            if (goalReached) {
+                                foundWithReorder = true;
+                                stuckCount = 0;
+                                clearYieldingForBeneficiary(subgoal.agentId);
+                                break;
+                            }
                         }
                     }
                     if (foundWithReorder)
@@ -933,17 +1003,48 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /**
      * Resolves conflicts in joint action by making conflicting agents wait.
+     * CRITICAL: The primary agent (currently executing a task) is NEVER made to wait.
+     * Other agents must yield to the primary agent.
+     *
+     * @param jointAction The joint action to resolve conflicts for
+     * @param state Current state
+     * @param level The level
+     * @param primaryAgentId The agent currently executing a task (has right of way), or -1 if none
+     * @return Joint action with conflicts resolved
      */
-    private Action[] resolveConflicts(Action[] jointAction, State state, Level level) {
+    private Action[] resolveConflicts(Action[] jointAction, State state, Level level, int primaryAgentId) {
         List<ConflictDetector.Conflict> conflicts = conflictDetector.detectConflicts(state, jointAction, level);
 
         for (ConflictDetector.Conflict conflict : conflicts) {
-            // Lower priority agent waits (higher ID waits)
-            int waitingAgent = Math.max(conflict.agent1, conflict.agent2);
+            int waitingAgent;
+
+            // CRITICAL: Primary agent NEVER waits - it has the right of way
+            if (conflict.agent1 == primaryAgentId) {
+                waitingAgent = conflict.agent2;
+            } else if (conflict.agent2 == primaryAgentId) {
+                waitingAgent = conflict.agent1;
+            } else {
+                // Neither is primary, use standard rule (higher ID waits)
+                waitingAgent = Math.max(conflict.agent1, conflict.agent2);
+            }
+
             jointAction[waitingAgent] = Action.noOp();
         }
 
         return jointAction;
+    }
+
+    /**
+     * Resolves conflicts in joint action by making conflicting agents wait.
+     * Uses standard "higher ID waits" rule when no primary agent is specified.
+     *
+     * @param jointAction The joint action to resolve conflicts for
+     * @param state Current state
+     * @param level The level
+     * @return Joint action with conflicts resolved
+     */
+    private Action[] resolveConflicts(Action[] jointAction, State state, Level level) {
+        return resolveConflicts(jointAction, state, level, -1); // No primary agent
     }
 
     /**
@@ -1312,12 +1413,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Based on slides06: Plan Merging / Post-Processing.
      */
     private Action[] createJointActionWithMerging(int primaryAgentId, Action primaryAction,
-            State state, Level level, int numAgents) {
+            State state, Level level, int numAgents, boolean isAgentGoal) {
         Action[] jointAction = new Action[numAgents];
         Arrays.fill(jointAction, Action.noOp());
         jointAction[primaryAgentId] = primaryAction;
 
-        // Try to let other agents make progress too
+        // CRITICAL: Skip plan merging if primary agent is executing an agent goal
+        // This prevents other agents from creating dynamic obstacles that invalidate the planned path
+        if (isAgentGoal) {
+            logVerbose("[NO MERGE] Skipping plan merging for agent goal execution");
+            return jointAction;
+        }
+
+        // Try to let other agents make progress too (only for box goals)
         for (int agentId = 0; agentId < numAgents; agentId++) {
             if (agentId == primaryAgentId)
                 continue;
@@ -1439,8 +1547,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
 
         if (primaryAgent != -1 && primaryAction != null) {
+            // Check if we're in agent goal phase
+            boolean isAgentGoalPhase = allBoxGoalsSatisfied(state, level);
             Action[] jointAction = createJointActionWithMerging(
-                    primaryAgent, primaryAction, state, level, numAgents);
+                    primaryAgent, primaryAction, state, level, numAgents, isAgentGoalPhase);
             jointAction = resolveConflicts(jointAction, state, level);
             plan.add(jointAction);
             return true;
