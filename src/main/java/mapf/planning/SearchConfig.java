@@ -60,6 +60,35 @@ public class SearchConfig {
     /** Maximum distance to search for parking positions */
     public static final int MAX_PARKING_DISTANCE = 10;
     
+    /** Random seed for reproducible results */
+    public static final int RANDOM_SEED = 42;
+    
+    /** Maximum stuck iterations before giving up */
+    public static final int MAX_STUCK_ITERATIONS = 50;
+    
+    /** Stuck logging interval (log every N stuck iterations) */
+    public static final int STUCK_LOG_INTERVAL = 10;
+    
+    // ========== Logging Configuration ==========
+    
+    /**
+     * Log level for controlling output verbosity.
+     * 0 = SILENT (no output except critical errors)
+     * 1 = MINIMAL (only [OK], [FAIL], final result)
+     * 2 = NORMAL (+ iteration progress, warnings)
+     * 3 = VERBOSE (+ detailed debug info)
+     */
+    public static final int LOG_LEVEL = 3;
+    
+    /** Helper method to check if verbose logging is enabled */
+    public static boolean isVerbose() { return LOG_LEVEL >= 3; }
+    
+    /** Helper method to check if normal logging is enabled */
+    public static boolean isNormal() { return LOG_LEVEL >= 2; }
+    
+    /** Helper method to check if minimal logging is enabled */
+    public static boolean isMinimal() { return LOG_LEVEL >= 1; }
+    
     // Instance configuration
     private long timeoutMs = DEFAULT_TIMEOUT_MS;
     private int maxStates = DEFAULT_MAX_STATES;
