@@ -942,7 +942,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         if (primaryAgent == -1) {
             // No agent can make progress, try random move to break deadlock
+            // IMPORTANT: Only use agents that have incomplete goals
             for (int agentId = 0; agentId < numAgents; agentId++) {
+                // Skip agents that have completed all their goals
+                if (isAgentGoalSatisfied(agentId, state, level)) continue;
+                
                 for (Action action : getAllActions()) {
                     if (action.type == Action.ActionType.MOVE && 
                         state.isApplicable(action, agentId, level)) {

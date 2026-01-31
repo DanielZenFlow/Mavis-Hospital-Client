@@ -136,6 +136,9 @@ public class TrueDistanceHeuristic implements Heuristic {
         int totalDistance = 0;
         
         // Calculate distance for each box to its nearest goal
+        // Also track which boxes are NOT yet at their goals (per agent color)
+        Map<Color, List<Position>> unsatisfiedBoxesByColor = new HashMap<>();
+        
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
             Position boxPos = entry.getKey();
             char boxType = entry.getValue();
@@ -143,10 +146,16 @@ public class TrueDistanceHeuristic implements Heuristic {
             int minDist = getMinDistanceToGoal(boxPos, boxType);
             if (minDist < UNREACHABLE) {
                 totalDistance += minDist;
+                
+                // Track unsatisfied boxes (distance > 0 means not at goal)
+                if (minDist > 0) {
+                    Color boxColor = level.getBoxColor(boxType);
+                    unsatisfiedBoxesByColor.computeIfAbsent(boxColor, k -> new ArrayList<>()).add(boxPos);
+                }
             }
         }
         
-        // Calculate distance for each agent to its goal
+        // Calculate distance for each agent to its goal position (if any)
         for (Map.Entry<Integer, Position> entry : agentGoalPositions.entrySet()) {
             int agentId = entry.getKey();
             Position goalPos = entry.getValue();
@@ -159,6 +168,30 @@ public class TrueDistanceHeuristic implements Heuristic {
                     if (dist < UNREACHABLE) {
                         totalDistance += dist;
                     }
+                }
+            }
+        }
+        
+        // NEW: Add distance from each agent to its nearest unsatisfied box
+        // This encourages agents to stay near their work and discourages unnecessary movement
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            Position agentPos = state.getAgentPosition(agentId);
+            if (agentPos == null) continue;
+            
+            Color agentColor = level.getAgentColor(agentId);
+            List<Position> unsatisfiedBoxes = unsatisfiedBoxesByColor.get(agentColor);
+            
+            if (unsatisfiedBoxes != null && !unsatisfiedBoxes.isEmpty()) {
+                // Find minimum distance to any unsatisfied box this agent can move
+                int minDistToBox = UNREACHABLE;
+                for (Position boxPos : unsatisfiedBoxes) {
+                    int dist = agentPos.manhattanDistance(boxPos) - 1; // -1 because agent needs to be adjacent
+                    if (dist < 0) dist = 0;
+                    minDistToBox = Math.min(minDistToBox, dist);
+                }
+                
+                if (minDistToBox < UNREACHABLE) {
+                    totalDistance += minDistToBox;
                 }
             }
         }
