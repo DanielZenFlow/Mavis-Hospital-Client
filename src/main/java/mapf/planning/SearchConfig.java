@@ -42,6 +42,12 @@ public class SearchConfig {
     /** Progress logging interval (log every N states) */
     public static final int PROGRESS_LOG_INTERVAL = 10_000;
     
+    /** Maximum states per single-subgoal search in Priority Planning */
+    public static final int MAX_STATES_PER_SUBGOAL = 50_000;
+    
+    /** Number of random re-orderings to try when stuck in Priority Planning */
+    public static final int MAX_REORDER_ATTEMPTS = 5;
+    
     // Instance configuration
     private long timeoutMs = DEFAULT_TIMEOUT_MS;
     private int maxStates = DEFAULT_MAX_STATES;

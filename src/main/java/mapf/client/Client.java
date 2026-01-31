@@ -218,13 +218,15 @@ public class Client {
         long totalStartTime = System.currentTimeMillis();
         long remainingTime = config.getTimeoutMs();
         
-        for (double weight : weights) {
+        for (int i = 0; i < weights.length; i++) {
+            double weight = weights[i];
             if (remainingTime <= 0) {
                 debugOut.println("Total timeout exceeded, stopping search");
                 break;
             }
             
-            // Allocate time for this attempt
+            // Allocate time for this attempt: half of remaining time
+            // This ensures fair distribution across fallback strategies
             long attemptTimeout = Math.min(remainingTime / 2, remainingTime);
             
             SearchConfig currentConfig = new SearchConfig(
