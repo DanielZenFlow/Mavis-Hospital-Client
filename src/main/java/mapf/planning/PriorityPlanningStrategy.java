@@ -3,6 +3,7 @@ package mapf.planning;
 import mapf.domain.*;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
+import mapf.planning.coordination.AgentYieldingManager;
 import java.util.*;
 
 /**
@@ -35,10 +36,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private final Random random = new Random(SearchConfig.RANDOM_SEED); // For priority re-ordering
 
     /**
-     * Tracks agents that are temporarily "yielding" - giving up their goal position
-     * to let another agent pass through. Maps yieldingAgentId -> beneficiaryAgentId
+     * Manages agent yielding behavior - extracted for Single Responsibility Principle.
+     * Handles both reactive yielding (when blocking) and proactive yielding (after task completion).
      */
-    private Map<Integer, Integer> yieldingAgents = new HashMap<>();
+    private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
 
     /**
      * Cache for goal topological depths. Computed once per level.
@@ -123,7 +124,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         logMinimal(getName() + ": Planning for " + numAgents + " agents with subgoal decomposition");
 
         // Reset yielding state for new search
-        yieldingAgents.clear();
+        yieldingManager.reset();
         
         // Reset displacement tracking for new search
         displacementHistory.clear();
@@ -237,56 +238,48 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             // Check for yielding timeout - if agents have been yielding for too long,
             // release them to prevent permanent deadlock.
-            // CRITICAL: Only trigger ONCE at the exact threshold, not every iteration
-            // after.
-            // Also only trigger if we're about to give up anyway (near
-            // MAX_STUCK_ITERATIONS).
-            if (!yieldingAgents.isEmpty() && stuckCount == SearchConfig.MAX_STUCK_ITERATIONS - 5) {
+            // CRITICAL: Only trigger ONCE at the exact threshold, not every iteration after.
+            // Also only trigger if we're about to give up anyway (near MAX_STUCK_ITERATIONS).
+            if (yieldingManager.hasYieldingAgents() && stuckCount == SearchConfig.MAX_STUCK_ITERATIONS - 5) {
                 logNormal("[YIELD] Releasing all yielding agents due to potential deadlock (stuckCount=" + stuckCount
                         + ")");
-                yieldingAgents.clear();
+                yieldingManager.clearAllYielding();
             }
 
-            // NEW: Process yielding agents FIRST - make sure they actually move!
+            // Process yielding agents FIRST - make sure they actually move!
             // If an agent is marked as YIELDING but still blocking the beneficiary's path,
             // we must force it to move before continuing with normal planning.
-            if (!yieldingAgents.isEmpty()) {
+            if (yieldingManager.hasYieldingAgents()) {
                 boolean anyYieldingMoved = false;
 
-                for (Map.Entry<Integer, Integer> entry : new HashMap<>(yieldingAgents).entrySet()) {
+                for (Map.Entry<Integer, Integer> entry : new HashMap<>(yieldingManager.getYieldingAgents()).entrySet()) {
                     int yieldingAgentId = entry.getKey();
                     int beneficiaryId = entry.getValue();
 
-                    Position yieldingPos = currentState.getAgentPosition(yieldingAgentId);
-                    Position beneficiaryPos = currentState.getAgentPosition(beneficiaryId);
-                    Position beneficiaryGoal = findAgentGoalPosition(beneficiaryId, level);
+                    // Use AgentYieldingManager to check if still blocking
+                    if (yieldingManager.isBlockingAgent(yieldingAgentId, beneficiaryId, currentState, level)) {
+                        Position yieldingPos = currentState.getAgentPosition(yieldingAgentId);
+                        logNormal("[YIELD-CHECK] Agent " + yieldingAgentId +
+                                " still blocking at " + yieldingPos + ", forcing move");
 
-                    if (beneficiaryGoal != null) {
-                        Set<Position> criticalPath = findCriticalPositionsForAgentGoal(
-                                beneficiaryPos, beneficiaryGoal, level);
+                        int planSizeBefore = fullPlan.size();
+                        boolean moved = forceYieldingAgentToMove(fullPlan, currentState, level,
+                                numAgents, yieldingAgentId, beneficiaryId);
 
-                        if (criticalPath.contains(yieldingPos)) {
-                            // Yielding agent is STILL blocking! Force it to move.
-                            logNormal("[YIELD-CHECK] Agent " + yieldingAgentId +
-                                    " still blocking at " + yieldingPos + ", forcing move");
-
-                            int planSizeBefore = fullPlan.size();
-                            boolean moved = forceYieldingAgentToMove(fullPlan, currentState, level,
-                                    numAgents, yieldingAgentId, beneficiaryId);
-
-                            if (moved) {
-                                // Update state
-                                for (int i = planSizeBefore; i < fullPlan.size(); i++) {
-                                    currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
-                                }
-                                anyYieldingMoved = true;
-                                stuckCount = 0;
+                        if (moved) {
+                            // Update state
+                            for (int i = planSizeBefore; i < fullPlan.size(); i++) {
+                                currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
                             }
-                        } else {
-                            // Yielding agent has moved out of the way
-                            logVerbose("[YIELD-CHECK] Agent " + yieldingAgentId +
-                                    " no longer blocking (at " + yieldingPos + ")");
+                            anyYieldingMoved = true;
+                            stuckCount = 0;
                         }
+                    } else {
+                        // Yielding agent has moved out of the way
+                        Position yieldingPos = currentState.getAgentPosition(yieldingAgentId);
+                        logVerbose("[YIELD-CHECK] Agent " + yieldingAgentId +
+                                " no longer blocking (at " + yieldingPos + ")");
+                        yieldingManager.clearYielding(yieldingAgentId);
                     }
                 }
 
@@ -313,9 +306,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             // Filter out subgoals for yielding agents (they must stay parked)
             unsatisfied.removeIf(sg -> {
-                if (yieldingAgents.containsKey(sg.agentId)) {
+                if (yieldingManager.isYielding(sg.agentId)) {
                     logVerbose("[YIELD] Skipping subgoal for Agent " + sg.agentId +
-                            " (yielding for Agent " + yieldingAgents.get(sg.agentId) + ")");
+                            " (yielding for Agent " + yieldingManager.getBeneficiary(sg.agentId) + ")");
                     return true;
                 }
                 return false;
@@ -485,6 +478,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
                         // Release any agents that were yielding for this agent
                         clearYieldingForBeneficiary(subgoal.agentId);
+                        
+                        // PROACTIVE YIELDING: After completing a task, check if this agent 
+                        // is now blocking other agents' paths and move to a safe position
+                        if (performProactiveYielding(subgoal.agentId, fullPlan, currentState, level, numAgents)) {
+                            // Update currentState after proactive yielding moves
+                            State tempState = initialState;
+                            for (Action[] jointAction : fullPlan) {
+                                tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                            }
+                            currentState = tempState;
+                        }
+                        
                         break;
                     }
                 } else {
@@ -613,6 +618,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 foundWithReorder = true;
                                 stuckCount = 0;
                                 clearYieldingForBeneficiary(subgoal.agentId);
+                                
+                                // PROACTIVE YIELDING: After completing task via reorder
+                                if (performProactiveYielding(subgoal.agentId, fullPlan, currentState, level, numAgents)) {
+                                    // Update currentState
+                                    State tempState = initialState;
+                                    for (Action[] jointAction : fullPlan) {
+                                        tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                                    }
+                                    currentState = tempState;
+                                }
+                                
                                 break;
                             }
                         }
@@ -1618,7 +1634,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
 
             // Skip agents that are currently yielding - they must stay parked
-            if (yieldingAgents.containsKey(agentId)) {
+            if (yieldingManager.isYielding(agentId)) {
                 continue;
             }
 
@@ -1992,7 +2008,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
 
             // YIELDING CHECK: Don't let yielding agents move during plan merging
-            if (yieldingAgents.containsKey(agentId)) {
+            if (yieldingManager.isYielding(agentId)) {
                 logVerbose("[SKIP] Agent " + agentId + " is YIELDING, skipping in plan merge");
                 continue;
             }
@@ -2066,9 +2082,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
 
             // Skip agents that are currently yielding - they must stay parked
-            if (yieldingAgents.containsKey(agentId)) {
+            if (yieldingManager.isYielding(agentId)) {
                 logVerbose("[GREEDY] Skipping Agent " + agentId + " - currently YIELDING for Agent "
-                        + yieldingAgents.get(agentId));
+                        + yieldingManager.getBeneficiary(agentId));
                 continue;
             }
 
@@ -2089,7 +2105,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     continue;
 
                 // Skip agents that are currently yielding - they must stay parked
-                if (yieldingAgents.containsKey(agentId))
+                if (yieldingManager.isYielding(agentId))
                     continue;
 
                 for (Action action : getAllActions()) {
@@ -2536,7 +2552,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
 
             // Skip agents that are currently yielding - they must stay parked
-            if (yieldingAgents.containsKey(agentId))
+            if (yieldingManager.isYielding(agentId))
                 continue;
 
             // Only move agents that have completed their box tasks
@@ -2858,7 +2874,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * until the beneficiary agent has completed its task.
      */
     private void setAgentYielding(int yieldingAgentId, int beneficiaryId) {
-        yieldingAgents.put(yieldingAgentId, beneficiaryId);
+        yieldingManager.setYielding(yieldingAgentId, beneficiaryId);
         logVerbose("[YIELD] Agent " + yieldingAgentId + " now YIELDING for Agent " + beneficiaryId);
     }
 
@@ -3314,16 +3330,86 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Called when the beneficiary completes its subgoal.
      */
     private void clearYieldingForBeneficiary(int beneficiaryId) {
-        Iterator<Map.Entry<Integer, Integer>> it = yieldingAgents.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<Integer, Integer> entry = it.next();
+        Map<Integer, Integer> yieldingAgents = yieldingManager.getYieldingAgents();
+        for (Map.Entry<Integer, Integer> entry : yieldingAgents.entrySet()) {
             if (entry.getValue() == beneficiaryId) {
                 int agentId = entry.getKey();
-                it.remove();
+                yieldingManager.clearYielding(agentId);
                 logVerbose("[YIELD] Agent " + agentId + " RELEASED from yielding (beneficiary Agent " + beneficiaryId
                         + " completed)");
             }
         }
+    }
+
+    /**
+     * Proactive yielding: After completing a task, check if this agent is blocking others.
+     * If so, move to a safe position to avoid becoming an obstacle.
+     * 
+     * @return true if proactive yielding actions were added to the plan
+     */
+    private boolean performProactiveYielding(int completedAgentId, List<Action[]> plan, 
+            State currentState, Level level, int numAgents) {
+        // Mark this agent as having completed its task
+        yieldingManager.markTaskCompleted(completedAgentId);
+        
+        // Check if this agent is blocking anyone
+        List<Integer> blockedAgents = yieldingManager.findBlockedAgents(completedAgentId, currentState, level);
+        
+        if (blockedAgents.isEmpty()) {
+            logVerbose("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone");
+            return false;
+        }
+        
+        logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " blocking agents: " + blockedAgents);
+        
+        // Find a safe position for this agent
+        Position safePos = yieldingManager.findNearestSafePosition(completedAgentId, currentState, level);
+        
+        if (safePos == null) {
+            logNormal("[PROACTIVE-YIELD] No safe position found for Agent " + completedAgentId);
+            // Fallback: try single step yielding
+            Action yieldMove = yieldingManager.generateYieldMove(completedAgentId, blockedAgents.get(0), 
+                    currentState, level);
+            if (yieldMove != null) {
+                Action[] jointAction = new Action[numAgents];
+                Arrays.fill(jointAction, Action.noOp());
+                jointAction[completedAgentId] = yieldMove;
+                plan.add(jointAction);
+                logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " performed single yield move");
+                return true;
+            }
+            return false;
+        }
+        
+        // Plan path to safe position
+        List<Action> pathToSafe = yieldingManager.planPathToPosition(completedAgentId, safePos, currentState, level);
+        
+        if (pathToSafe.isEmpty()) {
+            logNormal("[PROACTIVE-YIELD] No path to safe position for Agent " + completedAgentId);
+            return false;
+        }
+        
+        // Execute path to safe position
+        logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " moving to safe position " + safePos + 
+                " (" + pathToSafe.size() + " steps)");
+        
+        State tempState = currentState;
+        for (Action action : pathToSafe) {
+            Action[] jointAction = new Action[numAgents];
+            Arrays.fill(jointAction, Action.noOp());
+            jointAction[completedAgentId] = action;
+            
+            // Verify action is still applicable
+            if (!tempState.isApplicable(action, completedAgentId, level)) {
+                logNormal("[PROACTIVE-YIELD] Path interrupted at action " + action);
+                break;
+            }
+            
+            plan.add(jointAction);
+            tempState = applyJointAction(jointAction, tempState, level, numAgents);
+        }
+        
+        return true;
     }
 
     /**
