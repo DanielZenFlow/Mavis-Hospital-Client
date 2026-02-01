@@ -2,6 +2,7 @@ package mapf.planning;
 
 import mapf.domain.*;
 import mapf.planning.analysis.DependencyAnalyzer;
+import mapf.planning.cbs.CBSStrategy;
 import java.util.*;
 
 /**
@@ -53,6 +54,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> immovableBoxPositions = null;
     private State cachedStateForImmovable = null;
 
+    /**
+     * Tracks displacement attempts to avoid infinite loops.
+     * Key: "box@(x,y)" format representing a box that was displaced
+     * This prevents repeatedly displacing the same box back and forth
+     */
+    private Set<String> displacementHistory = new HashSet<>();
+    
+    /**
+     * Counts how many times we've attempted displacement in current search.
+     * After MAX_DISPLACEMENT_ATTEMPTS, force CBS instead.
+     */
+    private int displacementAttempts = 0;
+    private static final int MAX_DISPLACEMENT_ATTEMPTS = 3;
+
     // ========== Conditional Logging Helpers ==========
     private void logMinimal(String msg) {
         if (SearchConfig.isMinimal())
@@ -101,6 +116,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         // Reset yielding state for new search
         yieldingAgents.clear();
+        
+        // Reset displacement tracking for new search
+        displacementHistory.clear();
+        displacementAttempts = 0;
 
         // Use iterative subgoal planning
         List<Action[]> plan = planWithSubgoals(initialState, level, startTime);
@@ -143,7 +162,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             // Dependency analysis: when stuck, check if cyclic dependencies exist
             // This helps diagnose WHY we're stuck and whether CBS would help
-            if (stuckCount >= SearchConfig.DEPENDENCY_CHECK_THRESHOLD && stuckCount % 10 == 0) {
+            if (stuckCount == SearchConfig.DEPENDENCY_CHECK_THRESHOLD && SearchConfig.USE_CBS_ON_CYCLE) {
                 System.err.println("\n========== DEPENDENCY ANALYSIS (stuckCount=" + stuckCount + ") ==========");
                 DependencyAnalyzer.AnalysisResult depAnalysis = 
                     DependencyAnalyzer.analyze(currentState, level);
@@ -151,8 +170,57 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (depAnalysis.hasCycle) {
                     System.err.println("[DEPENDENCY] *** CYCLIC DEPENDENCY DETECTED ***");
                     System.err.println(depAnalysis.report);
-                    // For now, just log the diagnosis
-                    // Future: could trigger CBS or alternative strategy here
+                    
+                    // Check if we've tried displacement too many times
+                    if (displacementAttempts >= MAX_DISPLACEMENT_ATTEMPTS) {
+                        System.err.println("[DISPLACEMENT] Already tried " + displacementAttempts + 
+                            " times, switching to CBS directly...");
+                    } else {
+                        // Strategy: Try to break the cycle by temporarily displacing one box
+                        System.err.println("[DISPLACEMENT] Attempting to break cycle via temporary displacement (attempt " + 
+                            (displacementAttempts + 1) + "/" + MAX_DISPLACEMENT_ATTEMPTS + ")...");
+                        
+                        displacementAttempts++;
+                        
+                        List<Action[]> displacementPlan = attemptCycleBreaking(
+                            currentState, level, depAnalysis.cycles, numAgents, 
+                            timeoutMs - (System.currentTimeMillis() - startTime));
+                        
+                        if (displacementPlan != null && !displacementPlan.isEmpty()) {
+                            System.err.println("[DISPLACEMENT] *** SUCCESS! Displaced box with " + 
+                                displacementPlan.size() + " steps ***");
+                            fullPlan.addAll(displacementPlan);
+                            
+                            // Update current state
+                            for (Action[] jointAction : displacementPlan) {
+                                currentState = applyJointAction(jointAction, currentState, level, numAgents);
+                            }
+                            
+                            // Reset stuck count - we made progress
+                            stuckCount = 0;
+                            continue; // Retry main loop with new state
+                        } else {
+                            System.err.println("[DISPLACEMENT] Failed to find displacement, trying CBS...");
+                        }
+                    }
+                    
+                    // Fallback: Try CBS (for pure agent coordination)
+                    System.err.println("[CBS] Attempting CBS as fallback strategy...");
+                    CBSStrategy cbs = new CBSStrategy(heuristic, config);
+                    cbs.setTimeout(timeoutMs - (System.currentTimeMillis() - startTime));
+                    cbs.setMaxStates(maxStates);
+                    
+                    List<Action[]> cbsPlan = cbs.search(currentState, level);
+                    
+                    if (cbsPlan != null && !cbsPlan.isEmpty()) {
+                        System.err.println("[CBS] *** SUCCESS! Found plan with " + cbsPlan.size() + " steps ***");
+                        fullPlan.addAll(cbsPlan);
+                        logMinimal(getName() + ": [OK] Solved via CBS fallback");
+                        logMinimal(getName() + ": Total plan length: " + fullPlan.size());
+                        return fullPlan;
+                    } else {
+                        System.err.println("[CBS] Failed to find solution, continuing with Priority Planning");
+                    }
                 } else {
                     System.err.println("[DEPENDENCY] No cyclic dependency found. Stuck due to other reasons.");
                 }
@@ -843,6 +911,313 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             default:
                 return false;
         }
+    }
+
+    // ========== Cycle Breaking via Temporary Displacement ==========
+    
+    /**
+     * Attempts to break a cyclic dependency by temporarily displacing one box.
+     * 
+     * Strategy:
+     * 1. Select a "victim" from the cycle - an agent whose box can be temporarily moved
+     * 2. Find a safe position (not blocking anyone's path)
+     * 3. Plan to move the box to the safe position
+     * 4. This breaks the cycle, allowing other agents to proceed
+     * 
+     * @param state Current state
+     * @param level Level information
+     * @param cycles Detected cycles (list of agent IDs in each cycle)
+     * @param numAgents Number of agents
+     * @param remainingTimeMs Time remaining for planning
+     * @return Plan to displace the box, or null if not possible
+     */
+    private List<Action[]> attemptCycleBreaking(State state, Level level, 
+            List<List<Integer>> cycles, int numAgents, long remainingTimeMs) {
+        
+        if (cycles.isEmpty()) return null;
+        
+        long startTime = System.currentTimeMillis();
+        long timeLimit = Math.min(remainingTimeMs, 10000); // Max 10 seconds for displacement
+        
+        // Take the first cycle
+        List<Integer> cycle = cycles.get(0);
+        System.err.println("[DISPLACEMENT] Trying to break cycle with " + cycle.size() + " agents...");
+        
+        // Prioritize cycle members first, then try a few nearby agents
+        Set<Integer> agentsToTry = new LinkedHashSet<>(cycle);
+        // Only add up to 3 more agents to avoid explosion
+        int addedCount = 0;
+        for (int i = 0; i < state.getNumAgents() && addedCount < 3; i++) {
+            if (!agentsToTry.contains(i)) {
+                agentsToTry.add(i);
+                addedCount++;
+            }
+        }
+        
+        // Try each agent as a potential victim
+        int attemptCount = 0;
+        for (int victimAgentId : agentsToTry) {
+            // Check timeout
+            if (System.currentTimeMillis() - startTime > timeLimit) {
+                System.err.println("[DISPLACEMENT] Timeout after checking " + attemptCount + " agents");
+                break;
+            }
+            
+            attemptCount++;
+            Position agentPos = state.getAgentPosition(victimAgentId);
+            Color agentColor = level.getAgentColor(victimAgentId);
+            
+            // Find boxes this agent can push - try only closest ones
+            List<Map.Entry<Position, Character>> candidateBoxes = new ArrayList<>();
+            for (Map.Entry<Position, Character> boxEntry : state.getBoxes().entrySet()) {
+                Position boxPos = boxEntry.getKey();
+                char boxType = boxEntry.getValue();
+                
+                // Check if this agent can push this box
+                if (level.getBoxColor(boxType) != agentColor) continue;
+                
+                // Check distance - only nearby boxes
+                int dist = Math.abs(boxPos.row - agentPos.row) + Math.abs(boxPos.col - agentPos.col);
+                if (dist <= 8) { // Tighter limit
+                    candidateBoxes.add(boxEntry);
+                }
+            }
+            
+            // Sort by distance, try closest first
+            candidateBoxes.sort((a, b) -> {
+                int distA = Math.abs(a.getKey().row - agentPos.row) + Math.abs(a.getKey().col - agentPos.col);
+                int distB = Math.abs(b.getKey().row - agentPos.row) + Math.abs(b.getKey().col - agentPos.col);
+                return Integer.compare(distA, distB);
+            });
+            
+            // Try only top 2 boxes per agent
+            int boxTried = 0;
+            for (Map.Entry<Position, Character> boxEntry : candidateBoxes) {
+                if (boxTried >= 2) break;
+                boxTried++;
+                
+                Position boxPos = boxEntry.getKey();
+                char boxType = boxEntry.getValue();
+                
+                // Check if we've already tried to displace this box
+                String boxKey = boxType + "@" + boxPos;
+                if (displacementHistory.contains(boxKey)) {
+                    continue; // Skip - already tried this box
+                }
+                
+                // Find a safe position to displace this box
+                Position safePos = findSafeDisplacementPosition(boxPos, state, level, cycle);
+                if (safePos == null) continue;
+                
+                // Plan to move this box to the safe position
+                long searchTimeLimit = timeLimit - (System.currentTimeMillis() - startTime);
+                List<Action> path = searchForDisplacement(victimAgentId, boxPos, safePos, boxType, state, level, searchTimeLimit);
+                
+                if (path != null && !path.isEmpty()) {
+                    System.err.println("[DISPLACEMENT] *** SUCCESS! Moving box " + boxType + 
+                        " from " + boxPos + " to " + safePos + " (" + path.size() + " steps) ***");
+                    
+                    // Record this displacement to avoid repeating
+                    displacementHistory.add(boxKey);
+                    
+                    // Convert single-agent path to joint actions
+                    List<Action[]> jointPlan = new ArrayList<>();
+                    State tempState = state;
+                    for (Action action : path) {
+                        Action[] jointAction = new Action[numAgents];
+                        Arrays.fill(jointAction, Action.noOp());
+                        jointAction[victimAgentId] = action;
+                        jointPlan.add(jointAction);
+                        tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                    }
+                    return jointPlan;
+                }
+            }
+        }
+        
+        System.err.println("[DISPLACEMENT] Could not find any displacement opportunity");
+        return null;
+    }
+    
+    /**
+     * Find a safe position to temporarily place a box.
+     * Safe position requirements:
+     * 1. Not a wall
+     * 2. Not currently occupied
+     * 3. Not on any goal position
+     * 4. Not blocking the direct path of agents in the cycle
+     * 5. Ideally in a "dead-end" or corner where it won't interfere
+     */
+    private Position findSafeDisplacementPosition(Position boxPos, State state, Level level, 
+            List<Integer> cycleAgents) {
+        
+        // Collect positions to avoid
+        Set<Position> avoid = new HashSet<>();
+        
+        // Avoid all current agent and box positions
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            avoid.add(state.getAgentPosition(i));
+        }
+        for (Position pos : state.getBoxes().keySet()) {
+            avoid.add(pos);
+        }
+        
+        // Avoid all goal positions
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                if (level.getBoxGoal(row, col) != 0 || level.getAgentGoal(row, col) >= 0) {
+                    avoid.add(new Position(row, col));
+                }
+            }
+        }
+        
+        // BFS to find nearest safe position - LIMIT SEARCH
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        // Start from positions adjacent to the box
+        for (Direction dir : Direction.values()) {
+            Position adj = boxPos.move(dir);
+            if (!level.isWall(adj) && !avoid.contains(adj)) {
+                queue.add(adj);
+                visited.add(adj);
+            }
+        }
+        
+        int searchLimit = 50; // Drastically reduced from 200
+        int explored = 0;
+        
+        while (!queue.isEmpty() && explored < searchLimit) {
+            Position current = queue.poll();
+            explored++;
+            
+            // Check if this is a valid safe position
+            if (!avoid.contains(current) && !level.isWall(current)) {
+                // Prefer positions with fewer neighbors (corners/dead-ends)
+                int openNeighbors = 0;
+                for (Direction dir : Direction.values()) {
+                    Position neighbor = current.move(dir);
+                    if (!level.isWall(neighbor)) openNeighbors++;
+                }
+                
+                // Accept positions with 1-3 open neighbors
+                if (openNeighbors <= 3) {
+                    // Quick check: not too close to cycle agents
+                    boolean tooClose = false;
+                    for (int agentId : cycleAgents) {
+                        Position agentPos = state.getAgentPosition(agentId);
+                        if (Math.abs(current.row - agentPos.row) <= 1 && 
+                            Math.abs(current.col - agentPos.col) <= 1) {
+                            tooClose = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!tooClose) {
+                        return current;
+                    }
+                }
+            }
+            
+            // Expand neighbors
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!visited.contains(next) && !level.isWall(next)) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        
+        // Fallback: return first valid position we found
+        for (Position pos : visited) {
+            if (!avoid.contains(pos) && !level.isWall(pos)) {
+                return pos;
+            }
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Search for a path to displace a box to a safe position.
+     * Similar to searchForSubgoal but without goal protection (we're explicitly moving things out of the way).
+     */
+    private List<Action> searchForDisplacement(int agentId, Position boxStart, Position targetPos,
+            char boxType, State initialState, Level level, long timeLimitMs) {
+        
+        long startTime = System.currentTimeMillis();
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKey, Integer> bestG = new HashMap<>();
+
+        int h = getDistance(boxStart, targetPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart);
+        StateKey startKey = new StateKey(initialState, agentId, boxStart);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        int exploredCount = 0;
+        int maxExplore = 2000; // Reduced from 5000
+
+        while (!openList.isEmpty() && exploredCount < maxExplore) {
+            // Check timeout every 100 nodes to avoid overhead
+            if (exploredCount % 100 == 0 && System.currentTimeMillis() - startTime > timeLimitMs) {
+                return null;
+            }
+            
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            // Check if the box reached the target position
+            Character boxAtTarget = current.state.getBoxes().get(targetPos);
+            if (boxAtTarget != null && boxAtTarget == boxType) {
+                return reconstructPath(current);
+            }
+
+            // Expand node
+            for (Action action : getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) continue;
+
+                if (!current.state.isApplicable(action, agentId, level)) continue;
+
+                State newState = current.state.apply(action, agentId);
+
+                // Track current box position
+                Position newBoxPos = current.targetBoxPos;
+                if (action.type == Action.ActionType.PUSH || action.type == Action.ActionType.PULL) {
+                    // Find where the box moved
+                    Position agentPos = current.state.getAgentPosition(agentId);
+                    Position oldBoxPos;
+                    if (action.type == Action.ActionType.PUSH) {
+                        oldBoxPos = agentPos.move(action.agentDir);
+                        newBoxPos = oldBoxPos.move(action.boxDir);
+                    } else {
+                        oldBoxPos = agentPos.move(action.boxDir.opposite());
+                        newBoxPos = agentPos;
+                    }
+                    
+                    // Only track our target box
+                    Character movedBox = current.state.getBoxes().get(oldBoxPos);
+                    if (movedBox == null || movedBox != boxType) {
+                        newBoxPos = current.targetBoxPos;
+                    }
+                }
+
+                StateKey newKey = new StateKey(newState, agentId, newBoxPos);
+                int newG = current.g + 1;
+
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) continue;
+
+                bestG.put(newKey, newG);
+
+                int newH = getDistance(newBoxPos, targetPos, level);
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newBoxPos);
+                openList.add(newNode);
+            }
+        }
+
+        return null; // No path found
     }
 
     /**

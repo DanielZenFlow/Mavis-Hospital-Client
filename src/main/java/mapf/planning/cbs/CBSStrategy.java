@@ -101,10 +101,18 @@ public class CBSStrategy implements SearchStrategy {
             Conflict conflict = findFirstConflict(current, level);
             
             if (conflict == null) {
-                // No conflicts! We have a valid solution
-                System.err.println(getName() + ": Solution found! Cost=" + current.cost + 
-                    ", CT nodes=" + highLevelNodesExpanded + ", low-level searches=" + lowLevelSearches);
-                return convertToJointActions(current, numAgents);
+                // No conflicts! Check if we've actually reached the goal state
+                State finalState = getFinalState(current, numAgents);
+                if (finalState != null && finalState.isGoalState(level)) {
+                    System.err.println(getName() + ": Solution found! Cost=" + current.cost + 
+                        ", CT nodes=" + highLevelNodesExpanded + ", low-level searches=" + lowLevelSearches);
+                    return convertToJointActions(current, numAgents);
+                } else {
+                    // No conflicts but not at goal - CBS can't help here
+                    // This means agents aren't blocking each other, but boxes aren't at goals
+                    System.err.println(getName() + ": No conflicts but goal not reached - need box manipulation");
+                    return null;
+                }
             }
             
             // Branch on the conflict: create two child nodes with new constraints
@@ -261,6 +269,26 @@ public class CBSStrategy implements SearchStrategy {
             return path.get(path.size() - 1); // Agent stays at final position
         }
         return path.get(time);
+    }
+    
+    /**
+     * Gets the final state after executing all agent paths.
+     * Since CBS plans each agent independently, we need to get the last state
+     * from the longest path.
+     */
+    private State getFinalState(CTNode node, int numAgents) {
+        int maxTime = 0;
+        for (List<State> path : node.solution.values()) {
+            maxTime = Math.max(maxTime, path.size() - 1);
+        }
+        
+        // Get state at final time from any agent's path
+        for (List<State> path : node.solution.values()) {
+            if (path != null && !path.isEmpty()) {
+                return path.get(Math.min(maxTime, path.size() - 1));
+            }
+        }
+        return null;
     }
     
     /**
