@@ -1,6 +1,7 @@
 package mapf.planning;
 
 import mapf.domain.*;
+import mapf.planning.cbs.CBSStrategy;
 
 /**
  * Factory for selecting appropriate search strategy based on level characteristics.
@@ -48,6 +49,17 @@ public class StrategySelector {
             System.err.println("StrategySelector: Using PriorityPlanningStrategy (many agents)");
             return new PriorityPlanningStrategy(heuristic, config);
         }
+    }
+    
+    /**
+     * Creates a CBS strategy for handling cyclic dependencies.
+     * Called when PriorityPlanningStrategy detects a cyclic dependency.
+     * 
+     * @return CBS strategy instance
+     */
+    public CBSStrategy createCBSStrategy() {
+        System.err.println("StrategySelector: Creating CBS strategy for cyclic dependency resolution");
+        return new CBSStrategy(heuristic, config);
     }
     
     /**

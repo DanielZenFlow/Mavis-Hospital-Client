@@ -71,6 +71,12 @@ public class SearchConfig {
 
     /** Stuck iterations before running dependency analysis */
     public static final int DEPENDENCY_CHECK_THRESHOLD = 5;
+    
+    /** Maximum plan length for CBS (prevents infinite exploration) */
+    public static final int MAX_PLAN_LENGTH = 500;
+    
+    /** Use CBS when cyclic dependency is detected */
+    public static final boolean USE_CBS_ON_CYCLE = true;
 
     // ========== Logging Configuration ==========
     
