@@ -2,6 +2,11 @@ package mapf.planning;
 
 import mapf.domain.*;
 import mapf.planning.cbs.CBSStrategy;
+import mapf.planning.heuristic.Heuristic;
+import mapf.planning.strategy.JointAStarStrategy;
+import mapf.planning.strategy.PriorityPlanningStrategy;
+import mapf.planning.strategy.SimplePriorityStrategy;
+import mapf.planning.strategy.SingleAgentStrategy;
 
 /**
  * Factory for selecting appropriate search strategy based on level characteristics.
@@ -12,6 +17,12 @@ public class StrategySelector {
     
     private final Heuristic heuristic;
     private final SearchConfig config;
+    
+    /** 
+     * Set to true to use the new simplified priority strategy.
+     * This is useful for testing the refactored architecture.
+     */
+    public static boolean USE_SIMPLE_STRATEGY = false;
     
     public StrategySelector(Heuristic heuristic) {
         this(heuristic, new SearchConfig());
@@ -38,6 +49,12 @@ public class StrategySelector {
         int numAgents = initialState.getNumAgents();
         
         System.err.println("StrategySelector: " + numAgents + " agents detected");
+        
+        // Option to use new simplified strategy for testing
+        if (USE_SIMPLE_STRATEGY && numAgents > 1) {
+            System.err.println("StrategySelector: Using SimplePriorityStrategy (REFACTORED)");
+            return new SimplePriorityStrategy();
+        }
         
         if (numAgents <= 1) {
             System.err.println("StrategySelector: Using SingleAgentStrategy");

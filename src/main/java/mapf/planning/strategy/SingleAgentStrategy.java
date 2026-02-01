@@ -1,6 +1,10 @@
-package mapf.planning;
+package mapf.planning.strategy;
 
 import mapf.domain.*;
+import mapf.planning.SearchConfig;
+import mapf.planning.SearchStrategy;
+import mapf.planning.heuristic.Heuristic;
+
 import java.util.*;
 
 /**

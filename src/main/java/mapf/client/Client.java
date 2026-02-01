@@ -2,6 +2,11 @@ package mapf.client;
 
 import mapf.domain.*;
 import mapf.planning.*;
+import mapf.planning.heuristic.Heuristic;
+import mapf.planning.heuristic.ManhattanHeuristic;
+import mapf.planning.heuristic.TrueDistanceHeuristic;
+import mapf.planning.strategy.JointAStarStrategy;
+import mapf.planning.strategy.SingleAgentStrategy;
 
 import java.io.*;
 import java.util.*;
@@ -20,6 +25,9 @@ import java.util.*;
  * 
  * Strategy Pattern: Dynamically selects search algorithm based on level complexity.
  * Fallback Mechanism: If one strategy fails/times out, tries next with increased weight.
+ * 
+ * Environment Variables:
+ * - USE_SIMPLE_STRATEGY=true : Use the new simplified priority strategy (for testing refactored code)
  */
 public class Client {
     
@@ -43,6 +51,15 @@ public class Client {
     
     /** Search configuration */
     private final SearchConfig config;
+    
+    static {
+        // Check environment variable to enable new simplified strategy
+        String useSimple = System.getenv("USE_SIMPLE_STRATEGY");
+        if ("true".equalsIgnoreCase(useSimple)) {
+            StrategySelector.USE_SIMPLE_STRATEGY = true;
+            System.err.println("[Client] USE_SIMPLE_STRATEGY enabled via environment variable");
+        }
+    }
     
     /**
      * Creates a new Client with standard I/O streams.
@@ -257,21 +274,23 @@ public class Client {
     
     /**
      * Creates appropriate search strategy based on agent count and config.
+     * Uses StrategySelector which can be configured via USE_SIMPLE_STRATEGY.
      */
     private SearchStrategy createStrategy(int numAgents, SearchConfig strategyConfig) {
         Heuristic heuristic = createHeuristic();
         
-        if (numAgents == 1) {
-            SingleAgentStrategy strategy = new SingleAgentStrategy(heuristic, strategyConfig);
-            strategy.setWeight(strategyConfig.getAstarWeight());
-            return strategy;
-        } else if (numAgents <= SearchConfig.JOINT_ASTAR_AGENT_THRESHOLD) {
-            JointAStarStrategy strategy = new JointAStarStrategy(heuristic, strategyConfig);
-            strategy.setWeight(strategyConfig.getAstarWeight());
-            return strategy;
-        } else {
-            return new PriorityPlanningStrategy(heuristic, strategyConfig);
+        // Use StrategySelector to allow simple strategy testing
+        StrategySelector selector = new StrategySelector(heuristic, strategyConfig);
+        SearchStrategy strategy = selector.selectStrategy(level, currentState);
+        
+        // Set weight if supported
+        if (strategy instanceof SingleAgentStrategy) {
+            ((SingleAgentStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
+        } else if (strategy instanceof JointAStarStrategy) {
+            ((JointAStarStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
         }
+        
+        return strategy;
     }
     
     /**

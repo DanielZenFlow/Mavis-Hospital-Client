@@ -1,4 +1,4 @@
-package mapf.planning;
+package mapf.planning.heuristic;
 
 import mapf.domain.Level;
 import mapf.domain.State;

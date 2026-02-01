@@ -1,6 +1,9 @@
-package mapf.planning;
+package mapf.planning.pathfinding;
 
 import mapf.domain.*;
+import mapf.planning.SearchConfig;
+import mapf.planning.coordination.ConflictDetector;
+import mapf.planning.heuristic.Heuristic;
 
 import java.util.*;
 

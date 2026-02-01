@@ -1,4 +1,4 @@
-package mapf.planning;
+package mapf.planning.coordination;
 
 import mapf.domain.*;
 

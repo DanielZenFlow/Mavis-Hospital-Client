@@ -38,6 +38,12 @@ public class AgentYieldingManager {
      * Key: agentId, Value: last known safe position for that agent
      */
     private final Map<Integer, Position> agentSafePositions = new HashMap<>();
+    
+    /**
+     * Safe zone calculator for finding parking positions.
+     * Uses global working area analysis to avoid blocking other agents.
+     */
+    private final SafeZoneCalculator safeZoneCalculator = new SafeZoneCalculator();
 
     // Logging control
     private boolean verboseLogging = false;
@@ -216,10 +222,11 @@ public class AgentYieldingManager {
      * Finds a safe position where the agent won't block any corridors or critical
      * paths.
      * 
-     * A position is "safe" if:
-     * 1. It's not in a corridor (has 3+ free neighbors)
-     * 2. It doesn't block any other agent's critical path
-     * 3. It's reachable from the current position
+     * Uses SafeZoneCalculator to:
+     * 1. Compute global working area (all other agents' future paths)
+     * 2. Find positions NOT in the global working area
+     * 3. Prefer dead-ends and open areas over corridors
+     * 4. Avoid bottleneck positions
      * 
      * @param agentId Agent that needs to move
      * @param state   Current state
@@ -227,58 +234,22 @@ public class AgentYieldingManager {
      * @return The nearest safe position, or null if none found
      */
     public Position findNearestSafePosition(int agentId, State state, Level level) {
-        Position currentPos = state.getAgentPosition(agentId);
-
-        // BFS to find nearest safe position
-        Queue<Position> queue = new LinkedList<>();
-        Set<Position> visited = new HashSet<>();
-
-        queue.add(currentPos);
-        visited.add(currentPos);
-
-        int maxSearchDistance = Math.max(level.getRows(), level.getCols()) * 2;
-        int searched = 0;
-
-        while (!queue.isEmpty() && searched < maxSearchDistance * 10) {
-            Position pos = queue.poll();
-            searched++;
-
-            // Skip current position
-            if (!pos.equals(currentPos) && isSafePosition(pos, agentId, state, level)) {
-                log("[YIELD] Found safe position for Agent " + agentId + ": " + pos);
-                agentSafePositions.put(agentId, pos);
-                return pos;
-            }
-
-            // Explore neighbors
-            for (Direction dir : Direction.values()) {
-                Position next = pos.move(dir);
-
-                if (!visited.contains(next) && !level.isWall(next)) {
-                    // Don't path through other agents (they might move)
-                    boolean occupiedByAgent = false;
-                    for (int i = 0; i < state.getNumAgents(); i++) {
-                        if (i != agentId && state.getAgentPosition(i).equals(next)) {
-                            occupiedByAgent = true;
-                            break;
-                        }
-                    }
-
-                    if (!occupiedByAgent) {
-                        visited.add(next);
-                        queue.add(next);
-                    }
-                }
-            }
+        // Use the SafeZoneCalculator for proper global working area analysis
+        Position safePos = safeZoneCalculator.findSafePosition(agentId, state, level);
+        
+        if (safePos != null) {
+            agentSafePositions.put(agentId, safePos);
+            log("[YIELD] Found safe position for Agent " + agentId + ": " + safePos);
+        } else {
+            log("[YIELD] No safe position found for Agent " + agentId);
         }
-
-        log("[YIELD] No safe position found for Agent " + agentId);
-        return null;
+        
+        return safePos;
     }
 
     /**
      * Checks if a position is "safe" for parking.
-     * Safe = not in corridor + not blocking anyone's critical path
+     * Uses SafeZoneCalculator to check against global working area.
      */
     public boolean isSafePosition(Position pos, int agentId, State state, Level level) {
         // Check 1: Not a wall
@@ -289,29 +260,19 @@ public class AgentYieldingManager {
         if (state.getBoxes().containsKey(pos))
             return false;
 
-        // Check 3: Not in a corridor (has at least 3 free neighbors)
+        // Check 3: Not in a corridor (has at least 3 free neighbors) OR is a dead-end
         int freeNeighbors = countFreeNeighbors(pos, level);
-        if (freeNeighbors < 3) {
-            return false; // In a corridor or dead-end
+        if (freeNeighbors == 2) {
+            return false; // In a corridor - avoid
         }
-
-        // Check 4: Not blocking any other agent's critical path
-        int numAgents = state.getNumAgents();
-        for (int otherId = 0; otherId < numAgents; otherId++) {
-            if (otherId == agentId)
-                continue;
-
-            Position otherPos = state.getAgentPosition(otherId);
-            Position otherGoal = findAgentGoalPosition(otherId, level);
-
-            if (otherGoal == null)
-                continue;
-
-            // Would this position block the other agent?
-            Set<Position> criticalPath = findCriticalPath(otherPos, otherGoal, level, state);
-            if (criticalPath.contains(pos)) {
-                return false;
-            }
+        
+        // Dead-ends (freeNeighbors == 1) are OK for parking
+        // Open areas (freeNeighbors >= 3) are also OK
+        
+        // Check 4: Not in any other agent's global working area
+        Set<Position> globalWorkingArea = safeZoneCalculator.computeGlobalWorkingArea(agentId, state, level);
+        if (globalWorkingArea.contains(pos)) {
+            return false;
         }
 
         return true;

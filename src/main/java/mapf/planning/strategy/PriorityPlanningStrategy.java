@@ -1,10 +1,16 @@
-package mapf.planning;
+package mapf.planning.strategy;
 
 import mapf.domain.*;
+import mapf.planning.SearchConfig;
+import mapf.planning.SearchStrategy;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.AgentYieldingManager;
+import mapf.planning.coordination.ConflictDetector;
 import mapf.planning.coordination.DeadlockResolver;
+import mapf.planning.coordination.SafeZoneCalculator;
+import mapf.planning.heuristic.Heuristic;
+import mapf.planning.heuristic.TrueDistanceHeuristic;
 import java.util.*;
 
 /**
@@ -31,44 +37,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     private final Heuristic heuristic;
     private final SearchConfig config;
-    private final ConflictDetector conflictDetector;
     private long timeoutMs;
     private int maxStates;
-    private final Random random = new Random(SearchConfig.RANDOM_SEED); // For priority re-ordering
+    private final Random random = new Random(SearchConfig.RANDOM_SEED);
 
-    /**
-     * Manages agent yielding behavior - extracted for Single Responsibility Principle.
-     * Handles both reactive yielding (when blocking) and proactive yielding (after task completion).
-     */
+    // ========== Refactored Helper Classes (SRP compliant) ==========
+    private final SubgoalManager subgoalManager;
+    private final SubgoalSearcher subgoalSearcher;
+    private final TopologicalAnalyzer topologicalAnalyzer;
+    private final ConflictResolver conflictResolver;
+    private final ImmovableBoxDetector immovableDetector;
+    
+    // Legacy helpers (to be refactored further)
     private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
-
-    /**
-     * Resolves deadlocks when multiple agents/boxes form blocking cycles.
-     * Implements temporary box displacement to break cycles.
-     */
     private final DeadlockResolver deadlockResolver = new DeadlockResolver();
-
-    /**
-     * Cache for goal topological depths. Computed once per level.
-     * Higher depth = deeper inside dead-end region = should be filled FIRST.
-     */
-    private Map<Position, Integer> goalTopologicalDepths = null;
-    private Level cachedLevel = null;
-
-    /**
-     * Cache for immovable box positions (boxes that no agent can push).
-     * These are treated as walls for pathfinding purposes.
-     */
-    private Set<Position> immovableBoxPositions = null;
-    private State cachedStateForImmovable = null;
-
-    /**
-     * Cache for pre-satisfied static goals (goals already satisfied by immovable boxes).
-     * These goals should be completely skipped during planning - they are "decorations".
-     * Example: GROUP TWENTY in Spiraling.lvl - boxes already at goals, surrounded by walls.
-     */
-    private Set<Position> preSatisfiedStaticGoals = null;
-    private State cachedStateForStaticGoals = null;
+    private final SafeZoneCalculator safeZoneCalculator = new SafeZoneCalculator();
 
     /**
      * Tracks displacement attempts to avoid infinite loops.
@@ -103,9 +86,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     public PriorityPlanningStrategy(Heuristic heuristic, SearchConfig config) {
         this.heuristic = heuristic;
         this.config = config;
-        this.conflictDetector = new ConflictDetector();
         this.timeoutMs = config.getTimeoutMs();
         this.maxStates = config.getMaxStates();
+        
+        // Initialize refactored helpers
+        this.subgoalManager = new SubgoalManager(heuristic);
+        this.subgoalSearcher = new SubgoalSearcher(heuristic);
+        this.topologicalAnalyzer = new TopologicalAnalyzer();
+        this.conflictResolver = new ConflictResolver();
+        this.immovableDetector = new ImmovableBoxDetector();
     }
 
     @Override
@@ -750,60 +739,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /**
      * Gets all unsatisfied subgoals (box goals not yet achieved).
      * Filters out pre-satisfied static goals (decorative elements like GROUP TWENTY).
+     * 
+     * CRITICAL FIX: Also returns agent goals for agents that have completed their box tasks,
+     * even if other agents still have box goals. This prevents agents from blocking each other
+     * while waiting for Phase 2 to start.
      */
     private List<Subgoal> getUnsatisfiedSubgoals(State state, Level level) {
-        List<Subgoal> unsatisfied = new ArrayList<>();
-        
-        // Ensure pre-satisfied static goals are computed
-        ensurePreSatisfiedStaticGoalsComputed(state, level);
-
-        // Phase 1: Box goals
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position goalPos = new Position(row, col);
-                    
-                    // CRITICAL: Skip pre-satisfied static goals (decorations)
-                    if (preSatisfiedStaticGoals.contains(goalPos)) {
-                        continue;
-                    }
-                    
-                    Character actualBox = state.getBoxes().get(goalPos);
-
-                    // Check if goal is not satisfied
-                    if (actualBox == null || actualBox != goalType) {
-                        Color boxColor = level.getBoxColor(goalType);
-                        int agentId = findAgentForColor(boxColor, level, state.getNumAgents());
-                        if (agentId != -1) {
-                            unsatisfied.add(new Subgoal(agentId, goalType, goalPos, false));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 2: Agent goals (only after all box goals are satisfied or when making
-        // progress on box goals is blocked)
-        if (unsatisfied.isEmpty()) {
-            for (int row = 0; row < level.getRows(); row++) {
-                for (int col = 0; col < level.getCols(); col++) {
-                    int agentGoal = level.getAgentGoal(row, col);
-                    if (agentGoal >= 0 && agentGoal < state.getNumAgents()) {
-                        Position goalPos = new Position(row, col);
-                        Position agentPos = state.getAgentPosition(agentGoal);
-
-                        // Check if agent is not at goal position
-                        if (!agentPos.equals(goalPos)) {
-                            // Use special boxType '\0' to indicate agent goal
-                            unsatisfied.add(new Subgoal(agentGoal, '\0', goalPos, true));
-                        }
-                    }
-                }
-            }
-        }
-
-        return unsatisfied;
+        // Delegate to SubgoalManager (SRP: single responsibility for subgoal identification)
+        return subgoalManager.getUnsatisfiedSubgoals(state, level, immovableDetector);
     }
 
     /**
@@ -811,281 +754,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Returns Integer.MAX_VALUE if agent cannot reach any box of the required type.
      */
     private int estimateSubgoalDifficulty(Subgoal subgoal, State state, Level level) {
-        // Handle agent goals (no box involved)
-        if (subgoal.isAgentGoal) {
-            Position agentPos = state.getAgentPosition(subgoal.agentId);
-            return getDistanceWithImmovableBoxes(agentPos, subgoal.goalPos, state, level);
-        }
-
-        Position closestBox = findBestBoxForGoal(subgoal, state, level);
-        if (closestBox == null) {
-            return Integer.MAX_VALUE;
-        }
-
-        // Box to goal distance (considering immovable boxes as walls)
-        int boxToGoal = getDistanceWithImmovableBoxes(closestBox, subgoal.goalPos, state, level);
-
-        // Agent to box distance (considering immovable boxes as walls)
-        Position agentPos = state.getAgentPosition(subgoal.agentId);
-        int agentToBox = getDistanceWithImmovableBoxes(agentPos, closestBox, state, level);
-
-        // If agent can't reach box, return MAX_VALUE
-        if (agentToBox == Integer.MAX_VALUE || boxToGoal == Integer.MAX_VALUE) {
-            return Integer.MAX_VALUE;
-        }
-
-        return boxToGoal + agentToBox;
+        // Delegate to SubgoalManager (SRP: single responsibility for difficulty estimation)
+        return subgoalManager.estimateSubgoalDifficulty(subgoal, state, level, immovableDetector);
     }
 
     /**
-     * Finds the best box of the given type to move to the goal.
-     * CRITICAL: Must verify that the agent can actually REACH the box!
-     * Boxes that the agent cannot reach (due to walls or immovable boxes) are
-     * skipped.
-     */
-    private Position findBestBoxForGoal(Subgoal subgoal, State state, Level level) {
-        Position bestBox = null;
-        int bestTotalDist = Integer.MAX_VALUE;
-        Position agentPos = state.getAgentPosition(subgoal.agentId);
-
-        // Ensure immovable boxes are identified
-        ensureImmovableBoxesComputed(state, level);
-
-        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
-            if (entry.getValue() == subgoal.boxType) {
-                Position boxPos = entry.getKey();
-
-                // Skip if this box is already at a satisfied goal for this type
-                if (level.getBoxGoal(boxPos) == subgoal.boxType) {
-                    continue;
-                }
-
-                // Skip if this box is immovable (no agent can push it)
-                if (immovableBoxPositions.contains(boxPos)) {
-                    continue;
-                }
-
-                // CRITICAL: Check if agent can actually REACH this box
-                // Use BFS that treats immovable boxes as walls
-                int agentToBox = getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
-                if (agentToBox == Integer.MAX_VALUE) {
-                    // Agent cannot reach this box - skip it entirely!
-                    logVerbose("[REACHABILITY] Agent " + subgoal.agentId + " cannot reach box " +
-                            subgoal.boxType + " at " + boxPos + " - skipping");
-                    continue;
-                }
-
-                int boxToGoal = getDistanceWithImmovableBoxes(boxPos, subgoal.goalPos, state, level);
-                if (boxToGoal == Integer.MAX_VALUE) {
-                    // Box cannot reach goal - skip it
-                    continue;
-                }
-
-                int totalDist = agentToBox + boxToGoal;
-                if (totalDist < bestTotalDist) {
-                    bestTotalDist = totalDist;
-                    bestBox = boxPos;
-                }
-            }
-        }
-
-        if (bestBox != null) {
-            logVerbose("[REACHABILITY] Selected box " + subgoal.boxType + " at " + bestBox +
-                    " for goal " + subgoal.goalPos + " (total dist: " + bestTotalDist + ")");
-        }
-
-        return bestBox;
-    }
-
-    /**
-     * Computes and caches which boxes are immovable (no agent can push them).
-     * These boxes should be treated as walls for pathfinding.
-     */
-    private void ensureImmovableBoxesComputed(State state, Level level) {
-        // Only recompute if state changed (boxes might have moved)
-        if (immovableBoxPositions != null && cachedStateForImmovable == state) {
-            return;
-        }
-
-        cachedStateForImmovable = state;
-        immovableBoxPositions = new HashSet<>();
-
-        // First, find which colors have agents that can push them
-        Set<Color> pushableColors = new HashSet<>();
-        for (int i = 0; i < state.getNumAgents(); i++) {
-            pushableColors.add(level.getAgentColor(i));
-        }
-
-        // Mark all boxes whose color has no matching agent as immovable
-        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
-            char boxType = entry.getValue();
-            Color boxColor = level.getBoxColor(boxType);
-
-            if (!pushableColors.contains(boxColor)) {
-                immovableBoxPositions.add(entry.getKey());
-            }
-        }
-
-        if (!immovableBoxPositions.isEmpty()) {
-            logVerbose("[IMMOVABLE] Found " + immovableBoxPositions.size() + " immovable boxes (treated as walls)");
-        }
-    }
-
-    /**
-     * Computes and caches pre-satisfied static goals.
-     * A goal is "pre-satisfied static" if:
-     * 1. A box of the correct type is already at the goal position in the INITIAL state
-     * 2. That box cannot be moved (surrounded by walls or no agent can push it)
-     * 
-     * These goals represent "decorative" elements like GROUP TWENTY in Spiraling.lvl
-     * that should be completely skipped during planning.
-     */
-    private void ensurePreSatisfiedStaticGoalsComputed(State state, Level level) {
-        // Only compute once per state
-        if (preSatisfiedStaticGoals != null && cachedStateForStaticGoals == state) {
-            return;
-        }
-
-        cachedStateForStaticGoals = state;
-        preSatisfiedStaticGoals = new HashSet<>();
-        
-        // Ensure immovable boxes are computed first
-        ensureImmovableBoxesComputed(state, level);
-
-        // Find which colors have agents that can push them
-        Set<Color> pushableColors = new HashSet<>();
-        for (int i = 0; i < state.getNumAgents(); i++) {
-            pushableColors.add(level.getAgentColor(i));
-        }
-
-        // Check all goal positions
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType == '\0') continue;
-                
-                Position goalPos = new Position(row, col);
-                Character actualBox = state.getBoxes().get(goalPos);
-                
-                // Check 1: Is the correct box type already at this goal?
-                if (actualBox == null || actualBox != goalType) {
-                    continue; // Goal not satisfied, not a static goal
-                }
-                
-                // Check 2: Can this box be moved?
-                // A box is immovable if:
-                // - No agent has matching color, OR
-                // - Box is physically trapped (surrounded by walls on opposite sides)
-                
-                Color boxColor = level.getBoxColor(goalType);
-                boolean hasMatchingAgent = pushableColors.contains(boxColor);
-                
-                if (!hasMatchingAgent) {
-                    // No agent can push this box - it's static
-                    preSatisfiedStaticGoals.add(goalPos);
-                    continue;
-                }
-                
-                // Check if box is physically trapped (can't be pushed in any direction)
-                boolean canBePushed = false;
-                
-                // For a box to be pushable, there must be at least one direction where:
-                // - The cell in that direction is free (not wall)
-                // - The cell in the opposite direction is free (agent can stand there)
-                for (Direction dir : Direction.values()) {
-                    Position pushTo = goalPos.move(dir);
-                    Position agentFrom = goalPos.move(dir.opposite());
-                    
-                    // Check if push is physically possible
-                    if (!level.isWall(pushTo) && !level.isWall(agentFrom)) {
-                        // Also check that neither position has an immovable box
-                        if (!immovableBoxPositions.contains(pushTo) && 
-                            !immovableBoxPositions.contains(agentFrom)) {
-                            // Further check: can any agent actually reach the push position?
-                            // (We do a simple check - if there's a path from any agent to agentFrom)
-                            canBePushed = true;
-                            break;
-                        }
-                    }
-                }
-                
-                if (!canBePushed) {
-                    // Box is physically trapped - it's a static goal
-                    preSatisfiedStaticGoals.add(goalPos);
-                }
-            }
-        }
-
-        if (!preSatisfiedStaticGoals.isEmpty()) {
-            logMinimal("[STATIC-GOALS] Found " + preSatisfiedStaticGoals.size() + 
-                      " pre-satisfied static goals (skipped as decorations)");
-            for (Position pos : preSatisfiedStaticGoals) {
-                char goalType = level.getBoxGoal(pos);
-                logVerbose("  - Goal '" + goalType + "' at " + pos + " (already satisfied & immovable)");
-            }
-        }
-    }
-
-    /**
-     * Calculates distance between two positions, treating immovable boxes as walls.
-     * Uses BFS to find actual reachable distance.
-     */
-    private int getDistanceWithImmovableBoxes(Position from, Position to, State state, Level level) {
-        if (from.equals(to))
-            return 0;
-
-        ensureImmovableBoxesComputed(state, level);
-
-        // BFS to find shortest path treating immovable boxes as walls
-        // CRITICAL FIX: For complex maps like spirals, the actual path can be MUCH longer
-        // than Manhattan distance. We use a generous limit based on map size.
-        int maxSearchDist = Math.max(
-            level.getRows() * level.getCols() / 2,  // Half of total cells
-            from.manhattanDistance(to) * 10 + 100   // 10x Manhattan + buffer
-        );
-        
-        Queue<Position> queue = new LinkedList<>();
-        Map<Position, Integer> distances = new HashMap<>();
-
-        queue.add(from);
-        distances.put(from, 0);
-
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            int currentDist = distances.get(current);
-
-            if (current.equals(to)) {
-                return currentDist;
-            }
-
-            // Use generous search limit for spiral/maze-like maps
-            if (currentDist > maxSearchDist) {
-                continue;
-            }
-
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-
-                if (distances.containsKey(next))
-                    continue;
-                if (level.isWall(next))
-                    continue;
-
-                // CRITICAL: Treat immovable boxes as walls!
-                if (immovableBoxPositions.contains(next))
-                    continue;
-
-                distances.put(next, currentDist + 1);
-                queue.add(next);
-            }
-        }
-
-        return Integer.MAX_VALUE; // Unreachable
-    }
-
-    /**
-     * Gets distance between two positions using true distance heuristic if
-     * available.
+     * Calculates distance between two positions using true distance heuristic if available.
      */
     private int getDistance(Position from, Position to, Level level) {
         if (heuristic instanceof TrueDistanceHeuristic) {
@@ -1105,23 +779,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * not be moved.
      * This prevents later subgoals from disrupting already-completed goals.
      */
+    /**
+     * Computes the set of positions where boxes are already at satisfied goals.
+     */
     private Set<Position> computeSatisfiedGoalPositions(State state, Level level) {
-        Set<Position> satisfiedPositions = new HashSet<>();
-
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position pos = new Position(row, col);
-                    Character actualBox = state.getBoxes().get(pos);
-                    if (actualBox != null && actualBox == goalType) {
-                        satisfiedPositions.add(pos);
-                    }
-                }
-            }
-        }
-
-        return satisfiedPositions;
+        // Delegate to GoalChecker (SRP: single responsibility for goal-related utilities)
+        return GoalChecker.computeSatisfiedGoalPositions(state, level);
     }
 
     /**
@@ -1786,38 +1449,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * @return Joint action with conflicts resolved
      */
     private Action[] resolveConflicts(Action[] jointAction, State state, Level level, int primaryAgentId) {
-        List<ConflictDetector.Conflict> conflicts = conflictDetector.detectConflicts(state, jointAction, level);
-
-        for (ConflictDetector.Conflict conflict : conflicts) {
-            int waitingAgent;
-
-            // CRITICAL: Primary agent NEVER waits - it has the right of way
-            if (conflict.agent1 == primaryAgentId) {
-                waitingAgent = conflict.agent2;
-            } else if (conflict.agent2 == primaryAgentId) {
-                waitingAgent = conflict.agent1;
-            } else {
-                // Neither is primary, use standard rule (higher ID waits)
-                waitingAgent = Math.max(conflict.agent1, conflict.agent2);
-            }
-
-            jointAction[waitingAgent] = Action.noOp();
-        }
-
-        return jointAction;
+        // Delegate to ConflictResolver (SRP: single responsibility for conflict resolution)
+        return conflictResolver.resolveConflicts(jointAction, state, level, primaryAgentId);
     }
 
     /**
      * Resolves conflicts in joint action by making conflicting agents wait.
      * Uses standard "higher ID waits" rule when no primary agent is specified.
-     *
-     * @param jointAction The joint action to resolve conflicts for
-     * @param state Current state
-     * @param level The level
-     * @return Joint action with conflicts resolved
      */
     private Action[] resolveConflicts(Action[] jointAction, State state, Level level) {
-        return resolveConflicts(jointAction, state, level, -1); // No primary agent
+        // Delegate to ConflictResolver (SRP: single responsibility for conflict resolution)
+        return conflictResolver.resolveConflicts(jointAction, state, level);
     }
 
     /**
@@ -1964,98 +1606,32 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Checks if an agent's goals are all satisfied.
      */
     private boolean isAgentGoalSatisfied(int agentId, State state, Level level) {
-        Color agentColor = level.getAgentColor(agentId);
-
-        // Check box goals for this agent's color
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position pos = new Position(row, col);
-                    Character actualBox = state.getBoxes().get(pos);
-                    if (actualBox == null || actualBox != goalType) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        // Check agent goal position (if any)
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = new Position(row, col);
-                    if (!state.getAgentPosition(agentId).equals(goalPos)) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        return true;
+        // Delegate to GoalChecker (SRP: single responsibility for goal checking)
+        return GoalChecker.isAgentGoalSatisfied(agentId, state, level);
     }
 
     /**
-     * Checks if ALL box goals in the level are satisfied (regardless of agent
-     * color).
-     * This is different from hasCompletedBoxTasks which only checks one agent's
-     * color.
-     * 
-     * This method is used to control when agents can start moving toward their
-     * agent goals - they should only do so after ALL box goals are globally
-     * satisfied,
-     * not just their own color's box goals.
+     * Checks if ALL box goals in the level are satisfied (regardless of agent color).
      */
     private boolean allBoxGoalsSatisfied(State state, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position pos = new Position(row, col);
-                    Character actualBox = state.getBoxes().get(pos);
-                    if (actualBox == null || actualBox != goalType) {
-                        return false; // At least one box goal unsatisfied
-                    }
-                }
-            }
-        }
-        return true; // All box goals satisfied globally
+        // Delegate to GoalChecker (SRP: single responsibility for goal checking)
+        return GoalChecker.allBoxGoalsSatisfied(state, level);
     }
 
     /**
      * Finds the agent that can move boxes of a given color.
      */
     private int findAgentForColor(Color color, Level level, int numAgents) {
-        for (int i = 0; i < numAgents; i++) {
-            if (level.getAgentColor(i) == color) {
-                return i;
-            }
-        }
-        return -1;
+        // Delegate to GoalChecker (SRP: single responsibility for goal-related utilities)
+        return GoalChecker.findAgentForColor(color, level, numAgents);
     }
 
     /**
      * Generates all possible actions (cached for performance).
      */
-    private static List<Action> ALL_ACTIONS = null;
-
     private List<Action> getAllActions() {
-        if (ALL_ACTIONS == null) {
-            ALL_ACTIONS = new ArrayList<>();
-            ALL_ACTIONS.add(Action.noOp());
-
-            for (Direction dir : Direction.values()) {
-                ALL_ACTIONS.add(Action.move(dir));
-            }
-
-            for (Direction agentDir : Direction.values()) {
-                for (Direction boxDir : Direction.values()) {
-                    ALL_ACTIONS.add(Action.push(agentDir, boxDir));
-                    ALL_ACTIONS.add(Action.pull(agentDir, boxDir));
-                }
-            }
-        }
-        return ALL_ACTIONS;
+        // Delegate to PlanningUtils (SRP: single responsibility for planning utilities)
+        return PlanningUtils.getAllActions();
     }
 
     // ========== Helper Classes ==========
@@ -2064,13 +1640,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Represents a subgoal: moving a box type to a specific goal position,
      * or moving an agent to its goal position.
      */
-    private static class Subgoal {
+    public static class Subgoal {
         final int agentId;
         final char boxType; // '\0' for agent goals
         final Position goalPos;
         final boolean isAgentGoal; // true if this is an agent position goal
 
-        Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal) {
+        public Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal) {
             this.agentId = agentId;
             this.boxType = boxType;
             this.goalPos = goalPos;
@@ -2078,7 +1654,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
 
         // Backward compatibility constructor for box goals
-        Subgoal(int agentId, char boxType, Position goalPos) {
+        public Subgoal(int agentId, char boxType, Position goalPos) {
             this(agentId, boxType, goalPos, false);
         }
     }
@@ -2443,23 +2019,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Checks if an agent has completed all its box-moving tasks.
      */
     private boolean hasCompletedBoxTasks(int agentId, State state, Level level) {
-        Color agentColor = level.getAgentColor(agentId);
-
-        // Check all box goals for this agent's color
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position pos = new Position(row, col);
-                    Character actualBox = state.getBoxes().get(pos);
-                    if (actualBox == null || actualBox != goalType) {
-                        return false; // Still has unsatisfied box goals
-                    }
-                }
-            }
-        }
-
-        return true; // All box tasks complete
+        // Delegate to GoalChecker (SRP: single responsibility for goal-related utilities)
+        return GoalChecker.hasCompletedBoxTasks(agentId, state, level);
     }
 
     /**
@@ -3353,37 +2914,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * BFS distance between two positions, optionally avoiding certain positions.
      */
     private int bfsDistance(Position from, Position to, Level level, Set<Position> avoid) {
-        if (from.equals(to)) return 0;
-        
-        Queue<Position> queue = new LinkedList<>();
-        Map<Position, Integer> dist = new HashMap<>();
-        
-        queue.add(from);
-        dist.put(from, 0);
-        
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            int currentDist = dist.get(current);
-            
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-                
-                if (level.isWall(next)) continue;
-                if (dist.containsKey(next)) continue;
-                if (avoid != null && avoid.contains(next)) continue;
-                
-                int nextDist = currentDist + 1;
-                dist.put(next, nextDist);
-                
-                if (next.equals(to)) {
-                    return nextDist;
-                }
-                
-                queue.add(next);
-            }
-        }
-        
-        return Integer.MAX_VALUE;
+        // Delegate to PlanningUtils (SRP: single responsibility for planning utilities)
+        return PlanningUtils.bfsDistance(from, to, level, avoid);
     }
 
     // ========== Reverse Planning (HTN-style Goal Ordering) ==========
@@ -3561,14 +3093,30 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Key insight: In corridor-heavy maps like Spiraling, an agent completing a task
      * in a corridor will block ALL subsequent agents, even if not detected yet.
      * 
+     * CRITICAL FIX: If agent still has an agent goal to reach, do NOT yield to a distant
+     * "safe position". Instead, let the agent continue to its agent goal in Phase 2.
+     * This fixes the issue where agents complete box goals but never go to their agent goals.
+     * 
      * @return true if proactive yielding actions were added to the plan
      */
     private boolean performProactiveYielding(int completedAgentId, List<Action[]> plan, 
             State currentState, Level level, int numAgents) {
-        // Mark this agent as having completed its task
-        yieldingManager.markTaskCompleted(completedAgentId);
         
         Position currentPos = currentState.getAgentPosition(completedAgentId);
+        
+        // CRITICAL FIX: Check if agent has an agent goal to reach
+        // If yes, do NOT mark as completed and do NOT yield to a distant position
+        // The agent should continue to its agent goal in Phase 2
+        Position agentGoal = findAgentGoalPosition(completedAgentId, level);
+        if (agentGoal != null && !currentPos.equals(agentGoal)) {
+            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " has agent goal at " + agentGoal + 
+                    ", skipping proactive yield (will go to goal in Phase 2)");
+            // Do NOT mark as completed - agent still has work to do
+            return false;
+        }
+        
+        // Agent has no agent goal or is already at agent goal - can be marked as completed
+        yieldingManager.markTaskCompleted(completedAgentId);
         
         // Use PASSABLE neighbors (considers boxes and agents) for corridor detection
         // This is critical because a box at a neighbor position effectively creates a corridor
@@ -3660,12 +3208,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * CRITICAL: Must use passableNeighbors (considers boxes) not just freeNeighbors (map structure only)!
      * A position with 3 free neighbors on the map might only have 1 passable neighbor if boxes are nearby.
      * 
+     * IMPROVED: Now uses SafeZoneCalculator to check global working area (all agents' future paths)
+     * 
      * @return Best yield position, or null if none found
      */
     private Position findBestYieldPosition(int agentId, State state, Level level, List<Integer> blockedAgents) {
         Position currentPos = state.getAgentPosition(agentId);
         
-        // First try: use AgentYieldingManager's strict safe position
+        // IMPROVED: Use SafeZoneCalculator for proper global working area analysis
+        Position safePosFromCalculator = safeZoneCalculator.findSafePosition(agentId, state, level);
+        if (safePosFromCalculator != null) {
+            int passableNeighbors = countPassableNeighbors(safePosFromCalculator, state, level, agentId);
+            logNormal("[YIELD] SafeZoneCalculator found position " + safePosFromCalculator + 
+                    " (passableNeighbors=" + passableNeighbors + ")");
+            return safePosFromCalculator;
+        }
+        
+        // Fallback: Use AgentYieldingManager's strict safe position (now also uses SafeZoneCalculator internally)
         Position strictSafe = yieldingManager.findNearestSafePosition(agentId, state, level);
         if (strictSafe != null) {
             // Verify it's actually safe with current state (not just map structure)
@@ -3676,8 +3235,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         
-        // Second try: find position with most PASSABLE neighbors (considering boxes and agents)
-        // CRITICAL FIX: Use passableNeighbors, not freeNeighbors!
+        // IMPROVED: Compute global working area to avoid blocking any agent's future work
+        Set<Position> globalWorkingArea = safeZoneCalculator.computeGlobalWorkingArea(agentId, state, level);
+        
+        // Last resort: BFS search with global working area check
         Queue<Position> queue = new LinkedList<>();
         Set<Position> visited = new HashSet<>();
         Map<Position, Integer> distanceMap = new HashMap<>();
@@ -3720,7 +3281,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             score += 20; // Dead-ends are excellent parking
                         }
                         
-                        // Penalty if this position would block any other agent
+                        // IMPROVED: Heavy penalty if in global working area (would block ANY agent's future work)
+                        if (globalWorkingArea.contains(pos)) {
+                            score -= 200; // Very heavy penalty - this position is needed by someone
+                        }
+                        
+                        // Additional penalty if this position would block any specifically blocked agent
                         boolean wouldBlock = false;
                         for (int otherId : blockedAgents) {
                             Position otherPos = state.getAgentPosition(otherId);
@@ -3993,24 +3559,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return false;
     }
 
+    /**
+     * Finds the agent goal position for a given agent ID.
+     */
     private Position findAgentGoalPosition(int agentId, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    return new Position(row, col);
-                }
-            }
-        }
-        return null;
+        // Delegate to GoalChecker (SRP: single responsibility for goal-related utilities)
+        return GoalChecker.findAgentGoalPosition(agentId, level);
     }
 
+    /**
+     * Checks if a position is occupied by any agent.
+     */
     private boolean isPositionOccupiedByAgent(Position pos, State state, int numAgents) {
-        for (int i = 0; i < numAgents; i++) {
-            if (state.getAgentPosition(i).equals(pos)) {
-                return true;
-            }
-        }
-        return false;
+        // Delegate to PlanningUtils (SRP: single responsibility for planning utilities)
+        return PlanningUtils.isPositionOccupiedByAgent(pos, state, numAgents);
     }
 
     /**
