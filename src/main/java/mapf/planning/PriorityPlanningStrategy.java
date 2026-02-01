@@ -4,6 +4,7 @@ import mapf.domain.*;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.AgentYieldingManager;
+import mapf.planning.coordination.DeadlockResolver;
 import java.util.*;
 
 /**
@@ -40,6 +41,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Handles both reactive yielding (when blocking) and proactive yielding (after task completion).
      */
     private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
+
+    /**
+     * Resolves deadlocks when multiple agents/boxes form blocking cycles.
+     * Implements temporary box displacement to break cycles.
+     */
+    private final DeadlockResolver deadlockResolver = new DeadlockResolver();
 
     /**
      * Cache for goal topological depths. Computed once per level.
@@ -652,6 +659,69 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             }
                             stuckCount = 0;
                             logNormal(getName() + ": Cleared blocking agent path");
+                        }
+                    }
+                    
+                    // NEW: Try DEADLOCK BOX DISPLACEMENT if agent clearing didn't help
+                    // This handles cases where BOXES (not agents) are blocking each other
+                    if (!clearedPath && stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING + 1) {
+                        // Collect blocked agent IDs
+                        List<Integer> blockedAgentIds = new ArrayList<>();
+                        for (Subgoal sg : highestDepthGoals) {
+                            blockedAgentIds.add(sg.agentId);
+                        }
+                        
+                        // Analyze blocking relationships
+                        List<DeadlockResolver.BlockingInfo> blockingInfos = 
+                            deadlockResolver.analyzeBlocking(currentState, level, blockedAgentIds);
+                        
+                        if (!blockingInfos.isEmpty()) {
+                            logNormal("\n[DEADLOCK] Analyzing blocking relationships:");
+                            for (DeadlockResolver.BlockingInfo info : blockingInfos) {
+                                logNormal("[DEADLOCK]   " + info);
+                            }
+                            
+                            // Try displacement
+                            DeadlockResolver.DisplacementPlan displacementPlan = 
+                                deadlockResolver.createDisplacementPlan(blockingInfos, currentState, level, displacementHistory);
+                            
+                            if (displacementPlan != null) {
+                                logNormal("[DEADLOCK] Attempting displacement: " + displacementPlan);
+                                
+                                // Record this displacement attempt
+                                String historyKey = displacementPlan.boxType + "@" + displacementPlan.boxPosition;
+                                displacementHistory.add(historyKey);
+                                
+                                // Execute displacement
+                                List<Action> displacePath = planBoxDisplacement(
+                                    displacementPlan.agentId, displacementPlan.boxPosition, 
+                                    displacementPlan.tempPosition, displacementPlan.boxType,
+                                    currentState, level);
+                                
+                                if (displacePath != null && !displacePath.isEmpty()) {
+                                    logNormal("[DEADLOCK] *** SUCCESS! Displacing box " + displacementPlan.boxType +
+                                        " with " + displacePath.size() + " steps ***");
+                                    
+                                    // Execute displacement plan
+                                    for (Action action : displacePath) {
+                                        Action[] jointAction = createJointActionWithMerging(
+                                            displacementPlan.agentId, action, currentState, level, 
+                                            numAgents, false);
+                                        jointAction = resolveConflicts(jointAction, currentState, level, 
+                                            displacementPlan.agentId);
+                                        fullPlan.add(jointAction);
+                                        currentState = applyJointAction(jointAction, currentState, level, numAgents);
+                                    }
+                                    
+                                    stuckCount = 0;
+                                    clearedPath = true;
+                                    logNormal("[DEADLOCK] Box displaced, continuing with normal planning");
+                                } else {
+                                    logNormal("[DEADLOCK] Failed to find displacement path");
+                                }
+                            } else {
+                                logNormal("[DEADLOCK] No suitable displacement found");
+                            }
                         }
                     }
 
@@ -1480,6 +1550,134 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
 
     /**
+     * Plans a path to displace a blocking box to a temporary parking position.
+     * Similar to searchForSubgoal but doesn't protect other goals as strictly.
+     * Used by DeadlockResolver to break blocking cycles.
+     * 
+     * @param agentId Agent that will push the box
+     * @param boxPos Current position of the blocking box
+     * @param targetPos Target parking position for the box
+     * @param boxType Type of the box
+     * @param initialState Current state
+     * @param level Level information
+     * @return List of actions to displace the box, or null if not possible
+     */
+    private List<Action> planBoxDisplacement(int agentId, Position boxPos, Position targetPos,
+            char boxType, State initialState, Level level) {
+        
+        // Check if box is actually at the specified position
+        Character actualBox = initialState.getBoxAt(boxPos);
+        if (actualBox == null || actualBox != boxType) {
+            logVerbose("[DISPLACEMENT] Box " + boxType + " not found at " + boxPos);
+            return null;
+        }
+
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKey, Integer> bestG = new HashMap<>();
+
+        // Less strict goal protection - only protect goals that are ALREADY satisfied
+        Set<Position> frozenGoals = new HashSet<>();
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                char goalType = level.getBoxGoal(row, col);
+                if (goalType != '\0') {
+                    Position goalPos = new Position(row, col);
+                    char currentBox = initialState.getBoxAt(goalPos);
+                    if (currentBox == goalType) {
+                        frozenGoals.add(goalPos);
+                    }
+                }
+            }
+        }
+        
+        // IMPORTANT: Remove target position from frozen goals (we're explicitly moving there)
+        frozenGoals.remove(targetPos);
+        // Also remove the box's current position (we're explicitly moving it)
+        frozenGoals.remove(boxPos);
+
+        logVerbose("[DISPLACEMENT] Planning displacement of " + boxType + " from " + boxPos + 
+            " to " + targetPos + ", protecting " + frozenGoals.size() + " satisfied goals");
+
+        int h = getDistance(boxPos, targetPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxPos);
+        StateKey startKey = new StateKey(initialState, agentId, boxPos);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        int exploredCount = 0;
+        int maxStates = SearchConfig.MAX_STATES_PER_SUBGOAL / 2; // Faster search for displacement
+
+        while (!openList.isEmpty() && exploredCount < maxStates) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            // Goal: box reaches target position
+            Position currentBoxPos = findBoxPosition(current.state, boxType, current.targetBoxPos);
+            if (currentBoxPos != null && currentBoxPos.equals(targetPos)) {
+                logVerbose("[DISPLACEMENT] Found path in " + exploredCount + " states");
+                return reconstructPath(current);
+            }
+
+            // Expand node
+            for (Action action : getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) {
+                    continue;
+                }
+
+                if (!current.state.isApplicable(action, agentId, level)) {
+                    continue;
+                }
+
+                // Only protect goals that are NOT our target
+                if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
+                    continue;
+                }
+
+                State newState = current.state.apply(action, agentId);
+
+                Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos);
+                int newG = current.g + 1;
+
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) {
+                    continue;
+                }
+
+                bestG.put(newKey, newG);
+
+                int newH = (newTargetBoxPos != null) ? getDistance(newTargetBoxPos, targetPos, level) : 0;
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos);
+                openList.add(newNode);
+            }
+        }
+
+        logVerbose("[DISPLACEMENT] No displacement path found in " + exploredCount + " states");
+        return null;
+    }
+
+    /**
+     * Finds the current position of a specific box type.
+     */
+    private Position findBoxPosition(State state, char boxType, Position hint) {
+        // First check hint position
+        if (hint != null) {
+            Character boxAtHint = state.getBoxAt(hint);
+            if (boxAtHint != null && boxAtHint == boxType) {
+                return hint;
+            }
+        }
+        
+        // Search all positions
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() == boxType) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
      * A* search to move an agent to its goal position (no box involved).
      * This is Phase 2: Agent Goal Planning.
      */
@@ -2011,6 +2209,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (yieldingManager.isYielding(agentId)) {
                 logVerbose("[SKIP] Agent " + agentId + " is YIELDING, skipping in plan merge");
                 continue;
+            }
+
+            // COMPLETED AGENT CHECK: Don't move agents that have completed their task
+            // and successfully yielded to a safe position. They should stay parked!
+            if (yieldingManager.hasCompletedTask(agentId)) {
+                Position agentPos = state.getAgentPosition(agentId);
+                int passableNeighbors = countPassableNeighbors(agentPos, state, level, agentId);
+                // Only protect if agent is in a safe position (not a corridor)
+                if (passableNeighbors >= 3 || countFreeNeighbors(agentPos, level) == 1) {
+                    logVerbose("[SKIP] Agent " + agentId + " has completed task and is in safe position, skipping");
+                    continue;
+                }
             }
 
             // GLOBAL BOX GOAL CHECK: Don't let ANY agent move toward agent goals
@@ -3359,23 +3569,31 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         yieldingManager.markTaskCompleted(completedAgentId);
         
         Position currentPos = currentState.getAgentPosition(completedAgentId);
-        int freeNeighbors = countFreeNeighbors(currentPos, level);
+        
+        // Use PASSABLE neighbors (considers boxes and agents) for corridor detection
+        // This is critical because a box at a neighbor position effectively creates a corridor
+        int passableNeighbors = countPassableNeighbors(currentPos, currentState, level, completedAgentId);
+        int freeNeighbors = countFreeNeighbors(currentPos, level); // Map structure only
+        
+        logNormal("[PROACTIVE-YIELD-CHECK] Agent " + completedAgentId + " at " + currentPos + 
+                ", passableNeighbors=" + passableNeighbors + " (map freeNeighbors=" + freeNeighbors + ")");
         
         // Check if this agent is blocking anyone
         List<Integer> blockedAgents = yieldingManager.findBlockedAgents(completedAgentId, currentState, level);
         
-        // CRITICAL: Also check if agent is in a CORRIDOR (width=1, freeNeighbors <= 2)
-        // Agents in corridors should ALWAYS move out, even if not currently blocking anyone
-        boolean inCorridor = (freeNeighbors <= 2);
+        // CRITICAL: Use passableNeighbors for corridor detection
+        // An agent is in a "corridor situation" if it can only move in ≤2 directions
+        // This catches cases where boxes create temporary corridor-like constraints
+        boolean inCorridor = (passableNeighbors <= 2);
         
         if (blockedAgents.isEmpty() && !inCorridor) {
-            logVerbose("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone and not in corridor");
+            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone and not in corridor");
             return false;
         }
         
         if (inCorridor) {
             logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " is in CORRIDOR at " + currentPos + 
-                    " (freeNeighbors=" + freeNeighbors + "), must move out");
+                    " (passableNeighbors=" + passableNeighbors + "), must move out");
         }
         if (!blockedAgents.isEmpty()) {
             logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " blocking agents: " + blockedAgents);
@@ -3439,6 +3657,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * 2. Position with 2 neighbors but in a "wider" area (near junction)
      * 3. Dead-end position (1 neighbor) - at least won't block main corridor
      * 
+     * CRITICAL: Must use passableNeighbors (considers boxes) not just freeNeighbors (map structure only)!
+     * A position with 3 free neighbors on the map might only have 1 passable neighbor if boxes are nearby.
+     * 
      * @return Best yield position, or null if none found
      */
     private Position findBestYieldPosition(int agentId, State state, Level level, List<Integer> blockedAgents) {
@@ -3447,11 +3668,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // First try: use AgentYieldingManager's strict safe position
         Position strictSafe = yieldingManager.findNearestSafePosition(agentId, state, level);
         if (strictSafe != null) {
-            return strictSafe;
+            // Verify it's actually safe with current state (not just map structure)
+            int passableNeighbors = countPassableNeighbors(strictSafe, state, level, agentId);
+            if (passableNeighbors >= 3) {
+                logNormal("[YIELD] Found strict safe position " + strictSafe + " (passableNeighbors=" + passableNeighbors + ")");
+                return strictSafe;
+            }
         }
         
-        // Second try: find position with most free neighbors (relaxed criteria)
-        // BFS to find nearest "wider" position
+        // Second try: find position with most PASSABLE neighbors (considering boxes and agents)
+        // CRITICAL FIX: Use passableNeighbors, not freeNeighbors!
         Queue<Position> queue = new LinkedList<>();
         Set<Position> visited = new HashSet<>();
         Map<Position, Integer> distanceMap = new HashMap<>();
@@ -3461,7 +3687,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         distanceMap.put(currentPos, 0);
         
         Position bestPos = null;
-        int bestScore = -1; // Higher is better: freeNeighbors * 10 - distance
+        int bestScore = -1; // Higher is better
         int maxDistance = Math.min(level.getRows() + level.getCols(), 50);
         
         while (!queue.isEmpty()) {
@@ -3472,43 +3698,54 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             
             // Skip current position
             if (!pos.equals(currentPos)) {
-                int freeNeighbors = countFreeNeighbors(pos, level);
+                // CRITICAL: Use passableNeighbors that considers current state (boxes, agents)
+                int passableNeighbors = countPassableNeighbors(pos, state, level, agentId);
+                int freeNeighbors = countFreeNeighbors(pos, level); // Map structure
                 
                 // Check not occupied
-                if (!state.getBoxes().containsKey(pos) && !isPositionOccupiedByAgent(pos, state, state.getNumAgents())) {
-                    // Score: prefer more free neighbors, penalize distance
-                    int score = freeNeighbors * 10 - distance;
+                if (state.getBoxAt(pos) == '\0' && !isPositionOccupiedByAgent(pos, state, state.getNumAgents())) {
+                    // CRITICAL: Only consider positions that are NOT corridors (passableNeighbors >= 3)
+                    // Exception: dead-ends (freeNeighbors == 1) are acceptable parking spots
+                    boolean isGoodSpot = (passableNeighbors >= 3) || (freeNeighbors == 1);
                     
-                    // Bonus for dead-ends (good parking spots)
-                    if (freeNeighbors == 1) {
-                        score += 5; // Dead-ends are good for parking
-                    }
-                    
-                    // Penalty if this position would block any other agent
-                    boolean wouldBlock = false;
-                    for (int otherId : blockedAgents) {
-                        Position otherPos = state.getAgentPosition(otherId);
-                        Position otherGoal = findAgentGoalPosition(otherId, level);
-                        if (otherGoal != null) {
-                            Set<Position> criticalPath = findCriticalPositionsForAgentGoal(otherPos, otherGoal, level);
-                            if (criticalPath.contains(pos)) {
-                                wouldBlock = true;
-                                break;
+                    if (!isGoodSpot) {
+                        // Skip corridor positions - don't move from one corridor to another!
+                        // But still explore through them
+                    } else {
+                        // Score: prefer more passable neighbors, penalize distance
+                        int score = passableNeighbors * 10 - distance;
+                        
+                        // Bonus for dead-ends (good parking spots that won't block anyone)
+                        if (freeNeighbors == 1) {
+                            score += 20; // Dead-ends are excellent parking
+                        }
+                        
+                        // Penalty if this position would block any other agent
+                        boolean wouldBlock = false;
+                        for (int otherId : blockedAgents) {
+                            Position otherPos = state.getAgentPosition(otherId);
+                            Position otherGoal = findAgentGoalPosition(otherId, level);
+                            if (otherGoal != null) {
+                                Set<Position> criticalPath = findCriticalPositionsForAgentGoal(otherPos, otherGoal, level);
+                                if (criticalPath.contains(pos)) {
+                                    wouldBlock = true;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if (wouldBlock) {
-                        score -= 100; // Heavy penalty
-                    }
-                    
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestPos = pos;
+                        if (wouldBlock) {
+                            score -= 100; // Heavy penalty
+                        }
+                        
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestPos = pos;
+                        }
                     }
                 }
             }
             
-            // Explore neighbors
+            // Explore neighbors (even through corridors)
             for (Direction dir : Direction.values()) {
                 Position next = pos.move(dir);
                 if (!visited.contains(next) && !level.isWall(next)) {
@@ -3517,6 +3754,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     queue.add(next);
                 }
             }
+        }
+        
+        if (bestPos != null) {
+            int passable = countPassableNeighbors(bestPos, state, level, agentId);
+            logNormal("[YIELD] Found best yield position " + bestPos + " (passableNeighbors=" + passable + ", score=" + bestScore + ")");
         }
         
         return bestPos;
@@ -3564,6 +3806,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /**
      * Counts free (non-wall) neighbors of a position.
+     * NOTE: This only considers map structure, not current state (boxes/agents).
+     * For corridor detection with current state, use countPassableNeighbors().
      */
     private int countFreeNeighbors(Position pos, Level level) {
         int count = 0;
@@ -3572,6 +3816,35 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (!level.isWall(neighbor)) {
                 count++;
             }
+        }
+        return count;
+    }
+
+    /**
+     * Counts passable (not blocked) neighbors considering current state.
+     * A neighbor is passable if: not a wall, not occupied by a box, not occupied by another agent.
+     * 
+     * This is used for determining if an agent is effectively in a "corridor" situation,
+     * where boxes can create temporary corridor-like constraints.
+     */
+    private int countPassableNeighbors(Position pos, State state, Level level, int excludeAgentId) {
+        int count = 0;
+        for (Direction dir : Direction.values()) {
+            Position neighbor = pos.move(dir);
+            if (level.isWall(neighbor)) continue;
+            if (state.getBoxAt(neighbor) != '\0') continue;  // '\0' means no box
+            
+            // Check if another agent is there
+            boolean hasAgent = false;
+            for (int i = 0; i < state.getNumAgents(); i++) {
+                if (i != excludeAgentId && state.getAgentPosition(i).equals(neighbor)) {
+                    hasAgent = true;
+                    break;
+                }
+            }
+            if (hasAgent) continue;
+            
+            count++;
         }
         return count;
     }
