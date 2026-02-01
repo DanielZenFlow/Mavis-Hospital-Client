@@ -68,7 +68,10 @@ public class SearchConfig {
     
     /** Stuck logging interval (log every N stuck iterations) */
     public static final int STUCK_LOG_INTERVAL = 10;
-    
+
+    /** Stuck iterations before running dependency analysis */
+    public static final int DEPENDENCY_CHECK_THRESHOLD = 5;
+
     // ========== Logging Configuration ==========
     
     /**

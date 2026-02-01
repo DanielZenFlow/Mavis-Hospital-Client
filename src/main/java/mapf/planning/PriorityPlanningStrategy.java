@@ -1,6 +1,7 @@
 package mapf.planning;
 
 import mapf.domain.*;
+import mapf.planning.analysis.DependencyAnalyzer;
 import java.util.*;
 
 /**
@@ -138,6 +139,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (stuckCount > SearchConfig.MAX_STUCK_ITERATIONS) {
                 logMinimal(getName() + ": Stuck after " + stuckCount + " iterations without progress");
                 break;
+            }
+
+            // Dependency analysis: when stuck, check if cyclic dependencies exist
+            // This helps diagnose WHY we're stuck and whether CBS would help
+            if (stuckCount >= SearchConfig.DEPENDENCY_CHECK_THRESHOLD && stuckCount % 10 == 0) {
+                System.err.println("\n========== DEPENDENCY ANALYSIS (stuckCount=" + stuckCount + ") ==========");
+                DependencyAnalyzer.AnalysisResult depAnalysis = 
+                    DependencyAnalyzer.analyze(currentState, level);
+                
+                if (depAnalysis.hasCycle) {
+                    System.err.println("[DEPENDENCY] *** CYCLIC DEPENDENCY DETECTED ***");
+                    System.err.println(depAnalysis.report);
+                    // For now, just log the diagnosis
+                    // Future: could trigger CBS or alternative strategy here
+                } else {
+                    System.err.println("[DEPENDENCY] No cyclic dependency found. Stuck due to other reasons.");
+                }
+                System.err.println("==========================================================\n");
             }
 
             // Check for yielding timeout - if agents have been yielding for too long,
