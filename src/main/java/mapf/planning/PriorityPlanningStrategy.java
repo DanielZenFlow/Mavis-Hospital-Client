@@ -55,6 +55,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private State cachedStateForImmovable = null;
 
     /**
+     * Cache for pre-satisfied static goals (goals already satisfied by immovable boxes).
+     * These goals should be completely skipped during planning - they are "decorations".
+     * Example: GROUP TWENTY in Spiraling.lvl - boxes already at goals, surrounded by walls.
+     */
+    private Set<Position> preSatisfiedStaticGoals = null;
+    private State cachedStateForStaticGoals = null;
+
+    /**
      * Tracks displacement attempts to avoid infinite loops.
      * Key: "box@(x,y)" format representing a box that was displaced
      * This prevents repeatedly displacing the same box back and forth
@@ -313,43 +321,88 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 return false;
             });
 
+            // NEW: Use REVERSE PLANNING for goal ordering (HTN-style)
+            // Key insight: Ask "which goal should be filled LAST?" and work backwards
+            // This automatically discovers correct order for corridors/spirals
+            ensureReverseOrderComputed(level);
+            final List<Subgoal> allUnsatisfied = new ArrayList<>(unsatisfied);
+            
             unsatisfied.sort((a, b) -> {
-                // First priority: TOPOLOGICAL DEPTH (higher depth = more inner = higher
-                // priority)
+                // PRIMARY: Reverse execution order (lower priority = execute FIRST)
+                // This is the HTN-discovered "recipe" for the level
+                int reverseA = getReverseExecutionPriority(a.goalPos, level);
+                int reverseB = getReverseExecutionPriority(b.goalPos, level);
+                
+                if (reverseA != reverseB) {
+                    return Integer.compare(reverseA, reverseB); // Lower priority first
+                }
+                
+                // SECONDARY: Blocking score for tie-breaking
+                int scoreA = computeBlockingScore(a, stateForSort, level, allUnsatisfied);
+                int scoreB = computeBlockingScore(b, stateForSort, level, allUnsatisfied);
+                
+                if (scoreA != scoreB) {
+                    return Integer.compare(scoreA, scoreB);
+                }
+                
+                // TERTIARY: Topological depth (higher = more inner = higher priority)
                 int depthA = goalTopologicalDepths.getOrDefault(a.goalPos, 0);
                 int depthB = goalTopologicalDepths.getOrDefault(b.goalPos, 0);
 
-                // DESCENDING order: deeper goals (higher depth) should be done FIRST
                 if (depthA != depthB) {
-                    return Integer.compare(depthB, depthA); // Note: B before A for descending
+                    return Integer.compare(depthB, depthA); // Descending
                 }
 
-                // Second priority: If same depth, use standard difficulty (easier first)
+                // Last resort: standard difficulty (easier first)
                 int diffA = estimateSubgoalDifficulty(a, stateForSort, level);
                 int diffB = estimateSubgoalDifficulty(b, stateForSort, level);
                 return Integer.compare(diffA, diffB);
             });
-
-            // CRITICAL: Only try goals at the HIGHEST depth level first
-            // Do NOT skip to lower-depth goals if high-depth goals fail
-            int highestDepth = unsatisfied.isEmpty() ? 0
-                    : goalTopologicalDepths.getOrDefault(unsatisfied.get(0).goalPos, 0);
-
-            List<Subgoal> highestDepthGoals = new ArrayList<>();
-            List<Subgoal> lowerDepthGoals = new ArrayList<>();
-            for (Subgoal sg : unsatisfied) {
-                int depth = goalTopologicalDepths.getOrDefault(sg.goalPos, 0);
-                if (depth == highestDepth) {
-                    highestDepthGoals.add(sg);
-                } else {
-                    lowerDepthGoals.add(sg);
+            
+            // Log the sorted order for debugging
+            if (SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
+                System.err.println("[REVERSE-ORDER] Subgoal execution order:");
+                for (int i = 0; i < Math.min(5, unsatisfied.size()); i++) {
+                    Subgoal sg = unsatisfied.get(i);
+                    int reversePrio = getReverseExecutionPriority(sg.goalPos, level);
+                    int depth = goalTopologicalDepths.getOrDefault(sg.goalPos, 0);
+                    if (sg.isAgentGoal) {
+                        System.err.println("  " + (i+1) + ". Agent " + sg.agentId + " -> " + sg.goalPos + 
+                            " (reverse=" + reversePrio + ", depth=" + depth + ")");
+                    } else {
+                        System.err.println("  " + (i+1) + ". Box " + sg.boxType + " -> " + sg.goalPos + 
+                            " (reverse=" + reversePrio + ", depth=" + depth + ")");
+                    }
                 }
             }
+
+            // Group goals by reverse execution priority:
+            // Goals with the LOWEST reverse priority should be executed FIRST
+            // (they are the innermost goals that must be filled before outer ones)
+            List<Subgoal> executableGoals = new ArrayList<>();
+            List<Subgoal> deferredGoals = new ArrayList<>();
+            
+            int lowestReversePrio = unsatisfied.isEmpty() ? 0 
+                    : getReverseExecutionPriority(unsatisfied.get(0).goalPos, level);
+            
+            for (Subgoal sg : unsatisfied) {
+                int reversePrio = getReverseExecutionPriority(sg.goalPos, level);
+                // Goals with same reverse priority are equally executable
+                if (reversePrio == lowestReversePrio) {
+                    executableGoals.add(sg);
+                } else {
+                    deferredGoals.add(sg);
+                }
+            }
+            
+            // Keep the old naming for compatibility with rest of code
+            List<Subgoal> highestDepthGoals = executableGoals;
+            List<Subgoal> lowerDepthGoals = deferredGoals;
 
             boolean madeProgress = false;
             Subgoal highestPriorityFailedGoal = null; // Track the deepest goal that failed
 
-            // First: ONLY try highest-depth goals
+            // First: ONLY try executable goals (those with lowest reverse priority)
             for (Subgoal subgoal : highestDepthGoals) {
                 if (System.currentTimeMillis() - startTime > timeoutMs) {
                     break;
@@ -610,9 +663,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /**
      * Gets all unsatisfied subgoals (box goals not yet achieved).
+     * Filters out pre-satisfied static goals (decorative elements like GROUP TWENTY).
      */
     private List<Subgoal> getUnsatisfiedSubgoals(State state, Level level) {
         List<Subgoal> unsatisfied = new ArrayList<>();
+        
+        // Ensure pre-satisfied static goals are computed
+        ensurePreSatisfiedStaticGoalsComputed(state, level);
 
         // Phase 1: Box goals
         for (int row = 0; row < level.getRows(); row++) {
@@ -620,6 +677,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0') {
                     Position goalPos = new Position(row, col);
+                    
+                    // CRITICAL: Skip pre-satisfied static goals (decorations)
+                    if (preSatisfiedStaticGoals.contains(goalPos)) {
+                        continue;
+                    }
+                    
                     Character actualBox = state.getBoxes().get(goalPos);
 
                     // Check if goal is not satisfied
@@ -783,6 +846,101 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
 
     /**
+     * Computes and caches pre-satisfied static goals.
+     * A goal is "pre-satisfied static" if:
+     * 1. A box of the correct type is already at the goal position in the INITIAL state
+     * 2. That box cannot be moved (surrounded by walls or no agent can push it)
+     * 
+     * These goals represent "decorative" elements like GROUP TWENTY in Spiraling.lvl
+     * that should be completely skipped during planning.
+     */
+    private void ensurePreSatisfiedStaticGoalsComputed(State state, Level level) {
+        // Only compute once per state
+        if (preSatisfiedStaticGoals != null && cachedStateForStaticGoals == state) {
+            return;
+        }
+
+        cachedStateForStaticGoals = state;
+        preSatisfiedStaticGoals = new HashSet<>();
+        
+        // Ensure immovable boxes are computed first
+        ensureImmovableBoxesComputed(state, level);
+
+        // Find which colors have agents that can push them
+        Set<Color> pushableColors = new HashSet<>();
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            pushableColors.add(level.getAgentColor(i));
+        }
+
+        // Check all goal positions
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                char goalType = level.getBoxGoal(row, col);
+                if (goalType == '\0') continue;
+                
+                Position goalPos = new Position(row, col);
+                Character actualBox = state.getBoxes().get(goalPos);
+                
+                // Check 1: Is the correct box type already at this goal?
+                if (actualBox == null || actualBox != goalType) {
+                    continue; // Goal not satisfied, not a static goal
+                }
+                
+                // Check 2: Can this box be moved?
+                // A box is immovable if:
+                // - No agent has matching color, OR
+                // - Box is physically trapped (surrounded by walls on opposite sides)
+                
+                Color boxColor = level.getBoxColor(goalType);
+                boolean hasMatchingAgent = pushableColors.contains(boxColor);
+                
+                if (!hasMatchingAgent) {
+                    // No agent can push this box - it's static
+                    preSatisfiedStaticGoals.add(goalPos);
+                    continue;
+                }
+                
+                // Check if box is physically trapped (can't be pushed in any direction)
+                boolean canBePushed = false;
+                
+                // For a box to be pushable, there must be at least one direction where:
+                // - The cell in that direction is free (not wall)
+                // - The cell in the opposite direction is free (agent can stand there)
+                for (Direction dir : Direction.values()) {
+                    Position pushTo = goalPos.move(dir);
+                    Position agentFrom = goalPos.move(dir.opposite());
+                    
+                    // Check if push is physically possible
+                    if (!level.isWall(pushTo) && !level.isWall(agentFrom)) {
+                        // Also check that neither position has an immovable box
+                        if (!immovableBoxPositions.contains(pushTo) && 
+                            !immovableBoxPositions.contains(agentFrom)) {
+                            // Further check: can any agent actually reach the push position?
+                            // (We do a simple check - if there's a path from any agent to agentFrom)
+                            canBePushed = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!canBePushed) {
+                    // Box is physically trapped - it's a static goal
+                    preSatisfiedStaticGoals.add(goalPos);
+                }
+            }
+        }
+
+        if (!preSatisfiedStaticGoals.isEmpty()) {
+            logMinimal("[STATIC-GOALS] Found " + preSatisfiedStaticGoals.size() + 
+                      " pre-satisfied static goals (skipped as decorations)");
+            for (Position pos : preSatisfiedStaticGoals) {
+                char goalType = level.getBoxGoal(pos);
+                logVerbose("  - Goal '" + goalType + "' at " + pos + " (already satisfied & immovable)");
+            }
+        }
+    }
+
+    /**
      * Calculates distance between two positions, treating immovable boxes as walls.
      * Uses BFS to find actual reachable distance.
      */
@@ -793,6 +951,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         ensureImmovableBoxesComputed(state, level);
 
         // BFS to find shortest path treating immovable boxes as walls
+        // CRITICAL FIX: For complex maps like spirals, the actual path can be MUCH longer
+        // than Manhattan distance. We use a generous limit based on map size.
+        int maxSearchDist = Math.max(
+            level.getRows() * level.getCols() / 2,  // Half of total cells
+            from.manhattanDistance(to) * 10 + 100   // 10x Manhattan + buffer
+        );
+        
         Queue<Position> queue = new LinkedList<>();
         Map<Position, Integer> distances = new HashMap<>();
 
@@ -807,8 +972,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 return currentDist;
             }
 
-            // Don't search too far
-            if (currentDist > from.manhattanDistance(to) * 3 + 50) {
+            // Use generous search limit for spiral/maze-like maps
+            if (currentDist > maxSearchDist) {
                 continue;
             }
 
@@ -2831,6 +2996,316 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
 
         return depths;
+    }
+
+    // ========== Box Blocking Analysis (for Dependency-based Ordering) ==========
+
+    /**
+     * Counts how many OTHER boxes are blocking the path from a box to its goal.
+     * This is the key insight for dependency-based ordering:
+     * - A box with 0 blockers can be moved immediately
+     * - A box with N blockers must wait for those N boxes to clear first
+     * 
+     * In spiral corridors like Spiraling.lvl, the innermost box (A) blocks all others,
+     * so it should be moved FIRST (even though its goal might not be the "deepest").
+     * 
+     * @param boxPos Current position of the box to analyze
+     * @param goalPos Target goal position for this box
+     * @param state Current state (to know where all boxes are)
+     * @param level Level information
+     * @return Number of other boxes blocking the path, or Integer.MAX_VALUE if unreachable
+     */
+    private int countBlockingBoxes(Position boxPos, Position goalPos, State state, Level level) {
+        // BFS to find path from box to goal, counting boxes encountered
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Integer> visited = new HashMap<>(); // Position -> boxes encountered so far
+        
+        queue.add(boxPos);
+        visited.put(boxPos, 0);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            int currentBlockers = visited.get(current);
+            
+            if (current.equals(goalPos)) {
+                return currentBlockers;
+            }
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                
+                if (level.isWall(next)) continue;
+                if (visited.containsKey(next)) continue;
+                
+                int nextBlockers = currentBlockers;
+                
+                // Check if there's a box at this position (and it's not our starting box)
+                char boxAtNext = state.getBoxAt(next);
+                if (boxAtNext != '\0' && !next.equals(boxPos)) {
+                    nextBlockers++;
+                }
+                
+                // Also check if there's an agent (agents can move, so count as 0.5 blocker)
+                // Actually, for simplicity, don't count agents as blockers
+                
+                visited.put(next, nextBlockers);
+                queue.add(next);
+            }
+        }
+        
+        return Integer.MAX_VALUE; // Unreachable
+    }
+
+    /**
+     * Computes a "blocking score" for a subgoal that considers both:
+     * 1. How many boxes block THIS subgoal's execution
+     * 2. How many OTHER subgoals are blocked by the box associated with this subgoal
+     * 
+     * Lower score = should be done first (fewer dependencies, or blocks more others)
+     * 
+     * This implements the MAPF principle: "Move boxes that block the most others first"
+     */
+    private int computeBlockingScore(Subgoal subgoal, State state, Level level, List<Subgoal> allSubgoals) {
+        if (subgoal.isAgentGoal) {
+            // For agent goals, just count boxes in the way
+            return countBlockingBoxes(state.getAgentPosition(subgoal.agentId), subgoal.goalPos, state, level);
+        }
+        
+        // For box goals, find the best box to move
+        Position boxPos = findBestBoxForGoal(subgoal, state, level);
+        if (boxPos == null) {
+            return Integer.MAX_VALUE;
+        }
+        
+        // Count how many boxes block this box from reaching its goal
+        int blockedBy = countBlockingBoxes(boxPos, subgoal.goalPos, state, level);
+        
+        // Count how many other subgoals this box is blocking
+        int blocksOthers = 0;
+        for (Subgoal other : allSubgoals) {
+            if (other == subgoal) continue;
+            if (other.isAgentGoal) continue;
+            
+            Position otherBoxPos = findBestBoxForGoal(other, state, level);
+            if (otherBoxPos == null) continue;
+            
+            // Check if our box is on the path from otherBox to otherGoal
+            if (isBoxOnPath(boxPos, otherBoxPos, other.goalPos, state, level)) {
+                blocksOthers++;
+            }
+        }
+        
+        // Score: prioritize boxes that are blocked by few AND block many others
+        // Formula: blockedBy * 10 - blocksOthers
+        // Lower score = higher priority
+        // - Low blockedBy means we can move it now
+        // - High blocksOthers means moving it will unblock many others
+        return blockedBy * 10 - blocksOthers;
+    }
+
+    /**
+     * Checks if a box position is on ANY shortest path between two positions.
+     */
+    private boolean isBoxOnPath(Position boxPos, Position from, Position to, State state, Level level) {
+        // Simple check: is boxPos between from and to?
+        // Use BFS to find if all shortest paths go through boxPos
+        
+        // First, find distance from 'from' to 'to' ignoring boxes
+        int directDist = bfsDistance(from, to, level, null);
+        if (directDist == Integer.MAX_VALUE) return false;
+        
+        // Now find distance avoiding boxPos
+        Set<Position> avoid = new HashSet<>();
+        avoid.add(boxPos);
+        int avoidDist = bfsDistance(from, to, level, avoid);
+        
+        // If avoiding boxPos makes path longer, it's on the path
+        return avoidDist > directDist;
+    }
+
+    /**
+     * BFS distance between two positions, optionally avoiding certain positions.
+     */
+    private int bfsDistance(Position from, Position to, Level level, Set<Position> avoid) {
+        if (from.equals(to)) return 0;
+        
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Integer> dist = new HashMap<>();
+        
+        queue.add(from);
+        dist.put(from, 0);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            int currentDist = dist.get(current);
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                
+                if (level.isWall(next)) continue;
+                if (dist.containsKey(next)) continue;
+                if (avoid != null && avoid.contains(next)) continue;
+                
+                int nextDist = currentDist + 1;
+                dist.put(next, nextDist);
+                
+                if (next.equals(to)) {
+                    return nextDist;
+                }
+                
+                queue.add(next);
+            }
+        }
+        
+        return Integer.MAX_VALUE;
+    }
+
+    // ========== Reverse Planning (HTN-style Goal Ordering) ==========
+    
+    /**
+     * Cache for reverse execution order. Computed once per level.
+     * Maps goalPosition -> execution priority (lower = execute first)
+     */
+    private Map<Position, Integer> reverseExecutionOrder = null;
+    private Level cachedLevelForReverse = null;
+    
+    /**
+     * Computes the optimal execution order for box goals using CORRIDOR DEPTH analysis.
+     * 
+     * Key insight: In corridor/spiral layouts like Spiraling.lvl, the correct order
+     * is to fill goals that are DEEPER in dead-ends FIRST (before their entrances get blocked).
+     * 
+     * Algorithm:
+     * 1. For each goal position, compute its "corridor depth" = distance to open space
+     * 2. Goals in dead-ends (far from open areas) have HIGH depth
+     * 3. Goals near intersections have LOW depth
+     * 4. HIGHER depth = should execute FIRST = LOWER priority number
+     * 
+     * @param level The level to analyze
+     * @return Map from goal position to execution priority (lower = execute first)
+     */
+    private Map<Position, Integer> computeReverseExecutionOrder(Level level) {
+        Map<Position, Integer> order = new HashMap<>();
+        
+        // Collect all box goals
+        Set<Position> allGoals = new HashSet<>();
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                if (level.getBoxGoal(row, col) != '\0') {
+                    allGoals.add(new Position(row, col));
+                }
+            }
+        }
+        
+        if (allGoals.isEmpty()) {
+            return order;
+        }
+        
+        // Compute corridor depth for each goal
+        Map<Position, Integer> corridorDepths = new HashMap<>();
+        int maxDepth = 0;
+        
+        for (Position goal : allGoals) {
+            int depth = computeCorridorDepth(goal, level);
+            corridorDepths.put(goal, depth);
+            maxDepth = Math.max(maxDepth, depth);
+        }
+        
+        // Convert depth to priority: HIGHER depth = LOWER priority number (execute first)
+        for (Position goal : allGoals) {
+            int depth = corridorDepths.get(goal);
+            // Invert: deeper goals get lower priority number
+            int priority = (maxDepth - depth) + 1;
+            order.put(goal, priority);
+        }
+        
+        // Log the computed order
+        if (SearchConfig.isNormal()) {
+            System.err.println("[REVERSE] Computed execution order by corridor depth:");
+            List<Map.Entry<Position, Integer>> sorted = new ArrayList<>(order.entrySet());
+            sorted.sort(Map.Entry.comparingByValue()); // Sort by priority (low first)
+            for (Map.Entry<Position, Integer> e : sorted) {
+                char goalType = level.getBoxGoal(e.getKey());
+                int depth = corridorDepths.get(e.getKey());
+                System.err.println("  Priority " + e.getValue() + " (depth=" + depth + "): Box " + 
+                                   goalType + " at " + e.getKey());
+            }
+        }
+        
+        return order;
+    }
+    
+    /**
+     * Computes how deep a position is inside a corridor/dead-end.
+     * Depth = distance to nearest "open space" (position with 3+ free neighbors).
+     * 
+     * A position deep in a dead-end has high depth.
+     * A position at an intersection has depth 0.
+     */
+    private int computeCorridorDepth(Position start, Level level) {
+        // BFS to find distance to nearest "open space"
+        Queue<int[]> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        queue.add(new int[]{start.row, start.col, 0});
+        visited.add(start);
+        
+        int searchLimit = 100;
+        
+        while (!queue.isEmpty()) {
+            int[] current = queue.poll();
+            Position pos = new Position(current[0], current[1]);
+            int dist = current[2];
+            
+            if (dist > searchLimit) break;
+            
+            // Count free neighbors
+            int freeNeighbors = 0;
+            for (Direction dir : Direction.values()) {
+                Position neighbor = pos.move(dir);
+                if (!level.isWall(neighbor)) {
+                    freeNeighbors++;
+                }
+            }
+            
+            // Open space = 3+ free neighbors
+            if (freeNeighbors >= 3) {
+                return dist;
+            }
+            
+            // Continue BFS
+            for (Direction dir : Direction.values()) {
+                Position next = pos.move(dir);
+                if (!level.isWall(next) && !visited.contains(next)) {
+                    visited.add(next);
+                    queue.add(new int[]{next.row, next.col, dist + 1});
+                }
+            }
+        }
+        
+        // No open space found - very deep dead-end
+        return searchLimit;
+    }
+    
+    /**
+     * Ensures reverse execution order is computed for the level.
+     */
+    private void ensureReverseOrderComputed(Level level) {
+        if (reverseExecutionOrder != null && cachedLevelForReverse == level) {
+            return;
+        }
+        
+        cachedLevelForReverse = level;
+        reverseExecutionOrder = computeReverseExecutionOrder(level);
+    }
+    
+    /**
+     * Gets the execution priority for a goal position.
+     * Lower value = should be executed FIRST.
+     */
+    private int getReverseExecutionPriority(Position goalPos, Level level) {
+        ensureReverseOrderComputed(level);
+        return reverseExecutionOrder.getOrDefault(goalPos, Integer.MAX_VALUE / 2);
     }
 
     /**
