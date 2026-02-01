@@ -3342,8 +3342,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
 
     /**
-     * Proactive yielding: After completing a task, check if this agent is blocking others.
-     * If so, move to a safe position to avoid becoming an obstacle.
+     * Proactive yielding: After completing a task, check if this agent should move out of the way.
+     * 
+     * Two scenarios trigger proactive yielding:
+     * 1. Agent is blocking another agent's critical path (reactive)
+     * 2. Agent is in a CORRIDOR (width=1) - should always move out to avoid future blocking
+     * 
+     * Key insight: In corridor-heavy maps like Spiraling, an agent completing a task
+     * in a corridor will block ALL subsequent agents, even if not detected yet.
      * 
      * @return true if proactive yielding actions were added to the plan
      */
@@ -3352,30 +3358,42 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Mark this agent as having completed its task
         yieldingManager.markTaskCompleted(completedAgentId);
         
+        Position currentPos = currentState.getAgentPosition(completedAgentId);
+        int freeNeighbors = countFreeNeighbors(currentPos, level);
+        
         // Check if this agent is blocking anyone
         List<Integer> blockedAgents = yieldingManager.findBlockedAgents(completedAgentId, currentState, level);
         
-        if (blockedAgents.isEmpty()) {
-            logVerbose("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone");
+        // CRITICAL: Also check if agent is in a CORRIDOR (width=1, freeNeighbors <= 2)
+        // Agents in corridors should ALWAYS move out, even if not currently blocking anyone
+        boolean inCorridor = (freeNeighbors <= 2);
+        
+        if (blockedAgents.isEmpty() && !inCorridor) {
+            logVerbose("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone and not in corridor");
             return false;
         }
         
-        logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " blocking agents: " + blockedAgents);
+        if (inCorridor) {
+            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " is in CORRIDOR at " + currentPos + 
+                    " (freeNeighbors=" + freeNeighbors + "), must move out");
+        }
+        if (!blockedAgents.isEmpty()) {
+            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " blocking agents: " + blockedAgents);
+        }
         
-        // Find a safe position for this agent
-        Position safePos = yieldingManager.findNearestSafePosition(completedAgentId, currentState, level);
+        // Find a safe position for this agent (with relaxed requirements for corridor maps)
+        Position safePos = findBestYieldPosition(completedAgentId, currentState, level, blockedAgents);
         
         if (safePos == null) {
-            logNormal("[PROACTIVE-YIELD] No safe position found for Agent " + completedAgentId);
-            // Fallback: try single step yielding
-            Action yieldMove = yieldingManager.generateYieldMove(completedAgentId, blockedAgents.get(0), 
-                    currentState, level);
+            logNormal("[PROACTIVE-YIELD] No yield position found for Agent " + completedAgentId);
+            // Fallback: try single step move out of corridor
+            Action yieldMove = findCorridorExitMove(completedAgentId, currentState, level);
             if (yieldMove != null) {
                 Action[] jointAction = new Action[numAgents];
                 Arrays.fill(jointAction, Action.noOp());
                 jointAction[completedAgentId] = yieldMove;
                 plan.add(jointAction);
-                logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " performed single yield move");
+                logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " performed corridor exit move");
                 return true;
             }
             return false;
@@ -3385,12 +3403,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         List<Action> pathToSafe = yieldingManager.planPathToPosition(completedAgentId, safePos, currentState, level);
         
         if (pathToSafe.isEmpty()) {
-            logNormal("[PROACTIVE-YIELD] No path to safe position for Agent " + completedAgentId);
+            logNormal("[PROACTIVE-YIELD] No path to yield position for Agent " + completedAgentId);
             return false;
         }
         
         // Execute path to safe position
-        logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " moving to safe position " + safePos + 
+        logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " moving to yield position " + safePos + 
                 " (" + pathToSafe.size() + " steps)");
         
         State tempState = currentState;
@@ -3410,6 +3428,152 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         
         return true;
+    }
+
+    /**
+     * Finds the best yield position for an agent that has completed its task.
+     * Uses a relaxed definition of "safe" for corridor-heavy maps:
+     * 
+     * Priority (highest to lowest):
+     * 1. Position with 3+ free neighbors (true junction/open area)
+     * 2. Position with 2 neighbors but in a "wider" area (near junction)
+     * 3. Dead-end position (1 neighbor) - at least won't block main corridor
+     * 
+     * @return Best yield position, or null if none found
+     */
+    private Position findBestYieldPosition(int agentId, State state, Level level, List<Integer> blockedAgents) {
+        Position currentPos = state.getAgentPosition(agentId);
+        
+        // First try: use AgentYieldingManager's strict safe position
+        Position strictSafe = yieldingManager.findNearestSafePosition(agentId, state, level);
+        if (strictSafe != null) {
+            return strictSafe;
+        }
+        
+        // Second try: find position with most free neighbors (relaxed criteria)
+        // BFS to find nearest "wider" position
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        Map<Position, Integer> distanceMap = new HashMap<>();
+        
+        queue.add(currentPos);
+        visited.add(currentPos);
+        distanceMap.put(currentPos, 0);
+        
+        Position bestPos = null;
+        int bestScore = -1; // Higher is better: freeNeighbors * 10 - distance
+        int maxDistance = Math.min(level.getRows() + level.getCols(), 50);
+        
+        while (!queue.isEmpty()) {
+            Position pos = queue.poll();
+            int distance = distanceMap.get(pos);
+            
+            if (distance > maxDistance) break;
+            
+            // Skip current position
+            if (!pos.equals(currentPos)) {
+                int freeNeighbors = countFreeNeighbors(pos, level);
+                
+                // Check not occupied
+                if (!state.getBoxes().containsKey(pos) && !isPositionOccupiedByAgent(pos, state, state.getNumAgents())) {
+                    // Score: prefer more free neighbors, penalize distance
+                    int score = freeNeighbors * 10 - distance;
+                    
+                    // Bonus for dead-ends (good parking spots)
+                    if (freeNeighbors == 1) {
+                        score += 5; // Dead-ends are good for parking
+                    }
+                    
+                    // Penalty if this position would block any other agent
+                    boolean wouldBlock = false;
+                    for (int otherId : blockedAgents) {
+                        Position otherPos = state.getAgentPosition(otherId);
+                        Position otherGoal = findAgentGoalPosition(otherId, level);
+                        if (otherGoal != null) {
+                            Set<Position> criticalPath = findCriticalPositionsForAgentGoal(otherPos, otherGoal, level);
+                            if (criticalPath.contains(pos)) {
+                                wouldBlock = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (wouldBlock) {
+                        score -= 100; // Heavy penalty
+                    }
+                    
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestPos = pos;
+                    }
+                }
+            }
+            
+            // Explore neighbors
+            for (Direction dir : Direction.values()) {
+                Position next = pos.move(dir);
+                if (!visited.contains(next) && !level.isWall(next)) {
+                    visited.add(next);
+                    distanceMap.put(next, distance + 1);
+                    queue.add(next);
+                }
+            }
+        }
+        
+        return bestPos;
+    }
+
+    /**
+     * Finds a single move to exit a corridor (move toward more open space).
+     */
+    private Action findCorridorExitMove(int agentId, State state, Level level) {
+        Position currentPos = state.getAgentPosition(agentId);
+        int currentFreeNeighbors = countFreeNeighbors(currentPos, level);
+        
+        // Try each direction, prefer one that leads to more free space
+        Direction bestDir = null;
+        int bestNeighborCount = currentFreeNeighbors;
+        
+        for (Direction dir : Direction.values()) {
+            Position newPos = currentPos.move(dir);
+            
+            if (level.isWall(newPos)) continue;
+            if (state.getBoxes().containsKey(newPos)) continue;
+            if (isPositionOccupiedByAgent(newPos, state, state.getNumAgents())) continue;
+            
+            int newFreeNeighbors = countFreeNeighbors(newPos, level);
+            
+            // Prefer direction with more free neighbors (moving toward open space)
+            if (newFreeNeighbors > bestNeighborCount) {
+                bestNeighborCount = newFreeNeighbors;
+                bestDir = dir;
+            } else if (bestDir == null && newFreeNeighbors >= currentFreeNeighbors) {
+                // At least don't move to a tighter spot
+                bestDir = dir;
+            }
+        }
+        
+        if (bestDir != null) {
+            Action moveAction = Action.move(bestDir);
+            if (state.isApplicable(moveAction, agentId, level)) {
+                return moveAction;
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Counts free (non-wall) neighbors of a position.
+     */
+    private int countFreeNeighbors(Position pos, Level level) {
+        int count = 0;
+        for (Direction dir : Direction.values()) {
+            Position neighbor = pos.move(dir);
+            if (!level.isWall(neighbor)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
