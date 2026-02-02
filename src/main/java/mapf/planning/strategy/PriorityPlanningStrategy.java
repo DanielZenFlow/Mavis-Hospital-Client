@@ -315,80 +315,46 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 return false;
             });
 
-            // Use reverse execution order (HTN-style) for goal ordering
-            final List<Subgoal> allUnsatisfied = new ArrayList<>(unsatisfied);
-            
-            unsatisfied.sort((a, b) -> {
-                // PRIMARY: Reverse execution order (lower priority = execute first)
-                int reverseA = topologicalAnalyzer.getReverseExecutionPriority(a.goalPos, level);
-                int reverseB = topologicalAnalyzer.getReverseExecutionPriority(b.goalPos, level);
-                
-                if (reverseA != reverseB) {
-                    return Integer.compare(reverseA, reverseB); // Lower priority first
+            // Sort subgoals based on pre-computed order or dynamic analysis
+            if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
+                // Use pre-computed order from LevelAnalyzer
+                final Map<Position, Integer> orderMap = new HashMap<>();
+                for (int i = 0; i < precomputedGoalOrder.size(); i++) {
+                    orderMap.put(precomputedGoalOrder.get(i), i);
                 }
+                unsatisfied.sort((a, b) -> {
+                    int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
+                    int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
+                    return Integer.compare(orderA, orderB);
+                });
                 
-                // SECONDARY: Blocking score for tie-breaking
-                int scoreA = topologicalAnalyzer.computeBlockingScore(a, stateForSort, level, allUnsatisfied, subgoalManager);
-                int scoreB = topologicalAnalyzer.computeBlockingScore(b, stateForSort, level, allUnsatisfied, subgoalManager);
-                
-                if (scoreA != scoreB) {
-                    return Integer.compare(scoreA, scoreB);
-                }
-                
-                // TERTIARY: Topological depth (higher = more inner = higher priority)
-                int depthA = topologicalAnalyzer.getTopologicalDepth(a.goalPos, level);
-                int depthB = topologicalAnalyzer.getTopologicalDepth(b.goalPos, level);
-
-                if (depthA != depthB) {
-                    return Integer.compare(depthB, depthA); // Descending
-                }
-
-                // Last resort: standard difficulty (easier first)
-                int diffA = subgoalManager.estimateSubgoalDifficulty(a, stateForSort, level);
-                int diffB = subgoalManager.estimateSubgoalDifficulty(b, stateForSort, level);
-                return Integer.compare(diffA, diffB);
-            });
-            
-            // Log the sorted order for debugging
-            if (SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
-                System.err.println("[REVERSE-ORDER] Subgoal execution order:");
-                for (int i = 0; i < Math.min(5, unsatisfied.size()); i++) {
-                    Subgoal sg = unsatisfied.get(i);
-                    int reversePrio = topologicalAnalyzer.getReverseExecutionPriority(sg.goalPos, level);
-                    int depth = topologicalAnalyzer.getTopologicalDepth(sg.goalPos, level);
-                    if (sg.isAgentGoal) {
-                        System.err.println("  " + (i+1) + ". Agent " + sg.agentId + " -> " + sg.goalPos + 
-                            " (reverse=" + reversePrio + ", depth=" + depth + ")");
-                    } else {
-                        System.err.println("  " + (i+1) + ". Box " + sg.boxType + " -> " + sg.goalPos + 
-                            " (reverse=" + reversePrio + ", depth=" + depth + ")");
+                if (SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
+                    System.err.println("[PRE-COMPUTED-ORDER] Using LevelAnalyzer goal order:");
+                    for (int i = 0; i < Math.min(5, unsatisfied.size()); i++) {
+                        Subgoal sg = unsatisfied.get(i);
+                        if (sg.isAgentGoal) {
+                            System.err.println("  " + (i+1) + ". Agent " + sg.agentId + " -> " + sg.goalPos);
+                        } else {
+                            System.err.println("  " + (i+1) + ". Box " + sg.boxType + " -> " + sg.goalPos);
+                        }
                     }
                 }
+            } else {
+                // Fallback: use simple difficulty-based ordering
+                unsatisfied.sort((a, b) -> {
+                    int diffA = subgoalManager.estimateSubgoalDifficulty(a, stateForSort, level);
+                    int diffB = subgoalManager.estimateSubgoalDifficulty(b, stateForSort, level);
+                    return Integer.compare(diffA, diffB);
+                });
             }
 
-            // Group goals by reverse execution priority (lowest = innermost = execute first)
-            List<Subgoal> executableGoals = new ArrayList<>();
-            List<Subgoal> deferredGoals = new ArrayList<>();
-            
-            int lowestReversePrio = unsatisfied.isEmpty() ? 0 
-                    : topologicalAnalyzer.getReverseExecutionPriority(unsatisfied.get(0).goalPos, level);
-            
-            for (Subgoal sg : unsatisfied) {
-                int reversePrio = topologicalAnalyzer.getReverseExecutionPriority(sg.goalPos, level);
-                if (reversePrio == lowestReversePrio) {
-                    executableGoals.add(sg);
-                } else {
-                    deferredGoals.add(sg);
-                }
-            }
-            
-            List<Subgoal> highestDepthGoals = executableGoals;
-            List<Subgoal> lowerDepthGoals = deferredGoals;
+            // Execute goals in order
+            List<Subgoal> highestDepthGoals = unsatisfied;
 
             boolean madeProgress = false;
             Subgoal highestPriorityFailedGoal = null;
 
-            // Try executable goals (lowest reverse priority)
+            // Try goals in sorted order
             for (Subgoal subgoal : highestDepthGoals) {
                 if (System.currentTimeMillis() - startTime > timeoutMs) {
                     break;
