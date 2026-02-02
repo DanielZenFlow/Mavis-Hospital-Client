@@ -54,7 +54,7 @@ public class TopologicalAnalyzer {
     /**
      * Computes topological depths for all goal positions using BFS from exits.
      */
-    private Map<Position, Integer> computeTopologicalDepths(Level level) {
+    public Map<Position, Integer> computeTopologicalDepths(Level level) {
         Map<Position, Integer> depths = new HashMap<>();
         Queue<Position> queue = new LinkedList<>();
         Set<Position> visited = new HashSet<>();
@@ -185,6 +185,53 @@ public class TopologicalAnalyzer {
         }
         
         return blockingCount;
+    }
+    
+    /**
+     * Computes blocking score for a subgoal.
+     * Lower score = higher priority.
+     */
+    public int computeBlockingScore(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level,
+                                    List<PriorityPlanningStrategy.Subgoal> allSubgoals, SubgoalManager subgoalManager) {
+        if (subgoal.isAgentGoal) {
+            return countBlockingBoxes(state.getAgentPosition(subgoal.agentId), subgoal.goalPos, state, level);
+        }
+        
+        Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
+        if (boxPos == null) {
+            return Integer.MAX_VALUE;
+        }
+        
+        int blockedBy = countBlockingBoxes(boxPos, subgoal.goalPos, state, level);
+        
+        int blocksOthers = 0;
+        for (PriorityPlanningStrategy.Subgoal other : allSubgoals) {
+            if (other == subgoal) continue;
+            if (other.isAgentGoal) continue;
+            
+            Position otherBoxPos = subgoalManager.findBestBoxForGoal(other, state, level);
+            if (otherBoxPos == null) continue;
+            
+            if (isBoxOnPath(boxPos, otherBoxPos, other.goalPos, state, level)) {
+                blocksOthers++;
+            }
+        }
+        
+        return blockedBy * 10 - blocksOthers;
+    }
+    
+    /**
+     * Checks if a box is on any shortest path between two positions.
+     */
+    private boolean isBoxOnPath(Position boxPos, Position from, Position to, State state, Level level) {
+        int directDist = PlanningUtils.bfsDistance(from, to, level, null);
+        if (directDist == Integer.MAX_VALUE) return false;
+        
+        Set<Position> avoid = new HashSet<>();
+        avoid.add(boxPos);
+        int avoidDist = PlanningUtils.bfsDistance(from, to, level, avoid);
+        
+        return avoidDist > directDist;
     }
     
     private Set<Position> findPath(Position from, Position to, Level level) {

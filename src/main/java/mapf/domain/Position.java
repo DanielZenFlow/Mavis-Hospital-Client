@@ -1,7 +1,5 @@
 package mapf.domain;
 
-import java.util.Objects;
-
 /**
  * Immutable class representing a position (coordinate) on the level grid.
  * Uses row and column indices where (0,0) is the top-left corner.

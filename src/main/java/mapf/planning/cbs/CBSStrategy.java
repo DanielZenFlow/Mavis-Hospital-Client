@@ -2,7 +2,6 @@ package mapf.planning.cbs;
 
 import mapf.domain.*;
 import mapf.planning.*;
-import mapf.planning.coordination.ConflictDetector;
 import mapf.planning.heuristic.Heuristic;
 
 import java.util.*;

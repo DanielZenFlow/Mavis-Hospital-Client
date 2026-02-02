@@ -50,6 +50,19 @@ public class GoalChecker {
     }
     
     /**
+     * Finds all agents who have completed their box tasks.
+     */
+    public static Set<Integer> findCompletedAgents(State state, Level level, int numAgents) {
+        Set<Integer> completed = new HashSet<>();
+        for (int agentId = 0; agentId < numAgents; agentId++) {
+            if (hasCompletedBoxTasks(agentId, state, level)) {
+                completed.add(agentId);
+            }
+        }
+        return completed;
+    }
+    
+    /**
      * Checks if an agent's position goal is satisfied.
      */
     public static boolean isAgentGoalSatisfied(int agentId, State state, Level level) {
@@ -113,5 +126,34 @@ public class GoalChecker {
             }
         }
         return -1;
+    }
+    
+    /**
+     * Checks if an action would disturb a satisfied goal.
+     */
+    public static boolean wouldDisturbSatisfiedGoal(Action action, int agentId, State state, Set<Position> satisfiedGoals) {
+        if (satisfiedGoals.isEmpty()) {
+            return false;
+        }
+
+        Position agentPos = state.getAgentPosition(agentId);
+        if (agentPos == null) {
+            return false;
+        }
+
+        switch (action.type) {
+            case PUSH: {
+                // The box is in front of the agent (in agentDir)
+                Position boxPos = agentPos.move(action.agentDir);
+                return satisfiedGoals.contains(boxPos);
+            }
+            case PULL: {
+                // The box is behind the agent (opposite of boxDir)
+                Position boxPos = agentPos.move(action.boxDir.opposite());
+                return satisfiedGoals.contains(boxPos);
+            }
+            default:
+                return false;
+        }
     }
 }
