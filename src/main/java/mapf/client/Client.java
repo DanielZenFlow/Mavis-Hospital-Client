@@ -52,12 +52,22 @@ public class Client {
     /** Search configuration */
     private final SearchConfig config;
     
+    /** Whether to use Portfolio Controller for strategy selection */
+    public static boolean USE_PORTFOLIO = false;
+    
     static {
         // Check environment variable to enable new simplified strategy
         String useSimple = System.getenv("USE_SIMPLE_STRATEGY");
         if ("true".equalsIgnoreCase(useSimple)) {
             StrategySelector.USE_SIMPLE_STRATEGY = true;
             System.err.println("[Client] USE_SIMPLE_STRATEGY enabled via environment variable");
+        }
+        
+        // Check environment variable to enable Portfolio Controller
+        String usePortfolio = System.getenv("USE_PORTFOLIO");
+        if ("true".equalsIgnoreCase(usePortfolio)) {
+            USE_PORTFOLIO = true;
+            System.err.println("[Client] USE_PORTFOLIO enabled via environment variable");
         }
     }
     
@@ -229,6 +239,15 @@ public class Client {
      * @return the plan, or null if all strategies fail
      */
     private List<Action[]> searchWithFallback() {
+        // Use Portfolio Controller if enabled
+        if (USE_PORTFOLIO) {
+            debugOut.println("[Client] Using Portfolio Controller");
+            PortfolioController portfolio = new PortfolioController(config);
+            portfolio.setTimeout(config.getTimeoutMs());
+            return portfolio.search(currentState, level);
+        }
+        
+        // Legacy fallback mechanism
         int numAgents = currentState.getNumAgents();
         double[] weights = { config.getAstarWeight(), 2.0, 5.0, Double.POSITIVE_INFINITY };
         
