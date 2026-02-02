@@ -93,6 +93,94 @@ public class BoxSearchPlanner {
     }
 
     /**
+     * Space-Time A* search for subgoal with reservation table.
+     * Avoids positions reserved by higher-priority agents.
+     */
+    public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
+            char boxType, State initialState, Level level, Set<Position> frozenGoals,
+            ReservationTable reservations, int startTime) {
+        
+        if (reservations == null) {
+            return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, frozenGoals);
+        }
+        
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKeyWithTime, Integer> bestG = new HashMap<>();
+
+        int h = getDistance(boxStart, goalPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart, startTime);
+        StateKeyWithTime startKey = new StateKeyWithTime(initialState, agentId, boxStart, startTime);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        int exploredCount = 0;
+
+        while (!openList.isEmpty() && exploredCount < SearchConfig.MAX_STATES_PER_SUBGOAL) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            // Check if goal is achieved
+            Character boxAtGoal = current.state.getBoxes().get(goalPos);
+            if (boxAtGoal != null && boxAtGoal == boxType) {
+                return reconstructPath(current);
+            }
+
+            int nextTime = current.time + 1;
+
+            // Expand node (including Wait action)
+            for (Action action : PlanningUtils.getAllActions()) {
+                State newState;
+                Position newAgentPos;
+                Position newBoxPos = current.targetBoxPos;
+                
+                if (action.type == Action.ActionType.NOOP) {
+                    // Wait action - stay in place
+                    newState = current.state;
+                    newAgentPos = current.state.getAgentPosition(agentId);
+                } else {
+                    if (!current.state.isApplicable(action, agentId, level)) {
+                        continue;
+                    }
+                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
+                        continue;
+                    }
+                    newState = current.state.apply(action, agentId);
+                    newAgentPos = newState.getAgentPosition(agentId);
+                    newBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                }
+
+                // Space-Time collision check: is agent's next position reserved?
+                if (reservations.isReserved(newAgentPos, nextTime, agentId)) {
+                    continue;
+                }
+                
+                // Also check box position if pushing
+                if (newBoxPos != null && !newBoxPos.equals(current.targetBoxPos)) {
+                    if (reservations.isReserved(newBoxPos, nextTime, agentId)) {
+                        continue;
+                    }
+                }
+
+                StateKeyWithTime newKey = new StateKeyWithTime(newState, agentId, newBoxPos, nextTime);
+                int newG = current.g + 1;
+
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) {
+                    continue;
+                }
+
+                bestG.put(newKey, newG);
+
+                int newH = (newBoxPos != null) ? getDistance(newBoxPos, goalPos, level) : 0;
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newBoxPos, nextTime);
+                openList.add(newNode);
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * A* search to move an agent to its goal position (no box involved).
      */
     public List<Action> searchForAgentGoal(int agentId, Position goalPos,
@@ -438,6 +526,33 @@ public class BoxSearchPlanner {
             return Objects.hash(agentPos, targetBoxPos);
         }
     }
+    
+    /** State key with time dimension for space-time A*. */
+    private static class StateKeyWithTime {
+        final Position agentPos;
+        final Position targetBoxPos;
+        final int time;
+
+        StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time) {
+            this.agentPos = state.getAgentPosition(agentId);
+            this.targetBoxPos = targetBoxPos;
+            this.time = time;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+            if (!(obj instanceof StateKeyWithTime)) return false;
+            StateKeyWithTime other = (StateKeyWithTime) obj;
+            return time == other.time && agentPos.equals(other.agentPos) &&
+                    Objects.equals(targetBoxPos, other.targetBoxPos);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(agentPos, targetBoxPos, time);
+        }
+    }
 
     private static class SearchNode implements Comparable<SearchNode> {
         final State state;
@@ -446,14 +561,20 @@ public class BoxSearchPlanner {
         final int g;
         final int f;
         final Position targetBoxPos;
+        final int time;
 
         SearchNode(State state, SearchNode parent, Action action, int g, int h, Position targetBoxPos) {
+            this(state, parent, action, g, h, targetBoxPos, g); // time = g for backward compat
+        }
+        
+        SearchNode(State state, SearchNode parent, Action action, int g, int h, Position targetBoxPos, int time) {
             this.state = state;
             this.parent = parent;
             this.action = action;
             this.g = g;
             this.f = g + h;
             this.targetBoxPos = targetBoxPos;
+            this.time = time;
         }
 
         @Override
