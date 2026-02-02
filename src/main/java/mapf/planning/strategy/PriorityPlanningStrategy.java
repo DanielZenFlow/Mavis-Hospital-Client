@@ -6,7 +6,6 @@ import mapf.planning.SearchStrategy;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.AgentYieldingManager;
-import mapf.planning.coordination.ConflictDetector;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.coordination.SafeZoneCalculator;
 import mapf.planning.heuristic.Heuristic;
@@ -27,10 +26,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     // Helper classes
     private final SubgoalManager subgoalManager;
-    private final SubgoalSearcher subgoalSearcher;
     private final TopologicalAnalyzer topologicalAnalyzer;
     private final ConflictResolver conflictResolver;
-    private final ImmovableBoxDetector immovableDetector;
     
     // New helper classes (Phase 2)
     private final BoxSearchPlanner boxSearchPlanner;
@@ -40,7 +37,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private final AgentCoordinator agentCoordinator;
     private final DeadlockBreaker deadlockBreaker;
     private final GoalChecker goalChecker;
-    private final ConflictDetector conflictDetector;
     
     // Legacy helpers (to be deprecated)
     private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
@@ -81,10 +77,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Initialize refactored helpers
         this.subgoalManager = new SubgoalManager(heuristic);
-        this.subgoalSearcher = new SubgoalSearcher(heuristic);
         this.topologicalAnalyzer = new TopologicalAnalyzer();
         this.conflictResolver = new ConflictResolver();
-        this.immovableDetector = new ImmovableBoxDetector();
         
         // Initialize Phase 2 helpers
         this.boxSearchPlanner = new BoxSearchPlanner(heuristic);
@@ -94,7 +88,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         this.agentCoordinator = new AgentCoordinator();
         this.deadlockBreaker = new DeadlockBreaker();
         this.goalChecker = new GoalChecker();
-        this.conflictDetector = new ConflictDetector();
     }
 
     @Override
