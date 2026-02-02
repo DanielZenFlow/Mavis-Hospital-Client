@@ -19,6 +19,9 @@ public class LevelAnalyzer {
         public final int freeSpaces;
         public final double density;
         
+        // Task filtering (P0: identifies real tasks)
+        public final TaskFilter.FilterResult taskFilter;
+        
         // Goal dependency analysis
         public final Map<Position, Set<Position>> goalBlockedBy;  // goal -> goals that block it
         public final List<Position> executionOrder;  // topologically sorted goals
@@ -35,6 +38,7 @@ public class LevelAnalyzer {
         public final String analysisReport;
         
         public LevelFeatures(int numAgents, int numBoxes, int numGoals, int freeSpaces,
+                            TaskFilter.FilterResult taskFilter,
                             Map<Position, Set<Position>> goalBlockedBy,
                             List<Position> executionOrder, int maxDepth, boolean hasCycle,
                             int corridorCells, int junctionCells,
@@ -44,6 +48,7 @@ public class LevelAnalyzer {
             this.numGoals = numGoals;
             this.freeSpaces = freeSpaces;
             this.density = (double)(numAgents + numBoxes) / Math.max(1, freeSpaces);
+            this.taskFilter = taskFilter;
             this.goalBlockedBy = goalBlockedBy;
             this.executionOrder = executionOrder;
             this.maxDependencyDepth = maxDepth;
@@ -73,31 +78,34 @@ public class LevelAnalyzer {
         // 1. Basic metrics
         int numAgents = state.getNumAgents();
         int numBoxes = state.getBoxes().size();
-        List<Position> goals = findAllGoalPositions(level);
-        int numGoals = goals.size();
         int freeSpaces = countFreeSpaces(level);
         
-        // 2. Structural analysis
+        // 2. Task filtering (P0: identify real tasks)
+        TaskFilter.FilterResult taskFilter = TaskFilter.filter(level, state);
+        List<Position> activeGoals = taskFilter.activeGoals;
+        int numGoals = activeGoals.size();
+        
+        // 3. Structural analysis
         int[] corridorJunction = countCorridorsAndJunctions(level);
         int corridorCells = corridorJunction[0];
         int junctionCells = corridorJunction[1];
         
-        // 3. Goal dependency analysis (core!)
-        Map<Position, Set<Position>> goalBlockedBy = computeGoalDependencies(goals, level);
-        boolean hasCycle = detectCycle(goalBlockedBy, goals);
-        List<Position> executionOrder = hasCycle ? goals : topologicalSort(goalBlockedBy, goals);
-        int maxDepth = computeMaxDependencyDepth(goalBlockedBy, goals);
+        // 4. Goal dependency analysis (only on active goals)
+        Map<Position, Set<Position>> goalBlockedBy = computeGoalDependencies(activeGoals, level);
+        boolean hasCycle = detectCycle(goalBlockedBy, activeGoals);
+        List<Position> executionOrder = hasCycle ? activeGoals : topologicalSort(goalBlockedBy, activeGoals);
+        int maxDepth = computeMaxDependencyDepth(goalBlockedBy, activeGoals);
         
-        // 4. Strategy recommendation
+        // 5. Strategy recommendation
         StrategyType recommended = recommendStrategy(numAgents, maxDepth, hasCycle, 
                                                      (double) corridorCells / Math.max(1, freeSpaces));
         
-        // 5. Generate report
-        String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces,
+        // 6. Generate report
+        String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                        goalBlockedBy, maxDepth, hasCycle, 
                                        corridorCells, junctionCells, recommended);
         
-        return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces,
+        return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                 goalBlockedBy, executionOrder, maxDepth, hasCycle,
                                 corridorCells, junctionCells, recommended, report);
     }
@@ -360,12 +368,22 @@ public class LevelAnalyzer {
     // ========== Report Generation ==========
     
     private static String generateReport(int numAgents, int numBoxes, int numGoals, int freeSpaces,
+                                        TaskFilter.FilterResult taskFilter,
                                         Map<Position, Set<Position>> blockedBy, int maxDepth,
                                         boolean hasCycle, int corridors, int junctions,
                                         StrategyType recommended) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n========== LEVEL ANALYSIS ==========\n");
-        sb.append(String.format("Agents: %d, Boxes: %d, Goals: %d\n", numAgents, numBoxes, numGoals));
+        sb.append(String.format("Agents: %d, Boxes: %d, Active goals: %d\n", numAgents, numBoxes, numGoals));
+        
+        // Task filter summary
+        if (!taskFilter.immovableBoxes.isEmpty()) {
+            sb.append(String.format("Immovable boxes (walls): %d\n", taskFilter.immovableBoxes.size()));
+        }
+        if (!taskFilter.satisfiedGoals.isEmpty()) {
+            sb.append(String.format("Already satisfied: %d\n", taskFilter.satisfiedGoals.size()));
+        }
+        
         sb.append(String.format("Free spaces: %d, Density: %.2f%%\n", 
                                freeSpaces, (numAgents + numBoxes) * 100.0 / freeSpaces));
         sb.append(String.format("Corridors: %d (%.1f%%), Junctions: %d\n", 

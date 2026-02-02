@@ -21,40 +21,44 @@ import java.util.*;
  * 4. Server responds with action results
  * 5. Repeat 3-4 until goal state is reached
  * 
- * Debug output should go to stderr to avoid interfering with server communication.
+ * Debug output should go to stderr to avoid interfering with server
+ * communication.
  * 
- * Strategy Pattern: Dynamically selects search algorithm based on level complexity.
- * Fallback Mechanism: If one strategy fails/times out, tries next with increased weight.
+ * Strategy Pattern: Dynamically selects search algorithm based on level
+ * complexity.
+ * Fallback Mechanism: If one strategy fails/times out, tries next with
+ * increased weight.
  * 
  * Environment Variables:
- * - USE_SIMPLE_STRATEGY=true : Use the new simplified priority strategy (for testing refactored code)
+ * - USE_SIMPLE_STRATEGY=true : Use the new simplified priority strategy (for
+ * testing refactored code)
  */
 public class Client {
-    
+
     /** Client name sent to the server */
     private static final String CLIENT_NAME = "HospitalClient";
-    
+
     /** Input reader for server communication */
     private final BufferedReader serverIn;
-    
+
     /** Output writer for server communication */
     private final PrintStream serverOut;
-    
+
     /** Debug output stream */
     private final PrintStream debugOut;
-    
+
     /** The parsed level */
     private Level level;
-    
+
     /** Current state */
     private State currentState;
-    
+
     /** Search configuration */
     private final SearchConfig config;
-    
+
     /** Whether to use Portfolio Controller for strategy selection */
-    public static boolean USE_PORTFOLIO = false;
-    
+    public static boolean USE_PORTFOLIO = true;
+
     static {
         // Check environment variable to enable new simplified strategy
         String useSimple = System.getenv("USE_SIMPLE_STRATEGY");
@@ -62,7 +66,7 @@ public class Client {
             StrategySelector.USE_SIMPLE_STRATEGY = true;
             System.err.println("[Client] USE_SIMPLE_STRATEGY enabled via environment variable");
         }
-        
+
         // Check environment variable to enable Portfolio Controller
         String usePortfolio = System.getenv("USE_PORTFOLIO");
         if ("true".equalsIgnoreCase(usePortfolio)) {
@@ -70,7 +74,7 @@ public class Client {
             System.err.println("[Client] USE_PORTFOLIO enabled via environment variable");
         }
     }
-    
+
     /**
      * Creates a new Client with standard I/O streams.
      */
@@ -80,12 +84,12 @@ public class Client {
         this.debugOut = System.err;
         this.config = SearchConfig.defaults();
     }
-    
+
     /**
      * Creates a new Client with custom I/O streams (for testing).
      * 
-     * @param in input stream
-     * @param out output stream  
+     * @param in    input stream
+     * @param out   output stream
      * @param debug debug output stream
      */
     public Client(BufferedReader in, PrintStream out, PrintStream debug) {
@@ -94,7 +98,7 @@ public class Client {
         this.debugOut = debug;
         this.config = SearchConfig.defaults();
     }
-    
+
     /**
      * Creates a new Client with custom I/O streams and config (for testing).
      */
@@ -104,7 +108,7 @@ public class Client {
         this.debugOut = debug;
         this.config = config;
     }
-    
+
     /**
      * Main entry point.
      * 
@@ -120,7 +124,7 @@ public class Client {
             System.exit(1);
         }
     }
-    
+
     /**
      * Runs the client's main loop.
      * 
@@ -129,22 +133,22 @@ public class Client {
     public void run() throws IOException {
         // Step 1: Send client name
         sendClientName();
-        
+
         // Step 2: Read and parse level
         parseLevel();
-        
+
         debugOut.println("Level: " + level.getName());
         debugOut.println("Dimensions: " + level.getRows() + "x" + level.getCols());
         debugOut.println("Agents: " + level.getNumAgents());
         debugOut.println("Initial state:");
         debugOut.println(currentState.toGridString(level));
-        
+
         // Step 3: Plan and execute
         planAndExecute();
-        
+
         debugOut.println("Goal reached!");
     }
-    
+
     /**
      * Sends the client name to the server.
      */
@@ -152,7 +156,7 @@ public class Client {
         serverOut.println(CLIENT_NAME);
         debugOut.println("Sent client name: " + CLIENT_NAME);
     }
-    
+
     /**
      * Reads and parses the level from the server.
      * 
@@ -160,16 +164,16 @@ public class Client {
      */
     private void parseLevel() throws IOException {
         debugOut.println("Parsing level...");
-        
+
         LevelParser parser = new LevelParser();
         LevelParser.ParseResult result = parser.parse(serverIn);
-        
+
         this.level = result.level;
         this.currentState = result.initialState;
-        
+
         debugOut.println("Level parsed successfully");
     }
-    
+
     /**
      * Main planning and execution loop.
      * Continues until the goal state is reached.
@@ -180,53 +184,53 @@ public class Client {
     private void planAndExecute() throws IOException {
         int numAgents = currentState.getNumAgents();
         debugOut.println("Number of agents: " + numAgents);
-        
+
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
-        
+
         if (plan == null || plan.isEmpty()) {
             debugOut.println("ERROR: No plan found with any strategy!");
             return;
         }
-        
+
         // Check action limit
         if (plan.size() > SearchConfig.MAX_ACTIONS) {
-            debugOut.println("WARNING: Plan exceeds action limit (" + plan.size() + 
+            debugOut.println("WARNING: Plan exceeds action limit (" + plan.size() +
                     " > " + SearchConfig.MAX_ACTIONS + ")");
         }
-        
+
         debugOut.println("Plan found with " + plan.size() + " steps");
-        
+
         // Execute the plan step by step
         int step = 0;
         int totalActions = 0;
-        
+
         for (Action[] actions : plan) {
             if (currentState.isGoalState(level)) {
                 debugOut.println("Goal reached early at step " + step);
                 break;
             }
-            
+
             // Check total action limit
             totalActions++;
             if (totalActions > SearchConfig.MAX_ACTIONS) {
                 debugOut.println("WARNING: Exceeded maximum actions limit");
                 break;
             }
-            
+
             // Send actions to server
             sendActions(actions);
-            
+
             // Read response
             boolean[] results = readResponse();
-            
+
             // Update state based on successful actions
             updateState(actions, results);
-            
+
             step++;
         }
     }
-    
+
     /**
      * Attempts search with fallback strategies if primary fails.
      * 
@@ -246,72 +250,71 @@ public class Client {
             portfolio.setTimeout(config.getTimeoutMs());
             return portfolio.search(currentState, level);
         }
-        
+
         // Legacy fallback mechanism
         int numAgents = currentState.getNumAgents();
         double[] weights = { config.getAstarWeight(), 2.0, 5.0, Double.POSITIVE_INFINITY };
-        
+
         long totalStartTime = System.currentTimeMillis();
         long remainingTime = config.getTimeoutMs();
-        
+
         for (int i = 0; i < weights.length; i++) {
             double weight = weights[i];
             if (remainingTime <= 0) {
                 debugOut.println("Total timeout exceeded, stopping search");
                 break;
             }
-            
+
             // Allocate time for this attempt: half of remaining time
             // This ensures fair distribution across fallback strategies
             long attemptTimeout = Math.min(remainingTime / 2, remainingTime);
-            
+
             SearchConfig currentConfig = new SearchConfig(
                     attemptTimeout,
                     config.getMaxStates(),
-                    weight
-            );
-            
+                    weight);
+
             SearchStrategy strategy = createStrategy(numAgents, currentConfig);
-            debugOut.println("Trying strategy: " + strategy.getName() + " (weight=" + weight + 
+            debugOut.println("Trying strategy: " + strategy.getName() + " (weight=" + weight +
                     ", timeout=" + attemptTimeout + "ms)");
-            
+
             List<Action[]> plan = strategy.search(currentState, level);
-            
+
             if (plan != null && !plan.isEmpty()) {
                 debugOut.println("Success with " + strategy.getName());
                 return plan;
             }
-            
+
             debugOut.println("Strategy " + strategy.getName() + " failed, trying fallback...");
-            
+
             // Update remaining time
             remainingTime = config.getTimeoutMs() - (System.currentTimeMillis() - totalStartTime);
         }
-        
+
         return null;
     }
-    
+
     /**
      * Creates appropriate search strategy based on agent count and config.
      * Uses StrategySelector which can be configured via USE_SIMPLE_STRATEGY.
      */
     private SearchStrategy createStrategy(int numAgents, SearchConfig strategyConfig) {
         Heuristic heuristic = createHeuristic();
-        
+
         // Use StrategySelector to allow simple strategy testing
         StrategySelector selector = new StrategySelector(heuristic, strategyConfig);
         SearchStrategy strategy = selector.selectStrategy(level, currentState);
-        
+
         // Set weight if supported
         if (strategy instanceof SingleAgentStrategy) {
             ((SingleAgentStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
         } else if (strategy instanceof JointAStarStrategy) {
             ((JointAStarStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
         }
-        
+
         return strategy;
     }
-    
+
     /**
      * Creates the heuristic to use for planning.
      * Override this method to change the heuristic.
@@ -328,7 +331,7 @@ public class Client {
             return new ManhattanHeuristic();
         }
     }
-    
+
     /**
      * Sends actions for all agents to the server.
      * 
@@ -337,15 +340,16 @@ public class Client {
     private void sendActions(Action[] actions) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < actions.length; i++) {
-            if (i > 0) sb.append("|");
+            if (i > 0)
+                sb.append("|");
             sb.append(actions[i].toServerString());
         }
-        
+
         String actionString = sb.toString();
         serverOut.println(actionString);
         debugOut.println("Sent: " + actionString);
     }
-    
+
     /**
      * Reads the server's response to the last actions.
      * 
@@ -355,21 +359,21 @@ public class Client {
     private boolean[] readResponse() throws IOException {
         String response = serverIn.readLine();
         debugOut.println("Received: " + response);
-        
+
         if (response == null) {
             throw new IOException("Server closed connection");
         }
-        
+
         String[] parts = response.split("\\|");
         boolean[] results = new boolean[parts.length];
-        
+
         for (int i = 0; i < parts.length; i++) {
             results[i] = parts[i].trim().equalsIgnoreCase("true");
         }
-        
+
         return results;
     }
-    
+
     /**
      * Updates the current state based on which actions succeeded.
      * 
