@@ -7,6 +7,7 @@ import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
+import mapf.planning.spacetime.ReservationTable;
 import java.util.*;
 
 /**
@@ -48,6 +49,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Completed box goals - treated as permanent obstacles per MAPF standard. */
     private Set<Position> completedBoxGoals = new HashSet<>();
+    
+    /** Space-time reservation table for collision avoidance. */
+    private ReservationTable reservationTable = new ReservationTable();
+    
+    /** Current global time step for space-time planning. */
+    private int globalTimeStep = 0;
 
     // Logging helpers
     private void logMinimal(String msg) {
@@ -109,6 +116,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Reset for new search
         displacementHistory.clear();
         displacementAttempts = 0;
+        completedBoxGoals.clear();
+        reservationTable.clear();
+        globalTimeStep = 0;
 
         List<Action[]> plan = planWithSubgoals(initialState, level, startTime);
 
@@ -231,6 +241,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             List<Action> path = planSubgoal(subgoal, currentState, level);
             
             if (path != null && !path.isEmpty()) {
+                // Record agent path in reservation table for space-time collision avoidance
+                List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
+                reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep);
+                
                 // Execute the path
                 State tempState = currentState;
                 for (Action action : path) {
@@ -239,6 +253,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, subgoal.agentId);
                     fullPlan.add(jointAction);
                     tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                    globalTimeStep++;
                 }
                 
                 // Verify goal was reached
@@ -260,6 +275,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return false;
+    }
+    
+    /** Extract agent position path from action sequence. */
+    private List<Position> extractAgentPath(int agentId, State startState, List<Action> actions, Level level) {
+        List<Position> path = new ArrayList<>();
+        State state = startState;
+        path.add(state.getAgentPosition(agentId));
+        
+        for (Action action : actions) {
+            if (action.type != Action.ActionType.NOOP && state.isApplicable(action, agentId, level)) {
+                state = state.apply(action, agentId);
+            }
+            path.add(state.getAgentPosition(agentId));
+        }
+        return path;
     }
     
     /** Move agent off box goal position to nearest non-goal position using BFS. */
@@ -339,15 +369,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
     
-    /** Plan path for a single subgoal. */
+    /** Plan path for a single subgoal using space-time A*. */
     private List<Action> planSubgoal(Subgoal subgoal, State state, Level level) {
         if (subgoal.isAgentGoal) {
             return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
         } else {
             Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
             if (boxPos == null) return null;
+            // Use space-time A* with reservation table
             return boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>());
+                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>(),
+                    reservationTable, globalTimeStep);
         }
     }
     
