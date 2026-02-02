@@ -24,9 +24,31 @@ import java.util.*;
  */
 public class SafeZoneCalculator {
 
-    // Cache for computed working areas (invalidated when state changes significantly)
+    // Cache for computed working areas (invalidated when state changes)
     private Map<Integer, Set<Position>> agentWorkingAreaCache = new HashMap<>();
+    private Set<Position> globalWorkingAreaCache = null;
+    private int globalWorkingAreaExcludeAgent = -1;
     private State cachedState = null;
+    private Level cachedLevel = null;
+    
+    // Cache for safe positions
+    private Map<Integer, Position> safePositionCache = new HashMap<>();
+    private State safePositionCachedState = null;
+    
+    /** Resets all caches. Call when state changes significantly. */
+    public void resetCache() {
+        agentWorkingAreaCache.clear();
+        globalWorkingAreaCache = null;
+        globalWorkingAreaExcludeAgent = -1;
+        safePositionCache.clear();
+        cachedState = null;
+        safePositionCachedState = null;
+    }
+    
+    /** Check if cache is valid for current state. */
+    private boolean isCacheValid(State state, Level level) {
+        return cachedState == state && cachedLevel == level;
+    }
 
     /**
      * Computes the "working area" for an agent - all positions it might need.
@@ -37,6 +59,18 @@ public class SafeZoneCalculator {
      * 4. Buffer zones around these paths
      */
     public Set<Position> computeAgentWorkingArea(int agentId, State state, Level level) {
+        // Check cache first
+        if (isCacheValid(state, level) && agentWorkingAreaCache.containsKey(agentId)) {
+            return agentWorkingAreaCache.get(agentId);
+        }
+        
+        // Update cache state
+        if (!isCacheValid(state, level)) {
+            resetCache();
+            cachedState = state;
+            cachedLevel = level;
+        }
+        
         Set<Position> workingArea = new HashSet<>();
         
         Position agentPos = state.getAgentPosition(agentId);
@@ -99,6 +133,9 @@ public class SafeZoneCalculator {
             workingArea.addAll(agentPath);
         }
         
+        // Cache the result
+        agentWorkingAreaCache.put(agentId, workingArea);
+        
         return workingArea;
     }
 
@@ -107,6 +144,19 @@ public class SafeZoneCalculator {
      * This represents all positions that should be avoided when parking.
      */
     public Set<Position> computeGlobalWorkingArea(int excludeAgentId, State state, Level level) {
+        // Check cache first
+        if (isCacheValid(state, level) && globalWorkingAreaCache != null 
+                && globalWorkingAreaExcludeAgent == excludeAgentId) {
+            return globalWorkingAreaCache;
+        }
+        
+        // Update cache state if needed
+        if (!isCacheValid(state, level)) {
+            resetCache();
+            cachedState = state;
+            cachedLevel = level;
+        }
+        
         Set<Position> globalArea = new HashSet<>();
         
         for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
@@ -115,6 +165,10 @@ public class SafeZoneCalculator {
             Set<Position> agentArea = computeAgentWorkingArea(agentId, state, level);
             globalArea.addAll(agentArea);
         }
+        
+        // Cache the result
+        globalWorkingAreaCache = globalArea;
+        globalWorkingAreaExcludeAgent = excludeAgentId;
         
         return globalArea;
     }
@@ -133,9 +187,20 @@ public class SafeZoneCalculator {
      * - Corridor positions (degree 2)
      */
     public Position findSafePosition(int agentId, State state, Level level) {
+        // Check cache first
+        if (safePositionCachedState == state && safePositionCache.containsKey(agentId)) {
+            return safePositionCache.get(agentId);
+        }
+        
+        // Update cache state if different
+        if (safePositionCachedState != state) {
+            safePositionCache.clear();
+            safePositionCachedState = state;
+        }
+        
         Position currentPos = state.getAgentPosition(agentId);
         
-        // Compute global working area
+        // Compute global working area (will use cache if available)
         Set<Position> globalWorkingArea = computeGlobalWorkingArea(agentId, state, level);
         
         // BFS to find positions, scoring each
@@ -185,6 +250,9 @@ public class SafeZoneCalculator {
         } else {
             logNormal("[SAFE-ZONE] No good safe position found for Agent " + agentId);
         }
+        
+        // Cache the result (even if null)
+        safePositionCache.put(agentId, bestPosition);
         
         return bestPosition;
     }

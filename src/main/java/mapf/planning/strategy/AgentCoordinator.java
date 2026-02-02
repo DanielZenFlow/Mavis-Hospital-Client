@@ -189,6 +189,78 @@ public class AgentCoordinator {
     // ========== Idle Agent Clearing ==========
 
     /**
+     * Result of a clearing operation, including which agent was cleared.
+     */
+    public static class ClearingResult {
+        public final boolean success;
+        public final int clearedAgentId;
+        public final Position targetPosition;  // Where the cleared agent should move to
+        
+        public ClearingResult(boolean success, int clearedAgentId, Position targetPosition) {
+            this.success = success;
+            this.clearedAgentId = clearedAgentId;
+            this.targetPosition = targetPosition;
+        }
+        
+        public static ClearingResult failure() {
+            return new ClearingResult(false, -1, null);
+        }
+        
+        public static ClearingResult success(int clearedAgentId, Position targetPosition) {
+            return new ClearingResult(true, clearedAgentId, targetPosition);
+        }
+    }
+
+    /**
+     * Try to clear idle agents blocking the path. Returns which agent was cleared.
+     */
+    public ClearingResult tryIdleAgentClearingWithResult(List<Action[]> plan, State state, Level level,
+            int numAgents, int activeAgent, Set<Position> criticalPositions,
+            PathAnalyzer pathAnalyzer, ConflictResolver conflictResolver) {
+        
+        Position activePos = state.getAgentPosition(activeAgent);
+        Set<Position> satisfiedGoalPositions = GoalChecker.computeSatisfiedGoalPositions(state, level);
+
+        for (int idleAgent = 0; idleAgent < numAgents; idleAgent++) {
+            if (idleAgent == activeAgent)
+                continue;
+            // Only clear agents that have completed their task (not just any idle agent)
+            if (!hasCompletedTask(idleAgent))
+                continue;
+            // Skip agents already yielding (they're already being handled)
+            if (isYielding(idleAgent))
+                continue;
+
+            Position idlePos = state.getAgentPosition(idleAgent);
+
+            if (criticalPositions.contains(idlePos)) {
+                Position parkingPos = pathAnalyzer.findParkingPosition(idleAgent, state, level,
+                        numAgents, criticalPositions, satisfiedGoalPositions);
+
+                if (parkingPos != null) {
+                    List<Action> path = pathAnalyzer.planAgentPath(idleAgent, parkingPos, state, level, numAgents);
+
+                    if (path != null && !path.isEmpty()) {
+                        Action clearAction = path.get(0);
+                        Action[] jointAction = new Action[numAgents];
+                        Arrays.fill(jointAction, Action.noOp());
+                        jointAction[idleAgent] = clearAction;
+                        jointAction = conflictResolver.resolveConflicts(jointAction, state, level);
+                        plan.add(jointAction);
+                        
+                        // Store the target position for continued movement
+                        setYieldingTargetPosition(idleAgent, parkingPos);
+                        
+                        return ClearingResult.success(idleAgent, parkingPos);
+                    }
+                }
+            }
+        }
+
+        return ClearingResult.failure();
+    }
+
+    /**
      * Try to clear idle agents blocking the path.
      */
     public boolean tryIdleAgentClearing(List<Action[]> plan, State state, Level level,
@@ -386,8 +458,30 @@ public class AgentCoordinator {
             int numAgents, int agentId, PathAnalyzer pathAnalyzer, ConflictResolver conflictResolver) {
         
         Position targetPos = yieldingTargetPosition.get(agentId);
-        if (targetPos == null) {
-            return false;
+        Position currentPos = state.getAgentPosition(agentId);
+        
+        // If no target set or already at target, try to find a new parking position
+        if (targetPos == null || currentPos.equals(targetPos)) {
+            Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(state, level);
+            Set<Position> criticalPositions = new HashSet<>();
+            // Avoid blocking any agent's path
+            for (int i = 0; i < numAgents; i++) {
+                if (i == agentId) continue;
+                Position agentGoal = GoalChecker.findAgentGoalPosition(i, level);
+                if (agentGoal != null) {
+                    criticalPositions.add(agentGoal);
+                }
+            }
+            
+            targetPos = pathAnalyzer.findParkingPosition(agentId, state, level,
+                    numAgents, criticalPositions, satisfiedGoals);
+            
+            if (targetPos != null && !targetPos.equals(currentPos)) {
+                yieldingTargetPosition.put(agentId, targetPos);
+            } else {
+                // No valid parking position, clear this agent's yielding state
+                return false;
+            }
         }
 
         List<Action> path = pathAnalyzer.planAgentPath(agentId, targetPos, state, level, numAgents);

@@ -262,6 +262,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             }
                             anyYieldingMoved = true;
                             stuckCount = 0;
+                        } else {
+                            // Cannot move yielding agent - clear its yielding state to avoid infinite loop
+                            logNormal("[YIELD-CHECK] Agent " + yieldingAgentId + 
+                                    " cannot move, releasing from yielding state");
+                            yieldingManager.clearYielding(yieldingAgentId);
                         }
                     } else {
                         // Yielding agent has moved out of the way
@@ -287,11 +292,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // Sort subgoals by topological depth (deepest first)
             final State stateForSort = currentState;
 
-            // Filter out yielding agents
+            // Filter out yielding agents and agents that completed their agent goal and yielded
             unsatisfied.removeIf(sg -> {
                 if (yieldingManager.isYielding(sg.agentId)) {
                     logVerbose("[YIELD] Skipping subgoal for Agent " + sg.agentId +
                             " (yielding for Agent " + yieldingManager.getBeneficiary(sg.agentId) + ")");
+                    return true;
+                }
+                // Skip agent goals for agents that already completed and proactively yielded
+                if (sg.isAgentGoal && yieldingManager.hasAgentGoalCompletedAndYielded(sg.agentId)) {
+                    logVerbose("[YIELD] Skipping agent goal for Agent " + sg.agentId +
+                            " (already completed and proactively yielded)");
                     return true;
                 }
                 return false;
@@ -599,28 +610,43 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
                 // IMPROVEMENT 2: If still stuck, try greedy step with plan merging
                 if (!foundWithReorder) {
-                    // NEW: Try clearing blocking agents before giving up
+                    // Try clearing blocking agents before giving up
                     boolean clearedPath = false;
-                    if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING) {
-                        // TODO: Fix tryIdleAgentClearing signature
-                        /*
+                    if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING && !highestDepthGoals.isEmpty()) {
+                        // Find critical positions that need to be cleared for the highest priority goal
+                        Subgoal blockedGoal = highestDepthGoals.get(0);
+                        Set<Position> criticalPositions = new HashSet<>();
+                        criticalPositions.add(blockedGoal.goalPos);
+                        
+                        // Add positions on the path to the goal
+                        Position agentPos = currentState.getAgentPosition(blockedGoal.agentId);
+                        Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(currentState, level);
+                        Set<Position> pathPositions = pathAnalyzer.findCriticalPositionsForAgentGoal(
+                            currentState, level, blockedGoal.agentId, blockedGoal.goalPos, satisfiedGoals);
+                        criticalPositions.addAll(pathPositions);
+                        
                         int planSizeBefore = fullPlan.size();
-                        clearedPath = agentCoordinator.tryIdleAgentClearing(fullPlan, currentState, level,
-                                numAgents, highestDepthGoals, yieldingManager, goalChecker, pathAnalyzer, 
-                                conflictResolver, planMerger, greedyPlanner);
-                        if (clearedPath) {
+                        AgentCoordinator.ClearingResult clearResult = agentCoordinator.tryIdleAgentClearingWithResult(
+                            fullPlan, currentState, level, numAgents, blockedGoal.agentId, criticalPositions,
+                            pathAnalyzer, conflictResolver);
+                        
+                        if (clearResult.success) {
+                            // CRITICAL: Mark the cleared agent as yielding for the blocked agent
+                            yieldingManager.setYielding(clearResult.clearedAgentId, blockedGoal.agentId);
+                            
                             // Apply all new actions to update currentState
                             for (int i = planSizeBefore; i < fullPlan.size(); i++) {
                                 currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
                             }
                             stuckCount = 0;
-                            logNormal(getName() + ": Cleared blocking agent path");
-                        }*/
-                        // For now skip this optimization
+                            clearedPath = true;
+                            logNormal(getName() + ": Cleared Agent " + clearResult.clearedAgentId + 
+                                " (now yielding for Agent " + blockedGoal.agentId + ")");
+                        }
                     }
                     
                     // Try deadlock box displacement if agent clearing didn't help
-                    if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING + 1) {
+                    if (!clearedPath && stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING + 1) {
                         // Collect blocked agent IDs
                         List<Integer> blockedAgentIds = new ArrayList<>();
                         for (Subgoal sg : highestDepthGoals) {
@@ -881,6 +907,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         logNormal("[PROACTIVE-YIELD] Moving to yield position " + safePos + " (" + pathToSafe.size() + " steps)");
         
+        // If agent was at its agent goal, mark it as completed and yielded to prevent re-planning
+        if (agentGoal != null && currentPos.equals(agentGoal)) {
+            yieldingManager.markAgentGoalCompletedAndYielded(completedAgentId);
+        }
+        
         State tempState = currentState;
         for (Action action : pathToSafe) {
             Action[] jointAction = new Action[numAgents];
@@ -903,7 +934,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Position findBestYieldPosition(int agentId, State state, Level level, List<Integer> blockedAgents) {
         Position currentPos = state.getAgentPosition(agentId);
         
-        // IMPROVED: Use SafeZoneCalculator for proper global working area analysis
+        // Use SafeZoneCalculator for proper global working area analysis (cached)
         Position safePosFromCalculator = safeZoneCalculator.findSafePosition(agentId, state, level);
         if (safePosFromCalculator != null) {
             int passableNeighbors = pathAnalyzer.countPassableNeighbors(safePosFromCalculator, level);
@@ -912,18 +943,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return safePosFromCalculator;
         }
         
-        // Fallback: Use AgentYieldingManager's strict safe position (now also uses SafeZoneCalculator internally)
-        Position strictSafe = yieldingManager.findNearestSafePosition(agentId, state, level);
-        if (strictSafe != null) {
-            // Verify it's actually safe with current state (not just map structure)
-            int passableNeighbors = pathAnalyzer.countPassableNeighbors(strictSafe, level);
-            if (passableNeighbors >= 3) {
-                logNormal("[YIELD] Found strict safe position " + strictSafe + " (passableNeighbors=" + passableNeighbors + ")");
-                return strictSafe;
-            }
-        }
+        // SafeZoneCalculator already tried everything, use BFS with global working area
+        // (Note: removed duplicate call to yieldingManager.findNearestSafePosition which internally
+        //  calls the same safeZoneCalculator.findSafePosition - now returns same cached result)
         
-        // IMPROVED: Compute global working area to avoid blocking any agent's future work
+        // Get cached global working area
         Set<Position> globalWorkingArea = safeZoneCalculator.computeGlobalWorkingArea(agentId, state, level);
         
         // Last resort: BFS search with global working area check

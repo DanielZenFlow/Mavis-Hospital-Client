@@ -34,6 +34,12 @@ public class AgentYieldingManager {
     private final Set<Integer> completedAgents = new HashSet<>();
 
     /**
+     * Tracks agents that completed their agent goal and proactively yielded.
+     * These agents should NOT be re-planned to go back to their goal position.
+     */
+    private final Set<Integer> agentGoalCompletedAndYielded = new HashSet<>();
+
+    /**
      * Cache for safe positions per agent.
      * Key: agentId, Value: last known safe position for that agent
      */
@@ -63,6 +69,7 @@ public class AgentYieldingManager {
     public void reset() {
         yieldingAgents.clear();
         completedAgents.clear();
+        agentGoalCompletedAndYielded.clear();
         agentSafePositions.clear();
     }
 
@@ -100,6 +107,22 @@ public class AgentYieldingManager {
     public void markTaskCompleted(int agentId) {
         completedAgents.add(agentId);
         log("[YIELD] Agent " + agentId + " marked as task-completed");
+    }
+
+    /**
+     * Marks an agent as having completed its agent goal and proactively yielded.
+     * This prevents the agent from being re-planned to go back to its goal position.
+     */
+    public void markAgentGoalCompletedAndYielded(int agentId) {
+        agentGoalCompletedAndYielded.add(agentId);
+        log("[YIELD] Agent " + agentId + " marked as agent-goal-completed-and-yielded");
+    }
+
+    /**
+     * Checks if an agent has completed its agent goal and proactively yielded.
+     */
+    public boolean hasAgentGoalCompletedAndYielded(int agentId) {
+        return agentGoalCompletedAndYielded.contains(agentId);
     }
 
     /**
