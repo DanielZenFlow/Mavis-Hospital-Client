@@ -4,6 +4,7 @@ import mapf.domain.*;
 import mapf.planning.SearchConfig;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
+import mapf.planning.spacetime.ReservationTable;
 
 import java.util.*;
 
