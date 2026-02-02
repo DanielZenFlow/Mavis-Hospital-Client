@@ -137,10 +137,15 @@ public class LevelAnalyzer {
         // Separate box goals from agent goals
         List<Position> boxGoals = new ArrayList<>();
         Set<Position> boxGoalSet = new HashSet<>();
+        List<Position> agentGoals = new ArrayList<>();
+        Set<Position> agentGoalSet = new HashSet<>();
         for (Position goal : goals) {
             if (goalTypes.containsKey(goal)) {
                 boxGoals.add(goal);
                 boxGoalSet.add(goal);
+            } else {
+                agentGoals.add(goal);
+                agentGoalSet.add(goal);
             }
         }
         
@@ -177,14 +182,30 @@ public class LevelAnalyzer {
                 }
             }
             
-            // Check 3: Agent goal blocked by box goals on path (only box goals can block agent goals)
+            // Check 3: Agent goal blocked by box goals on path
             if (!boxGoalSet.contains(goalA)) {
                 int directDist = bfsDistanceFromEdge(goalA, level, Collections.emptySet());
-                for (Position goalX : boxGoals) {  // Only check box goals as blockers
+                for (Position goalX : boxGoals) {
                     if (goalX.equals(goalA)) continue;
                     int avoidDist = bfsDistanceFromEdge(goalA, level, Collections.singleton(goalX));
                     if (avoidDist > directDist) {
                         blockedBy.get(goalA).add(goalX);
+                    }
+                }
+            }
+            
+            // Check 4: Agent goal blocking other agent goals (stay-at-target dependency)
+            // If goalA is on the path to goalB, and agent at goalA would block access to goalB,
+            // then goalA depends on goalB (B must complete first, so A doesn't block it)
+            if (agentGoalSet.contains(goalA)) {
+                for (Position goalB : agentGoals) {
+                    if (goalB.equals(goalA)) continue;
+                    // Check if goalA blocks path to goalB
+                    int directDist = bfsDistanceFromEdge(goalB, level, Collections.emptySet());
+                    int avoidDist = bfsDistanceFromEdge(goalB, level, Collections.singleton(goalA));
+                    if (avoidDist > directDist) {
+                        // goalA blocks path to goalB, so goalA depends on goalB
+                        blockedBy.get(goalA).add(goalB);
                     }
                 }
             }
