@@ -53,6 +53,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Counts displacement attempts; forces CBS after MAX_DISPLACEMENT_ATTEMPTS. */
     private int displacementAttempts = 0;
     private static final int MAX_DISPLACEMENT_ATTEMPTS = 3;
+    
+    /** Pre-computed goal execution order from LevelAnalyzer (optional). */
+    private List<Position> precomputedGoalOrder = null;
 
     // Logging helpers
     private void logMinimal(String msg) {
@@ -107,6 +110,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     @Override
     public void setMaxStates(int maxStates) {
         this.maxStates = maxStates;
+    }
+    
+    /**
+     * Sets pre-computed goal execution order from LevelAnalyzer.
+     * When set, goals will be executed in this order instead of dynamic sorting.
+     */
+    public void setGoalExecutionOrder(List<Position> order) {
+        this.precomputedGoalOrder = order;
+        if (order != null && SearchConfig.isNormal()) {
+            System.err.println("[PriorityPlanning] Using pre-computed goal order: " + order.size() + " goals");
+        }
     }
 
     @Override
