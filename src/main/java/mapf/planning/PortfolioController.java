@@ -26,6 +26,9 @@ public class PortfolioController implements SearchStrategy {
     private long timeoutMs;
     private LevelFeatures features;
     
+    // Cached heuristic - expensive to compute, reuse across strategies
+    private Heuristic cachedHeuristic;
+    
     // Track attempts for debugging
     private final List<AttemptRecord> attempts = new ArrayList<>();
     
@@ -171,15 +174,18 @@ public class PortfolioController implements SearchStrategy {
     
     /**
      * Computes timeout for a single attempt.
+     * Per ARCHITECTURE.md: use shorter first attempt for fast fail/success detection.
      */
     private long computeAttemptTimeout(StrategyConfig config, long remainingTime, int totalStrategies) {
-        // Give more time to primary strategy, less to fallbacks
+        // First strategy: 40% of time (fast fail detection)
+        // Second strategy: 30% of remaining
+        // Last resort: all remaining time
         if (config.weight <= 1.0) {
-            return Math.min(remainingTime * 2 / 3, remainingTime);
+            return Math.min(remainingTime * 2 / 5, remainingTime);
         } else if (config.weight <= 2.0) {
-            return Math.min(remainingTime / 2, remainingTime);
+            return Math.min(remainingTime / 3, remainingTime);
         } else {
-            return remainingTime; // Last resort gets all remaining time
+            return remainingTime;
         }
     }
     
@@ -215,16 +221,24 @@ public class PortfolioController implements SearchStrategy {
                 if (features != null && features.executionOrder != null) {
                     priorityPlanning.setGoalExecutionOrder(features.executionOrder);
                 }
+                // Pass immovable boxes (treated as walls)
+                if (features != null && features.taskFilter != null) {
+                    priorityPlanning.setImmovableBoxes(features.taskFilter.immovableBoxes);
+                }
                 return priorityPlanning;
         }
     }
     
     private Heuristic createHeuristic(Level level) {
-        try {
-            return new TrueDistanceHeuristic(level);
-        } catch (Exception e) {
-            return new ManhattanHeuristic();
+        // Cache heuristic - BFS precomputation is expensive
+        if (cachedHeuristic == null) {
+            try {
+                cachedHeuristic = new TrueDistanceHeuristic(level);
+            } catch (Exception e) {
+                cachedHeuristic = new ManhattanHeuristic();
+            }
         }
+        return cachedHeuristic;
     }
     
     private void printAttemptSummary() {

@@ -5,16 +5,13 @@ import mapf.planning.SearchConfig;
 import mapf.planning.SearchStrategy;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
-import mapf.planning.coordination.AgentYieldingManager;
 import mapf.planning.coordination.DeadlockResolver;
-import mapf.planning.coordination.SafeZoneCalculator;
 import mapf.planning.heuristic.Heuristic;
-import mapf.planning.heuristic.TrueDistanceHeuristic;
 import java.util.*;
 
 /**
  * Priority-based planning strategy with subgoal decomposition.
- * Uses priority re-ordering, true distance heuristic, and specialized helper classes.
+ * Per ARCHITECTURE.md: "Independent Planning + Conflict Resolution"
  */
 public class PriorityPlanningStrategy implements SearchStrategy {
 
@@ -24,24 +21,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private int maxStates;
     private final Random random = new Random(SearchConfig.RANDOM_SEED);
 
-    // Helper classes
+    // Core helper classes (SRP: each handles one responsibility)
     private final SubgoalManager subgoalManager;
     private final TopologicalAnalyzer topologicalAnalyzer;
     private final ConflictResolver conflictResolver;
-    
-    // New helper classes (Phase 2)
     private final BoxSearchPlanner boxSearchPlanner;
     private final GreedyPlanner greedyPlanner;
     private final PlanMerger planMerger;
     private final PathAnalyzer pathAnalyzer;
     private final AgentCoordinator agentCoordinator;
     private final DeadlockBreaker deadlockBreaker;
-    private final GoalChecker goalChecker;
-    
-    // Legacy helpers (to be deprecated)
-    private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
     private final DeadlockResolver deadlockResolver = new DeadlockResolver();
-    private final SafeZoneCalculator safeZoneCalculator = new SafeZoneCalculator();
 
     /** Tracks displaced boxes to avoid infinite loops. */
     private Set<String> displacementHistory = new HashSet<>();
@@ -52,21 +42,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Pre-computed goal execution order from LevelAnalyzer (optional). */
     private List<Position> precomputedGoalOrder = null;
+    
+    /** Immovable boxes (treated as walls in pathfinding). */
+    private Set<Position> immovableBoxes = Collections.emptySet();
+    
+    /** Completed box goals - treated as permanent obstacles per MAPF standard. */
+    private Set<Position> completedBoxGoals = new HashSet<>();
 
     // Logging helpers
     private void logMinimal(String msg) {
-        if (SearchConfig.isMinimal())
-            System.err.println(msg);
+        if (SearchConfig.isMinimal()) System.err.println(msg);
     }
-
     private void logNormal(String msg) {
-        if (SearchConfig.isNormal())
-            System.err.println(msg);
+        if (SearchConfig.isNormal()) System.err.println(msg);
     }
-
     private void logVerbose(String msg) {
-        if (SearchConfig.isVerbose())
-            System.err.println(msg);
+        if (SearchConfig.isVerbose()) System.err.println(msg);
     }
 
     public PriorityPlanningStrategy(Heuristic heuristic, SearchConfig config) {
@@ -75,45 +66,37 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         this.timeoutMs = config.getTimeoutMs();
         this.maxStates = config.getMaxStates();
         
-        // Initialize refactored helpers
         this.subgoalManager = new SubgoalManager(heuristic);
         this.topologicalAnalyzer = new TopologicalAnalyzer();
         this.conflictResolver = new ConflictResolver();
-        
-        // Initialize Phase 2 helpers
         this.boxSearchPlanner = new BoxSearchPlanner(heuristic);
         this.greedyPlanner = new GreedyPlanner();
         this.planMerger = new PlanMerger();
         this.pathAnalyzer = new PathAnalyzer();
         this.agentCoordinator = new AgentCoordinator();
         this.deadlockBreaker = new DeadlockBreaker();
-        this.goalChecker = new GoalChecker();
     }
 
     @Override
-    public String getName() {
-        return "Priority Planning";
-    }
+    public String getName() { return "Priority Planning"; }
 
     @Override
-    public void setTimeout(long timeoutMs) {
-        this.timeoutMs = timeoutMs;
-    }
+    public void setTimeout(long timeoutMs) { this.timeoutMs = timeoutMs; }
 
     @Override
-    public void setMaxStates(int maxStates) {
-        this.maxStates = maxStates;
-    }
+    public void setMaxStates(int maxStates) { this.maxStates = maxStates; }
     
-    /**
-     * Sets pre-computed goal execution order from LevelAnalyzer.
-     * When set, goals will be executed in this order instead of dynamic sorting.
-     */
+    /** Sets pre-computed goal execution order from LevelAnalyzer. */
     public void setGoalExecutionOrder(List<Position> order) {
         this.precomputedGoalOrder = order;
         if (order != null && SearchConfig.isNormal()) {
-            System.err.println("[PriorityPlanning] Using pre-computed goal order: " + order.size() + " goals");
+            System.err.println("[PP] Using pre-computed goal order: " + order.size() + " goals");
         }
+    }
+    
+    /** Sets immovable boxes (treated as walls in pathfinding). */
+    public void setImmovableBoxes(Set<Position> immovable) {
+        this.immovableBoxes = immovable != null ? immovable : Collections.emptySet();
     }
 
     @Override
@@ -121,585 +104,79 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         long startTime = System.currentTimeMillis();
         int numAgents = initialState.getNumAgents();
 
-        logMinimal(getName() + ": Planning for " + numAgents + " agents with subgoal decomposition");
+        logMinimal(getName() + ": Planning for " + numAgents + " agents");
 
-        // Reset yielding state for new search
-        yieldingManager.reset();
-        
-        // Reset displacement tracking for new search
+        // Reset for new search
         displacementHistory.clear();
         displacementAttempts = 0;
 
-        // Use iterative subgoal planning
         List<Action[]> plan = planWithSubgoals(initialState, level, startTime);
 
         if (plan != null && !plan.isEmpty()) {
             logMinimal(getName() + ": Total plan length: " + plan.size());
         }
-
         return plan;
     }
 
     /**
-     * Plans using subgoal decomposition - moves one box at a time.
-     * This naturally handles dependencies between agents.
+     * Core PP algorithm: iteratively solve subgoals in priority order.
+     * Per ARCHITECTURE.md: "moves one box at a time, naturally handles dependencies"
      */
     private List<Action[]> planWithSubgoals(State initialState, Level level, long startTime) {
         List<Action[]> fullPlan = new ArrayList<>();
         State currentState = initialState;
         int numAgents = initialState.getNumAgents();
-
         int stuckCount = 0;
 
         while (!currentState.isGoalState(level)) {
-            // Check time limit (PRODUCT.md: 3 minutes)
+            // PRODUCT.md constraints: 3 minutes, 20,000 actions
             if (System.currentTimeMillis() - startTime > timeoutMs) {
                 logMinimal(getName() + ": Timeout reached");
                 break;
             }
-
-            // Check action limit (PRODUCT.md: 20,000 actions)
             if (fullPlan.size() >= SearchConfig.MAX_ACTIONS) {
-                logMinimal(getName() + ": Reached action limit (" + SearchConfig.MAX_ACTIONS + ")");
+                logMinimal(getName() + ": Action limit reached");
                 break;
             }
-
             if (stuckCount > SearchConfig.MAX_STUCK_ITERATIONS) {
-                logMinimal(getName() + ": Stuck after " + stuckCount + " iterations without progress");
+                logMinimal(getName() + ": Stuck after " + stuckCount + " iterations");
                 break;
             }
 
-            // Check for cyclic dependencies when stuck
+            // Try CBS fallback on cyclic dependency detection
             if (stuckCount == SearchConfig.DEPENDENCY_CHECK_THRESHOLD && SearchConfig.USE_CBS_ON_CYCLE) {
-                System.err.println("\n========== DEPENDENCY ANALYSIS (stuckCount=" + stuckCount + ") ==========");
-                DependencyAnalyzer.AnalysisResult depAnalysis = 
-                    DependencyAnalyzer.analyze(currentState, level);
-                
-                if (depAnalysis.hasCycle) {
-                    System.err.println("[DEPENDENCY] *** CYCLIC DEPENDENCY DETECTED ***");
-                    System.err.println(depAnalysis.report);
-                    
-                    // Check if we've tried displacement too many times
-                    if (displacementAttempts >= MAX_DISPLACEMENT_ATTEMPTS) {
-                        System.err.println("[DISPLACEMENT] Already tried " + displacementAttempts + 
-                            " times, switching to CBS directly...");
-                    } else {
-                        // Strategy: Try to break the cycle by temporarily displacing one box
-                        System.err.println("[DISPLACEMENT] Attempting to break cycle via temporary displacement (attempt " + 
-                            (displacementAttempts + 1) + "/" + MAX_DISPLACEMENT_ATTEMPTS + ")...");
-                        
-                        displacementAttempts++;
-                        
-                        List<Action[]> displacementPlan = new ArrayList<>();
-                        boolean cycleBreakSuccess = deadlockBreaker.attemptCycleBreaking(
-                            displacementPlan, currentState, level, numAgents, 
-                            depAnalysis.cycles.isEmpty() ? new ArrayList<>() : depAnalysis.cycles.get(0),
-                            pathAnalyzer, conflictResolver);
-                        
-                        if (cycleBreakSuccess && !displacementPlan.isEmpty()) {
-                            System.err.println("[DISPLACEMENT] *** SUCCESS! Displaced box with " + 
-                                displacementPlan.size() + " steps ***");
-                            fullPlan.addAll(displacementPlan);
-                            
-                            // Update current state
-                            for (Action[] jointAction : displacementPlan) {
-                                currentState = applyJointAction(jointAction, currentState, level, numAgents);
-                            }
-                            
-                            // Reset stuck count - we made progress
-                            stuckCount = 0;
-                            continue; // Retry main loop with new state
-                        } else {
-                            System.err.println("[DISPLACEMENT] Failed to find displacement, trying CBS...");
-                        }
-                    }
-                    
-                    // Fallback: Try CBS (for pure agent coordination)
-                    System.err.println("[CBS] Attempting CBS as fallback strategy...");
-                    CBSStrategy cbs = new CBSStrategy(heuristic, config);
-                    cbs.setTimeout(timeoutMs - (System.currentTimeMillis() - startTime));
-                    cbs.setMaxStates(maxStates);
-                    
-                    List<Action[]> cbsPlan = cbs.search(currentState, level);
-                    
-                    if (cbsPlan != null && !cbsPlan.isEmpty()) {
-                        System.err.println("[CBS] *** SUCCESS! Found plan with " + cbsPlan.size() + " steps ***");
-                        fullPlan.addAll(cbsPlan);
-                        logMinimal(getName() + ": [OK] Solved via CBS fallback");
-                        logMinimal(getName() + ": Total plan length: " + fullPlan.size());
-                        return fullPlan;
-                    } else {
-                        System.err.println("[CBS] Failed to find solution, continuing with Priority Planning");
-                    }
-                } else {
-                    System.err.println("[DEPENDENCY] No cyclic dependency found. Stuck due to other reasons.");
-                }
-                System.err.println("==========================================================\n");
+                List<Action[]> cbsResult = tryCBSFallback(currentState, level, initialState, fullPlan, startTime, numAgents);
+                if (cbsResult != null) return cbsResult;
             }
 
-            // Release yielding agents if stuck near MAX_STUCK_ITERATIONS threshold to prevent deadlock
-            if (yieldingManager.hasYieldingAgents() && stuckCount == SearchConfig.MAX_STUCK_ITERATIONS - 5) {
-                logNormal("[YIELD] Releasing all yielding agents due to potential deadlock (stuckCount=" + stuckCount
-                        + ")");
-                yieldingManager.clearAllYielding();
+            // Get and sort unsatisfied subgoals (excluding completed goals)
+            List<Subgoal> unsatisfied = subgoalManager.getUnsatisfiedSubgoals(currentState, level, completedBoxGoals);
+            if (unsatisfied.isEmpty()) break;
+
+            sortSubgoals(unsatisfied, currentState);
+            
+            // Log goal order once at start
+            if (fullPlan.isEmpty() && SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
+                logGoalOrder(unsatisfied);
             }
 
-            // Process yielding agents first to ensure they actually move
-            if (yieldingManager.hasYieldingAgents()) {
-                boolean anyYieldingMoved = false;
-
-                for (Map.Entry<Integer, Integer> entry : new HashMap<>(yieldingManager.getYieldingAgents()).entrySet()) {
-                    int yieldingAgentId = entry.getKey();
-                    int beneficiaryId = entry.getValue();
-
-                    // Use AgentYieldingManager to check if still blocking
-                    if (yieldingManager.isBlockingAgent(yieldingAgentId, beneficiaryId, currentState, level)) {
-                        Position yieldingPos = currentState.getAgentPosition(yieldingAgentId);
-                        logNormal("[YIELD-CHECK] Agent " + yieldingAgentId +
-                                " still blocking at " + yieldingPos + ", forcing move");
-
-                        int planSizeBefore = fullPlan.size();
-                        boolean moved = agentCoordinator.forceYieldingAgentToMove(fullPlan, currentState, level,
-                                numAgents, yieldingAgentId, pathAnalyzer, conflictResolver);
-
-                        if (moved) {
-                            // Update state
-                            for (int i = planSizeBefore; i < fullPlan.size(); i++) {
-                                currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
-                            }
-                            anyYieldingMoved = true;
-                            stuckCount = 0;
-                        } else {
-                            // Cannot move yielding agent - clear its yielding state to avoid infinite loop
-                            logNormal("[YIELD-CHECK] Agent " + yieldingAgentId + 
-                                    " cannot move, releasing from yielding state");
-                            yieldingManager.clearYielding(yieldingAgentId);
-                        }
-                    } else {
-                        // Yielding agent has moved out of the way
-                        Position yieldingPos = currentState.getAgentPosition(yieldingAgentId);
-                        logVerbose("[YIELD-CHECK] Agent " + yieldingAgentId +
-                                " no longer blocking (at " + yieldingPos + ")");
-                        yieldingManager.clearYielding(yieldingAgentId);
-                    }
-                }
-
-                if (anyYieldingMoved) {
-                    continue; // Restart main loop with updated state
-                }
-            }
-
-            // Get unsatisfied subgoals prioritized by difficulty
-            List<Subgoal> unsatisfied = subgoalManager.getUnsatisfiedSubgoals(currentState, level);
-
-            if (unsatisfied.isEmpty()) {
-                break;
-            }
-
-            // Sort subgoals by topological depth (deepest first)
-            final State stateForSort = currentState;
-
-            // Filter out yielding agents and agents that completed their agent goal and yielded
-            unsatisfied.removeIf(sg -> {
-                if (yieldingManager.isYielding(sg.agentId)) {
-                    logVerbose("[YIELD] Skipping subgoal for Agent " + sg.agentId +
-                            " (yielding for Agent " + yieldingManager.getBeneficiary(sg.agentId) + ")");
-                    return true;
-                }
-                // Skip agent goals for agents that already completed and proactively yielded
-                if (sg.isAgentGoal && yieldingManager.hasAgentGoalCompletedAndYielded(sg.agentId)) {
-                    logVerbose("[YIELD] Skipping agent goal for Agent " + sg.agentId +
-                            " (already completed and proactively yielded)");
-                    return true;
-                }
-                return false;
-            });
-
-            // Sort subgoals based on pre-computed order or dynamic analysis
-            if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
-                // Use pre-computed order from LevelAnalyzer
-                final Map<Position, Integer> orderMap = new HashMap<>();
-                for (int i = 0; i < precomputedGoalOrder.size(); i++) {
-                    orderMap.put(precomputedGoalOrder.get(i), i);
-                }
-                unsatisfied.sort((a, b) -> {
-                    int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
-                    int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
-                    return Integer.compare(orderA, orderB);
-                });
-                
-                if (SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
-                    System.err.println("[PRE-COMPUTED-ORDER] Using LevelAnalyzer goal order:");
-                    for (int i = 0; i < Math.min(5, unsatisfied.size()); i++) {
-                        Subgoal sg = unsatisfied.get(i);
-                        if (sg.isAgentGoal) {
-                            System.err.println("  " + (i+1) + ". Agent " + sg.agentId + " -> " + sg.goalPos);
-                        } else {
-                            System.err.println("  " + (i+1) + ". Box " + sg.boxType + " -> " + sg.goalPos);
-                        }
-                    }
-                }
+            // Try to execute highest priority subgoal
+            boolean madeProgress = tryExecuteSubgoals(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
+            
+            if (madeProgress) {
+                // Update state from plan
+                currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                stuckCount = 0;
             } else {
-                // Fallback: use simple difficulty-based ordering
-                unsatisfied.sort((a, b) -> {
-                    int diffA = subgoalManager.estimateSubgoalDifficulty(a, stateForSort, level);
-                    int diffB = subgoalManager.estimateSubgoalDifficulty(b, stateForSort, level);
-                    return Integer.compare(diffA, diffB);
-                });
-            }
-
-            // Execute goals in order
-            List<Subgoal> highestDepthGoals = unsatisfied;
-
-            boolean madeProgress = false;
-            Subgoal highestPriorityFailedGoal = null;
-
-            // Try goals in sorted order
-            for (Subgoal subgoal : highestDepthGoals) {
-                if (System.currentTimeMillis() - startTime > timeoutMs) {
-                    break;
-                }
-
-                List<Action> path = null;
-                Position boxToMove = null;
-
-                if (subgoal.isAgentGoal) {
-                    // Agent goal: move agent to target position
-                    path = boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, currentState, level);
-                } else {
-                    // Box goal: find box and move to goal
-                    boxToMove = subgoalManager.findBestBoxForGoal(subgoal, currentState, level);
-                    if (boxToMove == null) {
-                        continue;
-                    }
-                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxToMove,
-                            subgoal.goalPos, subgoal.boxType, currentState, level, new HashSet<>());
-                }
-
-                if (path != null && !path.isEmpty()) {
-                    // Plan merging: let other agents act too
-                    for (Action action : path) {
-                        Action[] jointAction = planMerger.createJointActionWithMerging(
-                                subgoal.agentId, action, currentState, level, numAgents, subgoal.isAgentGoal);
-
-                        // Resolve conflicts - primary agent has right of way
-                        jointAction = conflictResolver.resolveConflicts(jointAction, currentState, level, subgoal.agentId);
-
-                        fullPlan.add(jointAction);
-                        currentState = applyJointAction(jointAction, currentState, level, numAgents);
-                    }
-
-                    // Validate goal reached
-                    boolean goalReached = false;
-                    if (subgoal.isAgentGoal) {
-                        Position currentPos = currentState.getAgentPosition(subgoal.agentId);
-                        goalReached = currentPos.equals(subgoal.goalPos);
-
-                        if (goalReached) {
-                            logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
-                                    " moved to goal position " + subgoal.goalPos + " (path: " + path.size() + " steps)");
-                        } else {
-                            logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
-                                    " executed path but did NOT reach goal " + subgoal.goalPos +
-                                    " (current: " + currentPos + ", expected: " + subgoal.goalPos + ")");
-                            // Do NOT break - continue trying to complete this goal
-                            continue;
-                        }
-                    } else {
-                        // Box goal - verify box is at goal position
-                        char actualBox = currentState.getBoxAt(subgoal.goalPos);
-                        goalReached = (actualBox == subgoal.boxType);
-
-                        if (goalReached) {
-                            logMinimal(getName() + ": [OK] Agent " + subgoal.agentId +
-                                    " moved box " + subgoal.boxType + " (path: " + path.size() + " steps)");
-                        } else {
-                            logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
-                                    " executed path but box " + subgoal.boxType + " NOT at goal " +
-                                    subgoal.goalPos);
-                            continue;
-                        }
-                    }
-
-                    // Only mark progress if goal was actually reached
-                    if (goalReached) {
-                        madeProgress = true;
-                        stuckCount = 0;
-
-                        // Release any agents that were yielding for this agent
-                        agentCoordinator.clearYieldingForBeneficiary(subgoal.agentId, yieldingManager);
-                        
-                        // Proactive yielding: move agent to safe position after task completion
-                        if (performProactiveYielding(subgoal.agentId, fullPlan, currentState, level, numAgents)) {
-                            // Update currentState after proactive yielding moves
-                            State tempState = initialState;
-                            for (Action[] jointAction : fullPlan) {
-                                tempState = applyJointAction(jointAction, tempState, level, numAgents);
-                            }
-                            currentState = tempState;
-                        }
-                        
-                        break;
-                    }
-                } else {
-                    // Track the highest priority goal that failed
-                    // This is the FIRST goal in sorted list (deepest) that failed
-                    if (highestPriorityFailedGoal == null) {
-                        highestPriorityFailedGoal = subgoal;
-                        logVerbose("[BLOCKED] Highest priority goal blocked: Agent " + subgoal.agentId +
-                                (subgoal.isAgentGoal ? " to " : " box " + subgoal.boxType + " to ") +
-                                subgoal.goalPos + " (depth=" + topologicalAnalyzer.getTopologicalDepth(subgoal.goalPos, level)
-                                + ")");
-                    }
-                }
-            }
-
-            // NEW: If a high-priority goal failed, try to clear the path BEFORE falling
-            // back to lower priority goals
-            if (!madeProgress && highestPriorityFailedGoal != null && stuckCount < 3) {
-                // TODO: Fix tryPreemptivePathClearing signature
-                /*
-                boolean clearedForHighPriority = deadlockBreaker.tryPreemptivePathClearing(
-                        fullPlan, currentState, level, numAgents, highestPriorityFailedGoal,
-                        yieldingManager, goalChecker, pathAnalyzer, conflictResolver, planMerger);
-                if (clearedForHighPriority) {
-                    for (int i = fullPlan.size() - 1; i >= 0; i--) {
-                        // Update currentState based on added actions
-                    }
-                    // Re-calculate currentState from all actions
-                    State tempState = initialState;
-                    for (Action[] jointAction : fullPlan) {
-                        tempState = applyJointAction(jointAction, tempState, level, numAgents);
-                    }
-                    currentState = tempState;
-                    logNormal(getName() + ": Cleared path for high-priority goal, retrying...");
-                    continue;
-                }
-                */
-                // For now, skip this optimization
-            }
-
-            if (!madeProgress) {
                 stuckCount++;
-                // Log which subgoals are failing
-                if (stuckCount == 1 || stuckCount % SearchConfig.STUCK_LOG_INTERVAL == 0) {
-                    logNormal(getName() + ": Stuck iteration " + stuckCount +
-                            ", remaining subgoals:");
-                    for (Subgoal sg : unsatisfied) {
-                        int diff = subgoalManager.estimateSubgoalDifficulty(sg, currentState, level);
-                        if (sg.isAgentGoal) {
-                            logNormal("  - Agent " + sg.agentId + " -> goal position " +
-                                    sg.goalPos + " (difficulty: " + diff + ")");
-                        } else {
-                            logNormal("  - Agent " + sg.agentId + " box " + sg.boxType +
-                                    " -> goal " + sg.goalPos + " (difficulty: " + diff + ")");
-                        }
+                
+                // Try recovery mechanisms when stuck
+                if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING) {
+                    boolean recovered = tryRecovery(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
+                    if (recovered) {
+                        currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                        stuckCount = 0;
                     }
-                }
-
-                // Try random re-ordering of subgoals when stuck
-                boolean foundWithReorder = false;
-                for (int reorderAttempt = 0; reorderAttempt < SearchConfig.MAX_REORDER_ATTEMPTS; reorderAttempt++) {
-                    Collections.shuffle(highestDepthGoals, random);
-
-                    for (Subgoal subgoal : highestDepthGoals) {
-                        List<Action> path = null;
-
-                        if (subgoal.isAgentGoal) {
-                            path = boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, currentState, level);
-                        } else {
-                            Position boxToMove = subgoalManager.findBestBoxForGoal(subgoal, currentState, level);
-                            if (boxToMove == null)
-                                continue;
-                            path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxToMove,
-                                    subgoal.goalPos, subgoal.boxType, currentState, level, new HashSet<>());
-                        }
-
-                        if (path != null && !path.isEmpty()) {
-                            // Execute with plan merging
-                            for (Action action : path) {
-                                Action[] jointAction = planMerger.createJointActionWithMerging(
-                                        subgoal.agentId, action, currentState, level, numAgents, subgoal.isAgentGoal);
-                                // Resolve conflicts - primary agent has right of way
-                                jointAction = conflictResolver.resolveConflicts(jointAction, currentState, level, subgoal.agentId);
-
-                                fullPlan.add(jointAction);
-                                currentState = applyJointAction(jointAction, currentState, level, numAgents);
-                            }
-                            // Validate goal reached
-                            boolean goalReached = false;
-                            if (subgoal.isAgentGoal) {
-                                Position currentPos = currentState.getAgentPosition(subgoal.agentId);
-                                goalReached = currentPos.equals(subgoal.goalPos);
-
-                                if (goalReached) {
-                                    logNormal(getName() + ": Agent " + subgoal.agentId +
-                                            " moved to goal position after reorder (path: " + path.size() + " steps)");
-                                } else {
-                                    logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
-                                            " executed reordered path but did NOT reach goal " + subgoal.goalPos +
-                                            " (current: " + currentPos + ")");
-                                    continue;
-                                }
-                            } else {
-                                // Box goal - verify box is at goal position
-                                char actualBox = currentState.getBoxAt(subgoal.goalPos);
-                                goalReached = (actualBox == subgoal.boxType);
-
-                                if (goalReached) {
-                                    logNormal(getName() + ": Agent " + subgoal.agentId +
-                                            " moved box " + subgoal.boxType + " after reorder (path: " + path.size()
-                                            + " steps)");
-                                } else {
-                                    logNormal(getName() + ": [PARTIAL] Agent " + subgoal.agentId +
-                                            " executed reordered path but box " + subgoal.boxType + " NOT at goal " +
-                                            subgoal.goalPos);
-                                    continue;
-                                }
-                            }
-
-                            if (goalReached) {
-                                foundWithReorder = true;
-                                stuckCount = 0;
-                                agentCoordinator.clearYieldingForBeneficiary(subgoal.agentId, yieldingManager);
-                                
-                                // PROACTIVE YIELDING: After completing task via reorder
-                                if (performProactiveYielding(subgoal.agentId, fullPlan, currentState, level, numAgents)) {
-                                    // Update currentState
-                                    State tempState = initialState;
-                                    for (Action[] jointAction : fullPlan) {
-                                        tempState = applyJointAction(jointAction, tempState, level, numAgents);
-                                    }
-                                    currentState = tempState;
-                                }
-                                
-                                break;
-                            }
-                        }
-                    }
-                    if (foundWithReorder)
-                        break;
-                }
-
-                // IMPROVEMENT 2: If still stuck, try greedy step with plan merging
-                if (!foundWithReorder) {
-                    // Try clearing blocking agents before giving up
-                    boolean clearedPath = false;
-                    if (stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING && !highestDepthGoals.isEmpty()) {
-                        // Find critical positions that need to be cleared for the highest priority goal
-                        Subgoal blockedGoal = highestDepthGoals.get(0);
-                        Set<Position> criticalPositions = new HashSet<>();
-                        criticalPositions.add(blockedGoal.goalPos);
-                        
-                        // Add positions on the path to the goal
-                        Position agentPos = currentState.getAgentPosition(blockedGoal.agentId);
-                        Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(currentState, level);
-                        Set<Position> pathPositions = pathAnalyzer.findCriticalPositionsForAgentGoal(
-                            currentState, level, blockedGoal.agentId, blockedGoal.goalPos, satisfiedGoals);
-                        criticalPositions.addAll(pathPositions);
-                        
-                        int planSizeBefore = fullPlan.size();
-                        AgentCoordinator.ClearingResult clearResult = agentCoordinator.tryIdleAgentClearingWithResult(
-                            fullPlan, currentState, level, numAgents, blockedGoal.agentId, criticalPositions,
-                            pathAnalyzer, conflictResolver);
-                        
-                        if (clearResult.success) {
-                            // CRITICAL: Mark the cleared agent as yielding for the blocked agent
-                            yieldingManager.setYielding(clearResult.clearedAgentId, blockedGoal.agentId);
-                            
-                            // Apply all new actions to update currentState
-                            for (int i = planSizeBefore; i < fullPlan.size(); i++) {
-                                currentState = applyJointAction(fullPlan.get(i), currentState, level, numAgents);
-                            }
-                            stuckCount = 0;
-                            clearedPath = true;
-                            logNormal(getName() + ": Cleared Agent " + clearResult.clearedAgentId + 
-                                " (now yielding for Agent " + blockedGoal.agentId + ")");
-                        }
-                    }
-                    
-                    // Try deadlock box displacement if agent clearing didn't help
-                    if (!clearedPath && stuckCount >= SearchConfig.STUCK_ITERATIONS_BEFORE_CLEARING + 1) {
-                        // Collect blocked agent IDs
-                        List<Integer> blockedAgentIds = new ArrayList<>();
-                        for (Subgoal sg : highestDepthGoals) {
-                            blockedAgentIds.add(sg.agentId);
-                        }
-                        
-                        // Analyze blocking relationships
-                        List<DeadlockResolver.BlockingInfo> blockingInfos = 
-                            deadlockResolver.analyzeBlocking(currentState, level, blockedAgentIds);
-                        
-                        if (!blockingInfos.isEmpty()) {
-                            logNormal("\n[DEADLOCK] Analyzing blocking relationships:");
-                            for (DeadlockResolver.BlockingInfo info : blockingInfos) {
-                                logNormal("[DEADLOCK]   " + info);
-                            }
-                            
-                            // Try displacement
-                            DeadlockResolver.DisplacementPlan displacementPlan = 
-                                deadlockResolver.createDisplacementPlan(blockingInfos, currentState, level, displacementHistory);
-                            
-                            if (displacementPlan != null) {
-                                logNormal("[DEADLOCK] Attempting displacement: " + displacementPlan);
-                                
-                                // Record this displacement attempt
-                                String historyKey = displacementPlan.boxType + "@" + displacementPlan.boxPosition;
-                                displacementHistory.add(historyKey);
-                                
-                                // Execute displacement
-                                List<Action> displacePath = boxSearchPlanner.planBoxDisplacement(
-                                    displacementPlan.agentId, displacementPlan.boxPosition, 
-                                    displacementPlan.tempPosition, displacementPlan.boxType,
-                                    currentState, level);
-                                
-                                if (displacePath != null && !displacePath.isEmpty()) {
-                                    logNormal("[DEADLOCK] *** SUCCESS! Displacing box " + displacementPlan.boxType +
-                                        " with " + displacePath.size() + " steps ***");
-                                    
-                                    // Execute displacement plan
-                                    for (Action action : displacePath) {
-                                        Action[] jointAction = planMerger.createJointActionWithMerging(
-                                            displacementPlan.agentId, action, currentState, level, 
-                                            numAgents, false);
-                                        jointAction = conflictResolver.resolveConflicts(jointAction, currentState, level, 
-                                            displacementPlan.agentId);
-                                        fullPlan.add(jointAction);
-                                        currentState = applyJointAction(jointAction, currentState, level, numAgents);
-                                    }
-                                    
-                                    stuckCount = 0;
-                                    clearedPath = true;
-                                    logNormal("[DEADLOCK] Box displaced, continuing with normal planning");
-                                } else {
-                                    logNormal("[DEADLOCK] Failed to find displacement path");
-                                }
-                            } else {
-                                logNormal("[DEADLOCK] No suitable displacement found");
-                            }
-                        }
-                    }
-
-                    if (!clearedPath) {
-                        GreedyPlanner.AgentStateProvider stateProvider = new GreedyPlanner.AgentStateProvider() {
-                            public boolean isYielding(int agentId) { return yieldingManager.isYielding(agentId); }
-                            public boolean hasCompletedTask(int agentId) { return false; }
-                            public int getBeneficiary(int agentId) { return yieldingManager.getBeneficiary(agentId); }
-                        };
-                        GreedyPlanner.ActionEvaluator evaluator = new GreedyPlanner.ActionEvaluator() {
-                            public int estimateAgentCost(int agentId, State state, Level level) {
-                                return PriorityPlanningStrategy.this.estimateAgentCost(agentId, state, level);
-                            }
-                        };
-                        boolean anyMove = greedyPlanner.tryGreedyStepWithMerging(fullPlan, currentState, level, numAgents,
-                                stateProvider, evaluator, conflictResolver, planMerger);
-                        if (anyMove) {
-                            Action[] lastAction = fullPlan.get(fullPlan.size() - 1);
-                            currentState = applyJointAction(lastAction, currentState, level, numAgents);
-                        }
-                    }
-                } else {
-                    madeProgress = true;
                 }
             }
         }
@@ -712,91 +189,317 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         return fullPlan.isEmpty() ? null : fullPlan;
     }
-
-    /** Estimates total cost for an agent using true distance heuristic. */
-    private int estimateAgentCost(int agentId, State state, Level level) {
-        int cost = 0;
-        Color agentColor = level.getAgentColor(agentId);
-
-        // Calculate box goal costs
-        for (Map.Entry<Position, Character> box : state.getBoxes().entrySet()) {
-            char boxType = box.getValue();
-            if (level.getBoxColor(boxType) == agentColor) {
-                Position boxPos = box.getKey();
-
-                // Skip already satisfied goals
-                if (level.getBoxGoal(boxPos) == boxType) {
-                    continue;
-                }
-
-                // Find closest unsatisfied goal for this box type
-                int minDist = Integer.MAX_VALUE;
-                for (int r = 0; r < level.getRows(); r++) {
-                    for (int c = 0; c < level.getCols(); c++) {
-                        if (level.getBoxGoal(r, c) == boxType) {
-                            Position goalPos = new Position(r, c);
-                            Character currentBox = state.getBoxes().get(goalPos);
-                            // Skip already satisfied goals
-                            if (currentBox != null && currentBox == boxType) {
-                                continue;
-                            }
-                            int dist;
-                            if (heuristic instanceof TrueDistanceHeuristic) {
-                                dist = ((TrueDistanceHeuristic) heuristic).getDistance(boxPos, goalPos);
-                                if (dist == Integer.MAX_VALUE) {
-                                    dist = boxPos.manhattanDistance(goalPos);
-                                }
-                            } else {
-                                dist = boxPos.manhattanDistance(goalPos);
-                            }
-                            minDist = Math.min(minDist, dist);
-                        }
-                    }
-                }
-
-                if (minDist < Integer.MAX_VALUE) {
-                    cost += minDist;
-                }
+    
+    /** Sort subgoals by pre-computed order or difficulty. */
+    private void sortSubgoals(List<Subgoal> subgoals, State state) {
+        if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
+            Map<Position, Integer> orderMap = new HashMap<>();
+            for (int i = 0; i < precomputedGoalOrder.size(); i++) {
+                orderMap.put(precomputedGoalOrder.get(i), i);
             }
+            subgoals.sort((a, b) -> {
+                int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
+                int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
+                return Integer.compare(orderA, orderB);
+            });
+        } else {
+            // Fallback: sort by difficulty (easier first)
+            final State s = state;
+            subgoals.sort((a, b) -> {
+                int diffA = subgoalManager.estimateSubgoalDifficulty(a, s, null);
+                int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, null);
+                return Integer.compare(diffA, diffB);
+            });
         }
-
-        // Calculate agent position goal cost only after all box goals are satisfied
-        if (GoalChecker.allBoxGoalsSatisfied(state, level)) {
-            Position agentPos = state.getAgentPosition(agentId);
-
-            // Add HUGE penalty if agent is in a position that blocks higher-priority agents
-            Set<Position> blockingPositions = getPositionsThatWouldBlockHigherPriority(agentId, state, level);
-            if (blockingPositions.contains(agentPos)) {
-                cost += 10000;
-            }
-
-            for (int row = 0; row < level.getRows(); row++) {
-                for (int col = 0; col < level.getCols(); col++) {
-                    if (level.getAgentGoal(row, col) == agentId) {
-                        Position goalPos = new Position(row, col);
-                        if (!agentPos.equals(goalPos)) {
-                            if (heuristic instanceof TrueDistanceHeuristic) {
-                                int dist = ((TrueDistanceHeuristic) heuristic).getDistance(agentPos, goalPos);
-                                cost += (dist < Integer.MAX_VALUE) ? dist : agentPos.manhattanDistance(goalPos);
-                            } else {
-                                cost += agentPos.manhattanDistance(goalPos);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
+    }
+    
+    /** Log the goal execution order for debugging. */
+    private void logGoalOrder(List<Subgoal> subgoals) {
+        System.err.println("[PP] Goal execution order (" + subgoals.size() + " subgoals):");
+        for (int i = 0; i < Math.min(15, subgoals.size()); i++) {
+            Subgoal sg = subgoals.get(i);
+            String desc = sg.isAgentGoal ? "Agent " + sg.agentId : "Box " + sg.boxType;
+            System.err.println("  " + (i+1) + ". " + desc + " -> " + sg.goalPos);
         }
-
-        return cost;
     }
 
-    /** Represents a subgoal: moving a box or agent to a goal position. */
+    /** Try to execute subgoals in priority order. Returns true if progress made. */
+    private boolean tryExecuteSubgoals(List<Subgoal> subgoals, List<Action[]> fullPlan, 
+            State currentState, Level level, int numAgents, State initialState) {
+        
+        for (Subgoal subgoal : subgoals) {
+            List<Action> path = planSubgoal(subgoal, currentState, level);
+            
+            if (path != null && !path.isEmpty()) {
+                // Execute the path
+                State tempState = currentState;
+                for (Action action : path) {
+                    Action[] jointAction = planMerger.createJointActionWithMerging(
+                            subgoal.agentId, action, tempState, level, numAgents, subgoal.isAgentGoal);
+                    jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, subgoal.agentId);
+                    fullPlan.add(jointAction);
+                    tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                }
+                
+                // Verify goal was reached
+                boolean reached = verifyGoalReached(subgoal, tempState, level);
+                if (reached) {
+                    // Mark box goal as completed (MAPF standard: treat as permanent obstacle)
+                    if (!subgoal.isAgentGoal) {
+                        completedBoxGoals.add(subgoal.goalPos);
+                    }
+                    
+                    // Proactive Yielding: if agent is on a box goal, move off
+                    tempState = yieldFromBoxGoal(subgoal.agentId, tempState, level, fullPlan, numAgents);
+                    
+                    logMinimal(getName() + ": [OK] " + 
+                        (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) +
+                        " -> " + subgoal.goalPos + " (" + path.size() + " steps)");
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    
+    /** Move agent off box goal position to nearest non-goal position using BFS. */
+    private State yieldFromBoxGoal(int agentId, State state, Level level, 
+            List<Action[]> fullPlan, int numAgents) {
+        Position agentPos = state.getAgentPosition(agentId);
+        if (level.getBoxGoal(agentPos) == '\0') {
+            return state; // Not on a box goal
+        }
+        
+        // BFS to find nearest non-goal position
+        List<Position> pathToSafe = findPathToNonGoal(agentPos, state, level);
+        if (pathToSafe == null || pathToSafe.isEmpty()) {
+            return state; // No safe position found
+        }
+        
+        // Execute the path
+        State tempState = state;
+        Position currentPos = agentPos;
+        for (Position nextPos : pathToSafe) {
+            Direction dir = getDirection(currentPos, nextPos);
+            if (dir == null) break;
+            
+            Action moveAction = Action.move(dir);
+            Action[] jointAction = new Action[numAgents];
+            for (int i = 0; i < numAgents; i++) {
+                jointAction[i] = (i == agentId) ? moveAction : Action.noOp();
+            }
+            fullPlan.add(jointAction);
+            tempState = tempState.apply(moveAction, agentId);
+            currentPos = nextPos;
+        }
+        return tempState;
+    }
+    
+    /** BFS to find path to nearest non-goal position. */
+    private List<Position> findPathToNonGoal(Position start, State state, Level level) {
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Position> parent = new HashMap<>();
+        queue.add(start);
+        parent.put(start, null);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            
+            // Found a non-goal position (not start)
+            if (!current.equals(start) && level.getBoxGoal(current) == '\0') {
+                // Reconstruct path
+                List<Position> path = new ArrayList<>();
+                Position p = current;
+                while (p != null && !p.equals(start)) {
+                    path.add(0, p);
+                    p = parent.get(p);
+                }
+                return path;
+            }
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!parent.containsKey(next) && !level.isWall(next) && 
+                    !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
+                    parent.put(next, current);
+                    queue.add(next);
+                }
+            }
+        }
+        return null; // No safe position reachable
+    }
+    
+    /** Get direction from one position to adjacent position. */
+    private Direction getDirection(Position from, Position to) {
+        int dRow = to.row - from.row;
+        int dCol = to.col - from.col;
+        for (Direction dir : Direction.values()) {
+            if (dir.dRow == dRow && dir.dCol == dCol) return dir;
+        }
+        return null;
+    }
+    
+    /** Plan path for a single subgoal. */
+    private List<Action> planSubgoal(Subgoal subgoal, State state, Level level) {
+        if (subgoal.isAgentGoal) {
+            return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
+        } else {
+            Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
+            if (boxPos == null) return null;
+            return boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>());
+        }
+    }
+    
+    /** Verify that a subgoal was actually reached. */
+    private boolean verifyGoalReached(Subgoal subgoal, State state, Level level) {
+        if (subgoal.isAgentGoal) {
+            return state.getAgentPosition(subgoal.agentId).equals(subgoal.goalPos);
+        } else {
+            return state.getBoxAt(subgoal.goalPos) == subgoal.boxType;
+        }
+    }
+
+    /** Try CBS fallback when stuck with cyclic dependencies. */
+    private List<Action[]> tryCBSFallback(State currentState, Level level, State initialState,
+            List<Action[]> fullPlan, long startTime, int numAgents) {
+        
+        DependencyAnalyzer.AnalysisResult analysis = DependencyAnalyzer.analyze(currentState, level);
+        
+        if (analysis.hasCycle) {
+            logNormal("[PP] Cyclic dependency detected, trying displacement...");
+            
+            if (displacementAttempts < MAX_DISPLACEMENT_ATTEMPTS) {
+                displacementAttempts++;
+                List<Action[]> displacementPlan = new ArrayList<>();
+                boolean success = deadlockBreaker.attemptCycleBreaking(
+                    displacementPlan, currentState, level, numAgents,
+                    analysis.cycles.isEmpty() ? new ArrayList<>() : analysis.cycles.get(0),
+                    pathAnalyzer, conflictResolver);
+                
+                if (success && !displacementPlan.isEmpty()) {
+                    logNormal("[PP] Displacement succeeded with " + displacementPlan.size() + " steps");
+                    fullPlan.addAll(displacementPlan);
+                    return null; // Continue with PP
+                }
+            }
+            
+            // Try CBS as last resort
+            logNormal("[PP] Trying CBS fallback...");
+            CBSStrategy cbs = new CBSStrategy(heuristic, config);
+            cbs.setTimeout(timeoutMs - (System.currentTimeMillis() - startTime));
+            List<Action[]> cbsPlan = cbs.search(currentState, level);
+            
+            if (cbsPlan != null && !cbsPlan.isEmpty()) {
+                logMinimal("[PP] CBS solved with " + cbsPlan.size() + " steps");
+                fullPlan.addAll(cbsPlan);
+                return fullPlan;
+            }
+        }
+        return null;
+    }
+
+    /** Try recovery mechanisms when stuck. */
+    private boolean tryRecovery(List<Subgoal> subgoals, List<Action[]> fullPlan,
+            State currentState, Level level, int numAgents, State initialState) {
+        
+        if (subgoals.isEmpty()) return false;
+        Subgoal blockedGoal = subgoals.get(0);
+        
+        // Strategy 1: Try clearing blocking agents
+        Set<Position> criticalPositions = new HashSet<>();
+        criticalPositions.add(blockedGoal.goalPos);
+        Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(currentState, level);
+        criticalPositions.addAll(pathAnalyzer.findCriticalPositionsForAgentGoal(
+            currentState, level, blockedGoal.agentId, blockedGoal.goalPos, satisfiedGoals));
+        
+        int planSizeBefore = fullPlan.size();
+        AgentCoordinator.ClearingResult result = agentCoordinator.tryIdleAgentClearingWithResult(
+            fullPlan, currentState, level, numAgents, blockedGoal.agentId, criticalPositions,
+            pathAnalyzer, conflictResolver);
+        
+        if (result.success) {
+            logNormal("[PP] Cleared blocking agent " + result.clearedAgentId);
+            return true;
+        }
+        
+        // Strategy 2: Try box displacement
+        List<Integer> blockedAgents = new ArrayList<>();
+        for (Subgoal sg : subgoals) blockedAgents.add(sg.agentId);
+        
+        List<DeadlockResolver.BlockingInfo> blockingInfos = 
+            deadlockResolver.analyzeBlocking(currentState, level, blockedAgents, immovableBoxes);
+        
+        if (!blockingInfos.isEmpty()) {
+            DeadlockResolver.DisplacementPlan displacement = 
+                deadlockResolver.createDisplacementPlan(blockingInfos, currentState, level, displacementHistory);
+            
+            if (displacement != null) {
+                List<Action> displacePath = boxSearchPlanner.planBoxDisplacement(
+                    displacement.agentId, displacement.boxPosition,
+                    displacement.tempPosition, displacement.boxType, currentState, level);
+                
+                if (displacePath != null && !displacePath.isEmpty()) {
+                    String historyKey = displacement.boxType + "@" + displacement.boxPosition;
+                    displacementHistory.add(historyKey);
+                    
+                    State tempState = currentState;
+                    for (Action action : displacePath) {
+                        Action[] jointAction = planMerger.createJointActionWithMerging(
+                            displacement.agentId, action, tempState, level, numAgents, false);
+                        jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, displacement.agentId);
+                        fullPlan.add(jointAction);
+                        tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                    }
+                    logNormal("[PP] Displaced box " + displacement.boxType);
+                    return true;
+                }
+            }
+        }
+        
+        // Strategy 3: Random reorder and retry
+        Collections.shuffle(subgoals, random);
+        for (Subgoal sg : subgoals) {
+            List<Action> path = planSubgoal(sg, currentState, level);
+            if (path != null && !path.isEmpty()) {
+                State tempState = currentState;
+                for (Action action : path) {
+                    Action[] jointAction = planMerger.createJointActionWithMerging(
+                        sg.agentId, action, tempState, level, numAgents, sg.isAgentGoal);
+                    jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, sg.agentId);
+                    fullPlan.add(jointAction);
+                    tempState = applyJointAction(jointAction, tempState, level, numAgents);
+                }
+                if (verifyGoalReached(sg, tempState, level)) {
+                    logNormal("[PP] Succeeded with reordered goal");
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+
+    /** Recompute state from initial + all actions. */
+    private State recomputeState(State initial, List<Action[]> plan, Level level, int numAgents) {
+        State state = initial;
+        for (Action[] jointAction : plan) {
+            state = applyJointAction(jointAction, state, level, numAgents);
+        }
+        return state;
+    }
+
+    /** Apply joint action to state. */
+    private State applyJointAction(Action[] jointAction, State state, Level level, int numAgents) {
+        return planMerger.applyJointAction(jointAction, state, numAgents);
+    }
+
+    /** Subgoal: move a box or agent to a goal position. */
     public static class Subgoal {
-        final int agentId;
-        final char boxType; // '\0' for agent goals
-        final Position goalPos;
-        final boolean isAgentGoal; // true if this is an agent position goal
+        public final int agentId;
+        public final char boxType;
+        public final Position goalPos;
+        public final boolean isAgentGoal;
 
         public Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal) {
             this.agentId = agentId;
@@ -808,250 +511,5 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         public Subgoal(int agentId, char boxType, Position goalPos) {
             this(agentId, boxType, goalPos, false);
         }
-    }
-
-    /** Applies a joint action to the state and returns the new state. */
-    private State applyJointAction(Action[] jointAction, State state, Level level, int numAgents) {
-        return planMerger.applyJointAction(jointAction, state, numAgents);
-    }
-
-    /** Move completed agents out of corridors to avoid blocking. */
-    private boolean performProactiveYielding(int completedAgentId, List<Action[]> plan, 
-            State currentState, Level level, int numAgents) {
-        
-        Position currentPos = currentState.getAgentPosition(completedAgentId);
-        
-        // Check if agent has an agent goal to reach
-        Position agentGoal = GoalChecker.findAgentGoalPosition(completedAgentId, level);
-        if (agentGoal != null && !currentPos.equals(agentGoal)) {
-            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " has agent goal at " + agentGoal + 
-                    ", skipping proactive yield (will go to goal in Phase 2)");
-            return false;
-        }
-        
-        yieldingManager.markTaskCompleted(completedAgentId);
-        
-        int passableNeighbors = pathAnalyzer.countPassableNeighbors(currentPos, level);
-        int freeNeighbors = pathAnalyzer.countFreeNeighbors(currentPos, currentState, level);
-        
-        logNormal("[PROACTIVE-YIELD-CHECK] Agent " + completedAgentId + " at " + currentPos + 
-                ", passableNeighbors=" + passableNeighbors + " (map freeNeighbors=" + freeNeighbors + ")");
-        
-        List<Integer> blockedAgents = yieldingManager.findBlockedAgents(completedAgentId, currentState, level);
-        boolean inCorridor = (passableNeighbors <= 2);
-        
-        if (blockedAgents.isEmpty() && !inCorridor) {
-            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " not blocking anyone and not in corridor");
-            return false;
-        }
-        
-        if (inCorridor) {
-            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " is in CORRIDOR, must move out");
-        }
-        if (!blockedAgents.isEmpty()) {
-            logNormal("[PROACTIVE-YIELD] Agent " + completedAgentId + " blocking agents: " + blockedAgents);
-        }
-        
-        Position safePos = findBestYieldPosition(completedAgentId, currentState, level, blockedAgents);
-        
-        if (safePos == null) {
-            logNormal("[PROACTIVE-YIELD] No yield position found");
-            // TODO: Implement findCorridorExitMove in AgentCoordinator
-            /*
-            Action yieldMove = agentCoordinator.findCorridorExitMove(completedAgentId, currentState, level, pathAnalyzer);
-            if (yieldMove != null) {
-                Action[] jointAction = new Action[numAgents];
-                Arrays.fill(jointAction, Action.noOp());
-                jointAction[completedAgentId] = yieldMove;
-                plan.add(jointAction);
-                logNormal("[PROACTIVE-YIELD] Performed corridor exit move");
-                return true;
-            }
-            */
-            return false;
-        }
-        
-        List<Action> pathToSafe = yieldingManager.planPathToPosition(completedAgentId, safePos, currentState, level);
-        
-        if (pathToSafe.isEmpty()) {
-            logNormal("[PROACTIVE-YIELD] No path to yield position");
-            return false;
-        }
-        
-        logNormal("[PROACTIVE-YIELD] Moving to yield position " + safePos + " (" + pathToSafe.size() + " steps)");
-        
-        // If agent was at its agent goal, mark it as completed and yielded to prevent re-planning
-        if (agentGoal != null && currentPos.equals(agentGoal)) {
-            yieldingManager.markAgentGoalCompletedAndYielded(completedAgentId);
-        }
-        
-        State tempState = currentState;
-        for (Action action : pathToSafe) {
-            Action[] jointAction = new Action[numAgents];
-            Arrays.fill(jointAction, Action.noOp());
-            jointAction[completedAgentId] = action;
-            
-            if (!tempState.isApplicable(action, completedAgentId, level)) {
-                logNormal("[PROACTIVE-YIELD] Path interrupted");
-                break;
-            }
-            
-            plan.add(jointAction);
-            tempState = applyJointAction(jointAction, tempState, level, numAgents);
-        }
-        
-        return true;
-    }
-
-    /** Finds safe yield position preferring junctions, avoiding global working area. */
-    private Position findBestYieldPosition(int agentId, State state, Level level, List<Integer> blockedAgents) {
-        Position currentPos = state.getAgentPosition(agentId);
-        
-        // Use SafeZoneCalculator for proper global working area analysis (cached)
-        Position safePosFromCalculator = safeZoneCalculator.findSafePosition(agentId, state, level);
-        if (safePosFromCalculator != null) {
-            int passableNeighbors = pathAnalyzer.countPassableNeighbors(safePosFromCalculator, level);
-            logNormal("[YIELD] SafeZoneCalculator found position " + safePosFromCalculator + 
-                    " (passableNeighbors=" + passableNeighbors + ")");
-            return safePosFromCalculator;
-        }
-        
-        // SafeZoneCalculator already tried everything, use BFS with global working area
-        // (Note: removed duplicate call to yieldingManager.findNearestSafePosition which internally
-        //  calls the same safeZoneCalculator.findSafePosition - now returns same cached result)
-        
-        // Get cached global working area
-        Set<Position> globalWorkingArea = safeZoneCalculator.computeGlobalWorkingArea(agentId, state, level);
-        
-        // Last resort: BFS search with global working area check
-        Queue<Position> queue = new LinkedList<>();
-        Set<Position> visited = new HashSet<>();
-        Map<Position, Integer> distanceMap = new HashMap<>();
-        
-        queue.add(currentPos);
-        visited.add(currentPos);
-        distanceMap.put(currentPos, 0);
-        
-        Position bestPos = null;
-        int bestScore = -1; // Higher is better
-        int maxDistance = Math.min(level.getRows() + level.getCols(), 50);
-        
-        while (!queue.isEmpty()) {
-            Position pos = queue.poll();
-            int distance = distanceMap.get(pos);
-            
-            if (distance > maxDistance) break;
-            
-            // Skip current position
-            if (!pos.equals(currentPos)) {
-                // Use passableNeighbors that considers current state
-                int passableNeighbors = pathAnalyzer.countPassableNeighbors(pos, level);
-                int freeNeighbors = pathAnalyzer.countFreeNeighbors(pos, state, level); // Map structure
-                
-                // Check not occupied
-                if (state.getBoxAt(pos) == '\0' && !PlanningUtils.isPositionOccupiedByAgent(pos, state, state.getNumAgents())) {
-                    // Only consider non-corridors (passableNeighbors >= 3) or dead-ends (freeNeighbors == 1)
-                    boolean isGoodSpot = (passableNeighbors >= 3) || (freeNeighbors == 1);
-                    
-                    if (!isGoodSpot) {
-                        // Skip corridor positions - don't move from one corridor to another!
-                        // But still explore through them
-                    } else {
-                        // Score: prefer more passable neighbors, penalize distance
-                        int score = passableNeighbors * 10 - distance;
-                        
-                        // Bonus for dead-ends (good parking spots that won't block anyone)
-                        if (freeNeighbors == 1) {
-                            score += 20; // Dead-ends are excellent parking
-                        }
-                        
-                        // IMPROVED: Heavy penalty if in global working area (would block ANY agent's future work)
-                        if (globalWorkingArea.contains(pos)) {
-                            score -= 200; // Very heavy penalty - this position is needed by someone
-                        }
-                        
-                        // Additional penalty if this position would block any specifically blocked agent
-                        boolean wouldBlock = false;
-                        for (int otherId : blockedAgents) {
-                            Position otherPos = state.getAgentPosition(otherId);
-                            Position otherGoal = GoalChecker.findAgentGoalPosition(otherId, level);
-                            if (otherGoal != null) {
-                                Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(state, level);
-                                Set<Position> criticalPath = pathAnalyzer.findCriticalPositionsForAgentGoal(
-                                    state, level, otherId, otherGoal, satisfiedGoals);
-                                if (criticalPath.contains(pos)) {
-                                    wouldBlock = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (wouldBlock) {
-                            score -= 100; // Heavy penalty
-                        }
-                        
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestPos = pos;
-                        }
-                    }
-                }
-            }
-            
-            // Explore neighbors (even through corridors)
-            for (Direction dir : Direction.values()) {
-                Position next = pos.move(dir);
-                if (!visited.contains(next) && !level.isWall(next)) {
-                    visited.add(next);
-                    distanceMap.put(next, distance + 1);
-                    queue.add(next);
-                }
-            }
-        }
-        
-        if (bestPos != null) {
-            int passable = pathAnalyzer.countPassableNeighbors(bestPos, level);
-            logNormal("[YIELD] Found best yield position " + bestPos + " (passableNeighbors=" + passable + ", score=" + bestScore + ")");
-        }
-        
-        return bestPos;
-    }
-
-    /** Gets positions that would block higher-priority agents. */
-    private Set<Position> getPositionsThatWouldBlockHigherPriority(int agentId, State state, Level level) {
-        Set<Position> blocking = new HashSet<>();
-
-        // Only relevant during Agent Goal phase
-        if (!GoalChecker.allBoxGoalsSatisfied(state, level)) {
-            return blocking;
-        }
-
-        Position myGoal = GoalChecker.findAgentGoalPosition(agentId, level);
-        int myDepth = (myGoal != null) ? topologicalAnalyzer.getTopologicalDepth(myGoal, level) : 0;
-
-        for (int otherId = 0; otherId < state.getNumAgents(); otherId++) {
-            if (otherId == agentId)
-                continue;
-
-            Position otherGoal = GoalChecker.findAgentGoalPosition(otherId, level);
-            if (otherGoal == null)
-                continue;
-
-            // Check if other agent has already reached goal
-            if (state.getAgentPosition(otherId).equals(otherGoal))
-                continue;
-
-            int otherDepth = topologicalAnalyzer.getTopologicalDepth(otherGoal, level);
-
-            // If other agent has higher priority (deeper goal)
-            if (otherDepth > myDepth) {
-                Position otherPos = state.getAgentPosition(otherId);
-                Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(state, level);
-                Set<Position> otherCriticalPath = pathAnalyzer.findCriticalPositionsForAgentGoal(
-                    state, level, otherId, otherGoal, satisfiedGoals);
-                blocking.addAll(otherCriticalPath);
-            }
-        }
-
-        return blocking;
     }
 }

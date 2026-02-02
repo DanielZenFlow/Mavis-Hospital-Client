@@ -98,6 +98,15 @@ public class DeadlockResolver {
      * @return List of blocking relationships
      */
     public List<BlockingInfo> analyzeBlocking(State state, Level level, List<Integer> blockedAgents) {
+        return analyzeBlocking(state, level, blockedAgents, Collections.emptySet());
+    }
+    
+    /**
+     * Analyzes the current state to find blocking relationships.
+     * Immovable boxes are treated as walls and skipped.
+     */
+    public List<BlockingInfo> analyzeBlocking(State state, Level level, List<Integer> blockedAgents,
+                                              Set<Position> immovableBoxes) {
         List<BlockingInfo> blockingInfos = new ArrayList<>();
 
         for (int agentId : blockedAgents) {
@@ -107,8 +116,8 @@ public class DeadlockResolver {
             Position goalPos = findAgentCurrentGoal(agentId, state, level);
             if (goalPos == null) continue;
 
-            // Find what's blocking the path
-            BlockingInfo blocking = findBlockingObstacle(agentId, agentPos, goalPos, state, level);
+            // Find what's blocking the path (immovable boxes treated as walls)
+            BlockingInfo blocking = findBlockingObstacle(agentId, agentPos, goalPos, state, level, immovableBoxes);
             if (blocking != null) {
                 blockingInfos.add(blocking);
             }
@@ -157,10 +166,11 @@ public class DeadlockResolver {
 
     /**
      * Finds what's blocking an agent's path to a goal.
-     * Uses BFS to find the first obstacle on the shortest path.
+     * Uses BFS to find the first movable obstacle on the shortest path.
+     * Immovable boxes are treated as walls and skipped.
      */
     private BlockingInfo findBlockingObstacle(int agentId, Position start, Position goal, 
-                                              State state, Level level) {
+                                              State state, Level level, Set<Position> immovableBoxes) {
         Queue<Position> queue = new LinkedList<>();
         Map<Position, Position> cameFrom = new HashMap<>();
         
@@ -180,8 +190,11 @@ public class DeadlockResolver {
 
                 if (cameFrom.containsKey(next)) continue;
                 if (level.isWall(next)) continue;
+                
+                // Treat immovable boxes as walls - skip them
+                if (immovableBoxes.contains(next)) continue;
 
-                // Check if blocked by box
+                // Check if blocked by movable box
                 Character box = state.getBoxes().get(next);
                 if (box != null) {
                     return new BlockingInfo(agentId, goal, next, true, box, -1);

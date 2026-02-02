@@ -43,7 +43,7 @@ public class SearchConfig {
     public static final int PROGRESS_LOG_INTERVAL = 10_000;
     
     /** Maximum states per single-subgoal search in Priority Planning */
-    public static final int MAX_STATES_PER_SUBGOAL = 50_000;
+    public static final int MAX_STATES_PER_SUBGOAL = 20_000;
     
     /** Number of random re-orderings to try when stuck in Priority Planning */
     public static final int MAX_REORDER_ATTEMPTS = 5;
@@ -64,7 +64,7 @@ public class SearchConfig {
     public static final int RANDOM_SEED = 42;
     
     /** Maximum stuck iterations before giving up */
-    public static final int MAX_STUCK_ITERATIONS = 50;
+    public static final int MAX_STUCK_ITERATIONS = 30;
     
     /** Stuck logging interval (log every N stuck iterations) */
     public static final int STUCK_LOG_INTERVAL = 10;

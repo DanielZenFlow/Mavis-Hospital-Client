@@ -21,22 +21,18 @@ public class SubgoalManager {
     
     /**
      * Gets all unsatisfied subgoals in priority order.
-     * Phase 1: Box goals
-     * Phase 1.5: Agent goals for agents that completed box tasks
+     * Phase 1: Box goals (excluding already completed ones)
      * Phase 2: Remaining agent goals (after all boxes placed)
      */
-    public List<PriorityPlanningStrategy.Subgoal> getUnsatisfiedSubgoals(State state, Level level) {
+    public List<PriorityPlanningStrategy.Subgoal> getUnsatisfiedSubgoals(State state, Level level, Set<Position> completedBoxGoals) {
         List<PriorityPlanningStrategy.Subgoal> unsatisfied = new ArrayList<>();
         
         Set<Position> staticGoals = immovableDetector.findPreSatisfiedStaticGoals(state, level);
         
-        // Phase 1: Box goals
-        addBoxGoals(unsatisfied, state, level, staticGoals);
+        // Phase 1: Box goals (skip completed ones - MAPF permanent obstacle)
+        addBoxGoals(unsatisfied, state, level, staticGoals, completedBoxGoals);
         
-        // Phase 1.5: Agent goals for completed agents
-        addCompletedAgentGoals(unsatisfied, state, level);
-        
-        // Phase 2: Remaining agent goals (only if no box goals remain)
+        // Phase 2: Agent goals (only when no box goals remain)
         if (unsatisfied.isEmpty()) {
             addAllAgentGoals(unsatisfied, state, level);
         }
@@ -44,8 +40,13 @@ public class SubgoalManager {
         return unsatisfied;
     }
     
+    /** Legacy overload for backward compatibility. */
+    public List<PriorityPlanningStrategy.Subgoal> getUnsatisfiedSubgoals(State state, Level level) {
+        return getUnsatisfiedSubgoals(state, level, Collections.emptySet());
+    }
+    
     private void addBoxGoals(List<PriorityPlanningStrategy.Subgoal> unsatisfied, 
-                            State state, Level level, Set<Position> staticGoals) {
+                            State state, Level level, Set<Position> staticGoals, Set<Position> completedBoxGoals) {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
@@ -55,6 +56,9 @@ public class SubgoalManager {
                 
                 // Skip pre-satisfied static goals (decorations)
                 if (staticGoals.contains(goalPos)) continue;
+                
+                // Skip completed goals (MAPF: permanent obstacle)
+                if (completedBoxGoals.contains(goalPos)) continue;
                 
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
