@@ -8,6 +8,7 @@ import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.spacetime.ReservationTable;
+import mapf.planning.pibt.PIBT;
 import java.util.*;
 
 /**
@@ -55,6 +56,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Current global time step for space-time planning. */
     private int globalTimeStep = 0;
+    
+    /** PIBT for narrow corridor coordination. */
+    private final PIBT pibt = new PIBT();
 
     // Logging helpers
     private void logMinimal(String msg) {
@@ -240,7 +244,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         for (Subgoal subgoal : subgoals) {
             List<Action> path = planSubgoal(subgoal, currentState, level);
             
-            // On-demand Clearing: if planning fails, try to clear blocking agents iteratively
+            // On-demand Clearing with PIBT: if planning fails, chain-clear blocking agents
             if (path == null && !subgoal.isAgentGoal) {
                 int clearAttempts = 0;
                 final int MAX_CLEAR_ATTEMPTS = 5; // Prevent infinite loops
@@ -250,7 +254,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (blockingAgent == -1 || blockingAgent == subgoal.agentId) break;
                     
                     logVerbose("[PP] Agent " + blockingAgent + " blocks path to " + subgoal.goalPos);
-                    boolean cleared = clearBlockingAgent(blockingAgent, currentState, level, fullPlan, numAgents);
+                    boolean cleared = clearBlockingAgent(blockingAgent, subgoal.goalPos,
+                            currentState, level, fullPlan, numAgents);
                     if (!cleared) break;
                     
                     currentState = recomputeState(initialState, fullPlan, level, numAgents);
@@ -342,46 +347,93 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     /**
-     * Try to move a blocking agent to a safe position.
+     * Try to move a blocking agent using PIBT (chain-moving if necessary).
+     * Direction is determined based on blocking agent's position relative to goal.
      */
-    private boolean clearBlockingAgent(int agentId, State state, Level level, 
-            List<Action[]> fullPlan, int numAgents) {
-        Position agentPos = state.getAgentPosition(agentId);
+    private boolean clearBlockingAgent(int blockingAgentId, Position goalPos,
+            State state, Level level, List<Action[]> fullPlan, int numAgents) {
         
-        // Find a safe position for this agent (not on any goal, not blocking paths)
-        Position safeSpot = findSafeSpotForAgent(agentId, agentPos, state, level);
-        if (safeSpot == null) {
-            logVerbose("[PP] No safe spot found for agent " + agentId);
+        Position blockingPos = state.getAgentPosition(blockingAgentId);
+        
+        // Determine clearing direction: move blocking agent AWAY from goal
+        Direction clearDir = determineClearDirection(blockingPos, goalPos, state, level);
+        if (clearDir == null) {
+            logVerbose("[PP] No clear direction for agent " + blockingAgentId);
             return false;
         }
         
-        // Plan path to safe spot
-        List<Action> path = boxSearchPlanner.searchForAgentGoal(agentId, safeSpot, state, level);
-        if (path == null || path.isEmpty()) {
-            logVerbose("[PP] Cannot find path for agent " + agentId + " to safe spot " + safeSpot);
+        logNormal("[PP] PIBT clearing agent " + blockingAgentId + " direction " + clearDir);
+        
+        // Use PIBT to chain-move blocking agent(s)
+        PIBT.PIBTResult result = pibt.clearAgent(blockingAgentId, clearDir, state, level);
+        
+        if (!result.success) {
+            logVerbose("[PP] PIBT clearing failed for agent " + blockingAgentId);
             return false;
         }
         
-        logNormal("[PP] Clearing agent " + agentId + " from " + agentPos + " to " + safeSpot);
-        
-        // Execute the clearing path
-        State tempState = state;
-        for (Action action : path) {
-            Action[] jointAction = new Action[numAgents];
-            for (int i = 0; i < numAgents; i++) {
-                jointAction[i] = (i == agentId) ? action : Action.noOp();
-            }
-            jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, agentId);
+        // Add PIBT actions to plan
+        for (Action[] jointAction : result.actions) {
             fullPlan.add(jointAction);
-            tempState = applyJointAction(jointAction, tempState, level, numAgents);
             globalTimeStep++;
         }
         
-        // Record the clearing path in reservation table
-        List<Position> clearingPath = extractAgentPath(agentId, state, path, level);
-        reservationTable.reservePath(agentId, clearingPath, globalTimeStep - path.size(), false);
-        
+        logNormal("[PP] PIBT cleared with " + result.actions.size() + " steps");
         return true;
+    }
+    
+    /**
+     * Determine the best direction to clear a blocking agent.
+     * Prefers moving away from the goal (opposite direction).
+     */
+    private Direction determineClearDirection(Position blockingPos, Position goalPos, 
+            State state, Level level) {
+        
+        // Calculate direction from blocking agent to goal
+        int dRow = Integer.signum(goalPos.row - blockingPos.row);
+        int dCol = Integer.signum(goalPos.col - blockingPos.col);
+        
+        // Priority: 1) Away from goal, 2) Perpendicular, 3) Toward goal
+        List<Direction> candidates = new ArrayList<>();
+        
+        // Away from goal (preferred - gets out of the way)
+        if (dRow > 0) candidates.add(Direction.N);  // goal is South, go North
+        if (dRow < 0) candidates.add(Direction.S);  // goal is North, go South
+        if (dCol > 0) candidates.add(Direction.W);  // goal is East, go West
+        if (dCol < 0) candidates.add(Direction.E);  // goal is West, go East
+        
+        // Perpendicular directions
+        if (dRow != 0) {
+            candidates.add(Direction.E);
+            candidates.add(Direction.W);
+        }
+        if (dCol != 0) {
+            candidates.add(Direction.N);
+            candidates.add(Direction.S);
+        }
+        
+        // Toward goal (last resort - might work with chain movement)
+        if (dRow < 0) candidates.add(Direction.N);
+        if (dRow > 0) candidates.add(Direction.S);
+        if (dCol < 0) candidates.add(Direction.W);
+        if (dCol > 0) candidates.add(Direction.E);
+        
+        // If no direction info (blocking at goal), try all directions
+        if (candidates.isEmpty()) {
+            for (Direction dir : Direction.values()) {
+                candidates.add(dir);
+            }
+        }
+        
+        // Find first viable direction - PIBT handles agents, only check walls/boxes
+        for (Direction dir : candidates) {
+            Position nextPos = blockingPos.move(dir);
+            if (!level.isWall(nextPos) && !state.hasBoxAt(nextPos)) {
+                return dir;
+            }
+        }
+        
+        return null;
     }
     
     /**
