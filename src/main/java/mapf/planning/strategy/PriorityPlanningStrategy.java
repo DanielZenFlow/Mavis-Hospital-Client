@@ -8,7 +8,6 @@ import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.spacetime.ReservationTable;
-import mapf.planning.pibt.PIBT;
 import java.util.*;
 
 /**
@@ -56,9 +55,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Current global time step for space-time planning. */
     private int globalTimeStep = 0;
-    
-    /** PIBT for narrow corridor coordination. */
-    private final PIBT pibt = new PIBT();
 
     // Logging helpers
     private void logMinimal(String msg) {
@@ -115,8 +111,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         long startTime = System.currentTimeMillis();
         int numAgents = initialState.getNumAgents();
 
-        logMinimal(getName() + ": Planning for " + numAgents + " agents");
-
         // Reset for new search
         displacementHistory.clear();
         displacementAttempts = 0;
@@ -124,12 +118,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         reservationTable.clear();
         globalTimeStep = 0;
 
-        List<Action[]> plan = planWithSubgoals(initialState, level, startTime);
-
-        if (plan != null && !plan.isEmpty()) {
-            logMinimal(getName() + ": Total plan length: " + plan.size());
-        }
-        return plan;
+        return planWithSubgoals(initialState, level, startTime);
     }
 
     /**
@@ -145,15 +134,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         while (!currentState.isGoalState(level)) {
             // PRODUCT.md constraints: 3 minutes, 20,000 actions
             if (System.currentTimeMillis() - startTime > timeoutMs) {
-                logMinimal(getName() + ": Timeout reached");
+                logVerbose(getName() + ": Timeout");
                 break;
             }
             if (fullPlan.size() >= SearchConfig.MAX_ACTIONS) {
-                logMinimal(getName() + ": Action limit reached");
+                logVerbose(getName() + ": Action limit");
                 break;
             }
             if (stuckCount > SearchConfig.MAX_STUCK_ITERATIONS) {
-                logMinimal(getName() + ": Stuck after " + stuckCount + " iterations");
+                logVerbose(getName() + ": Stuck");
                 break;
             }
 
@@ -197,11 +186,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         if (currentState.isGoalState(level)) {
             logMinimal(getName() + ": [OK] Goal state reached!");
-        } else {
-            logMinimal(getName() + ": [FAIL] Could not reach goal state");
+            return fullPlan.isEmpty() ? null : fullPlan;
         }
-
-        return fullPlan.isEmpty() ? null : fullPlan;
+        logMinimal(getName() + ": [FAIL] Could not reach goal state");
+        return null;
     }
     
     /** Sort subgoals by pre-computed order or difficulty. */
@@ -244,35 +232,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         for (Subgoal subgoal : subgoals) {
             List<Action> path = planSubgoal(subgoal, currentState, level);
             
-            // On-demand Clearing with PIBT: if planning fails, chain-clear blocking agents
-            if (path == null && !subgoal.isAgentGoal) {
-                int clearAttempts = 0;
-                final int MAX_CLEAR_ATTEMPTS = 5; // Prevent infinite loops
-                
-                while (path == null && clearAttempts < MAX_CLEAR_ATTEMPTS) {
-                    int blockingAgent = detectStaticBlockingAgent(subgoal, currentState, level);
-                    if (blockingAgent == -1 || blockingAgent == subgoal.agentId) break;
-                    
-                    logVerbose("[PP] Agent " + blockingAgent + " blocks path to " + subgoal.goalPos);
-                    boolean cleared = clearBlockingAgent(blockingAgent, subgoal.goalPos,
-                            currentState, level, fullPlan, numAgents);
-                    if (!cleared) break;
-                    
-                    currentState = recomputeState(initialState, fullPlan, level, numAgents);
-                    path = planSubgoal(subgoal, currentState, level);
-                    clearAttempts++;
-                    
-                    if (path != null) {
-                        logNormal("[PP] Cleared " + clearAttempts + " agents, now executing " + subgoal.boxType);
-                    }
-                }
-            }
-            
             if (path != null && !path.isEmpty()) {
+                
                 // Record agent path in reservation table for space-time collision avoidance
-                // For box goals, don't permanently reserve (agent will yield after)
                 List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
-                boolean permanentEnd = subgoal.isAgentGoal; // Only agent goals stay permanently
+                boolean permanentEnd = subgoal.isAgentGoal;
                 reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep, permanentEnd);
                 
                 // Execute the path
@@ -289,7 +253,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Verify goal was reached
                 boolean reached = verifyGoalReached(subgoal, tempState, level);
                 if (reached) {
-                    // Mark box goal as completed (MAPF standard: treat as permanent obstacle)
+                    // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
                     }
@@ -307,202 +271,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return false;
     }
     
-    /**
-     * Detect if another agent is statically blocking the path to a subgoal.
-     * Uses BFS to find which agents sit on the required path.
-     */
-    private int detectStaticBlockingAgent(Subgoal subgoal, State state, Level level) {
-        Position agentPos = state.getAgentPosition(subgoal.agentId);
-        Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
-        if (boxPos == null) return -1;
-        
-        // BFS from agent to box, then box to goal - find first blocking agent
-        Set<Position> visited = new HashSet<>();
-        Queue<Position> queue = new LinkedList<>();
-        queue.add(agentPos);
-        visited.add(agentPos);
-        
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-                if (visited.contains(next) || level.isWall(next)) continue;
-                
-                // Check if another agent is here
-                for (int i = 0; i < state.getNumAgents(); i++) {
-                    if (i != subgoal.agentId && state.getAgentPosition(i).equals(next)) {
-                        return i; // Found blocking agent
-                    }
-                }
-                
-                // Skip boxes for path exploration (we can push them)
-                if (!state.hasBoxAt(next)) {
-                    visited.add(next);
-                    queue.add(next);
-                }
-            }
-        }
-        return -1; // No blocking agent found
-    }
-    
-    /**
-     * Try to move a blocking agent using PIBT (chain-moving if necessary).
-     * Direction is determined based on blocking agent's position relative to goal.
-     */
-    private boolean clearBlockingAgent(int blockingAgentId, Position goalPos,
-            State state, Level level, List<Action[]> fullPlan, int numAgents) {
-        
-        Position blockingPos = state.getAgentPosition(blockingAgentId);
-        
-        // Determine clearing direction: move blocking agent AWAY from goal
-        Direction clearDir = determineClearDirection(blockingPos, goalPos, state, level);
-        if (clearDir == null) {
-            logVerbose("[PP] No clear direction for agent " + blockingAgentId);
-            return false;
-        }
-        
-        logNormal("[PP] PIBT clearing agent " + blockingAgentId + " direction " + clearDir);
-        
-        // Use PIBT to chain-move blocking agent(s)
-        PIBT.PIBTResult result = pibt.clearAgent(blockingAgentId, clearDir, state, level);
-        
-        if (!result.success) {
-            logVerbose("[PP] PIBT clearing failed for agent " + blockingAgentId);
-            return false;
-        }
-        
-        // Add PIBT actions to plan
-        for (Action[] jointAction : result.actions) {
-            fullPlan.add(jointAction);
-            globalTimeStep++;
-        }
-        
-        logNormal("[PP] PIBT cleared with " + result.actions.size() + " steps");
-        return true;
-    }
-    
-    /**
-     * Determine the best direction to clear a blocking agent.
-     * Prefers moving away from the goal (opposite direction).
-     */
-    private Direction determineClearDirection(Position blockingPos, Position goalPos, 
-            State state, Level level) {
-        
-        // Calculate direction from blocking agent to goal
-        int dRow = Integer.signum(goalPos.row - blockingPos.row);
-        int dCol = Integer.signum(goalPos.col - blockingPos.col);
-        
-        // Priority: 1) Away from goal, 2) Perpendicular, 3) Toward goal
-        List<Direction> candidates = new ArrayList<>();
-        
-        // Away from goal (preferred - gets out of the way)
-        if (dRow > 0) candidates.add(Direction.N);  // goal is South, go North
-        if (dRow < 0) candidates.add(Direction.S);  // goal is North, go South
-        if (dCol > 0) candidates.add(Direction.W);  // goal is East, go West
-        if (dCol < 0) candidates.add(Direction.E);  // goal is West, go East
-        
-        // Perpendicular directions
-        if (dRow != 0) {
-            candidates.add(Direction.E);
-            candidates.add(Direction.W);
-        }
-        if (dCol != 0) {
-            candidates.add(Direction.N);
-            candidates.add(Direction.S);
-        }
-        
-        // Toward goal (last resort - might work with chain movement)
-        if (dRow < 0) candidates.add(Direction.N);
-        if (dRow > 0) candidates.add(Direction.S);
-        if (dCol < 0) candidates.add(Direction.W);
-        if (dCol > 0) candidates.add(Direction.E);
-        
-        // If no direction info (blocking at goal), try all directions
-        if (candidates.isEmpty()) {
-            for (Direction dir : Direction.values()) {
-                candidates.add(dir);
-            }
-        }
-        
-        // Find first viable direction - PIBT handles agents, only check walls/boxes
-        for (Direction dir : candidates) {
-            Position nextPos = blockingPos.move(dir);
-            if (!level.isWall(nextPos) && !state.hasBoxAt(nextPos)) {
-                return dir;
-            }
-        }
-        
-        return null;
-    }
-    
-    /**
-     * Find a safe spot for an agent to move to.
-     * Safe = not on any box goal, not on any agent goal, has multiple exits (freedom > 1).
-     */
-    private Position findSafeSpotForAgent(int agentId, Position start, State state, Level level) {
-        Queue<Position> queue = new LinkedList<>();
-        Set<Position> visited = new HashSet<>();
-        queue.add(start);
-        visited.add(start);
-        
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            
-            // Check if this is a safe spot (not start, not a goal, has freedom)
-            if (!current.equals(start)) {
-                boolean isBoxGoal = level.getBoxGoal(current) != '\0';
-                boolean isAgentGoal = level.getAgentGoal(current) >= 0;
-                int freedom = countFreeNeighbors(current, state, level);
-                
-                if (!isBoxGoal && !isAgentGoal && freedom >= 2) {
-                    return current;
-                }
-            }
-            
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-                if (!visited.contains(next) && !level.isWall(next) && 
-                    !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
-                    visited.add(next);
-                    queue.add(next);
-                }
-            }
-        }
-        
-        // Fallback: any non-goal position
-        visited.clear();
-        queue.add(start);
-        visited.add(start);
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            if (!current.equals(start) && level.getBoxGoal(current) == '\0') {
-                return current;
-            }
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-                if (!visited.contains(next) && !level.isWall(next) && 
-                    !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
-                    visited.add(next);
-                    queue.add(next);
-                }
-            }
-        }
-        return null;
-    }
-    
-    /** Count free neighbors (not wall, not box, not agent). */
-    private int countFreeNeighbors(Position pos, State state, Level level) {
-        int count = 0;
-        for (Direction dir : Direction.values()) {
-            Position next = pos.move(dir);
-            if (!level.isWall(next) && !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
-                count++;
-            }
-        }
-        return count;
-    }
-
     /** Extract agent position path from action sequence. */
     private List<Position> extractAgentPath(int agentId, State startState, List<Action> actions, Level level) {
         List<Position> path = new ArrayList<>();
@@ -631,7 +399,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         DependencyAnalyzer.AnalysisResult analysis = DependencyAnalyzer.analyze(currentState, level);
         
         if (analysis.hasCycle) {
-            logNormal("[PP] Cyclic dependency detected, trying displacement...");
+            logVerbose("[PP] Cyclic dependency detected, trying displacement...");
             
             if (displacementAttempts < MAX_DISPLACEMENT_ATTEMPTS) {
                 displacementAttempts++;
@@ -642,14 +410,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     pathAnalyzer, conflictResolver);
                 
                 if (success && !displacementPlan.isEmpty()) {
-                    logNormal("[PP] Displacement succeeded with " + displacementPlan.size() + " steps");
+                    logVerbose("[PP] Displacement succeeded with " + displacementPlan.size() + " steps");
                     fullPlan.addAll(displacementPlan);
                     return null; // Continue with PP
                 }
             }
             
             // Try CBS as last resort
-            logNormal("[PP] Trying CBS fallback...");
+            logVerbose("[PP] Trying CBS fallback...");
             CBSStrategy cbs = new CBSStrategy(heuristic, config);
             cbs.setTimeout(timeoutMs - (System.currentTimeMillis() - startTime));
             List<Action[]> cbsPlan = cbs.search(currentState, level);
@@ -683,7 +451,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             pathAnalyzer, conflictResolver);
         
         if (result.success) {
-            logNormal("[PP] Cleared blocking agent " + result.clearedAgentId);
+            logVerbose("[PP] Cleared blocking agent " + result.clearedAgentId);
             return true;
         }
         
@@ -715,7 +483,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         fullPlan.add(jointAction);
                         tempState = applyJointAction(jointAction, tempState, level, numAgents);
                     }
-                    logNormal("[PP] Displaced box " + displacement.boxType);
+                    logVerbose("[PP] Displaced box " + displacement.boxType);
                     return true;
                 }
             }
@@ -735,7 +503,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     tempState = applyJointAction(jointAction, tempState, level, numAgents);
                 }
                 if (verifyGoalReached(sg, tempState, level)) {
-                    logNormal("[PP] Succeeded with reordered goal");
+                    logVerbose("[PP] Succeeded with reordered goal");
                     return true;
                 }
             }
