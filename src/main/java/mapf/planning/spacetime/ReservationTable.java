@@ -20,15 +20,23 @@ public class ReservationTable {
         reservations.put(new TimePosition(pos, time), agentId);
     }
     
-    /** Reserve an entire path starting from a given time. */
+    /** Reserve an entire path starting from a given time, with optional permanent end reservation. */
     public void reservePath(int agentId, List<Position> path, int startTime) {
+        reservePath(agentId, path, startTime, true);
+    }
+    
+    /** 
+     * Reserve an entire path starting from a given time.
+     * @param permanentEnd if true, permanently reserves the final position (for agent goals)
+     */
+    public void reservePath(int agentId, List<Position> path, int startTime, boolean permanentEnd) {
         int t = startTime;
         for (Position pos : path) {
             reserve(pos, t, agentId);
             t++;
         }
-        // Permanently reserve final position (agent stays at goal)
-        if (!path.isEmpty()) {
+        // Only permanently reserve final position if requested (agent stays at goal)
+        if (permanentEnd && !path.isEmpty()) {
             Position finalPos = path.get(path.size() - 1);
             permanentReservations.put(finalPos, agentId);
         }

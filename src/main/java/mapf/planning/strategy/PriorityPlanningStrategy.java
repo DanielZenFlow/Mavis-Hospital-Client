@@ -242,8 +242,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             
             if (path != null && !path.isEmpty()) {
                 // Record agent path in reservation table for space-time collision avoidance
+                // For box goals, don't permanently reserve (agent will yield after)
                 List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
-                reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep);
+                boolean permanentEnd = subgoal.isAgentGoal; // Only agent goals stay permanently
+                reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep, permanentEnd);
                 
                 // Execute the path
                 State tempState = currentState;
