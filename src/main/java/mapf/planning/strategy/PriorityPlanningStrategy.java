@@ -371,14 +371,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
     
-    /** Plan path for a single subgoal using space-time A*. */
+    /** Plan path for a single subgoal. First tries fast 2D A*, then space-time A* if needed. */
     private List<Action> planSubgoal(Subgoal subgoal, State state, Level level) {
         if (subgoal.isAgentGoal) {
             return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
         } else {
             Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
             if (boxPos == null) return null;
-            // Use space-time A* with reservation table
+            
+            // First try fast 2D A* (no reservation table)
+            List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>());
+            if (path != null) return path;
+            
+            // Fallback to space-time A* if 2D search fails
             return boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                     subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>(),
                     reservationTable, globalTimeStep);
