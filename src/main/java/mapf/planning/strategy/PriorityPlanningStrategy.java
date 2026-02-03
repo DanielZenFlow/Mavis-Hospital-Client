@@ -240,6 +240,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         for (Subgoal subgoal : subgoals) {
             List<Action> path = planSubgoal(subgoal, currentState, level);
             
+            // On-demand Clearing: if planning fails, try to clear blocking agents
+            if (path == null && !subgoal.isAgentGoal) {
+                int blockingAgent = detectStaticBlockingAgent(subgoal, currentState, level);
+                if (blockingAgent != -1 && blockingAgent != subgoal.agentId) {
+                    logVerbose("[PP] Agent " + blockingAgent + " blocks path to " + subgoal.goalPos);
+                    boolean cleared = clearBlockingAgent(blockingAgent, currentState, level, fullPlan, numAgents);
+                    if (cleared) {
+                        currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                        path = planSubgoal(subgoal, currentState, level);
+                        if (path != null) {
+                            logNormal("[PP] Cleared agent " + blockingAgent + ", retrying " + subgoal.boxType);
+                        }
+                    }
+                }
+            }
+            
             if (path != null && !path.isEmpty()) {
                 // Record agent path in reservation table for space-time collision avoidance
                 // For box goals, don't permanently reserve (agent will yield after)
@@ -279,6 +295,147 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return false;
     }
     
+    /**
+     * Detect if another agent is statically blocking the path to a subgoal.
+     * Uses BFS to find which agents sit on the required path.
+     */
+    private int detectStaticBlockingAgent(Subgoal subgoal, State state, Level level) {
+        Position agentPos = state.getAgentPosition(subgoal.agentId);
+        Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
+        if (boxPos == null) return -1;
+        
+        // BFS from agent to box, then box to goal - find first blocking agent
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(agentPos);
+        visited.add(agentPos);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next) || level.isWall(next)) continue;
+                
+                // Check if another agent is here
+                for (int i = 0; i < state.getNumAgents(); i++) {
+                    if (i != subgoal.agentId && state.getAgentPosition(i).equals(next)) {
+                        return i; // Found blocking agent
+                    }
+                }
+                
+                // Skip boxes for path exploration (we can push them)
+                if (!state.hasBoxAt(next)) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        return -1; // No blocking agent found
+    }
+    
+    /**
+     * Try to move a blocking agent to a safe position.
+     */
+    private boolean clearBlockingAgent(int agentId, State state, Level level, 
+            List<Action[]> fullPlan, int numAgents) {
+        Position agentPos = state.getAgentPosition(agentId);
+        
+        // Find a safe position for this agent (not on any goal, not blocking paths)
+        Position safeSpot = findSafeSpotForAgent(agentId, agentPos, state, level);
+        if (safeSpot == null) return false;
+        
+        // Plan path to safe spot
+        List<Action> path = boxSearchPlanner.searchForAgentGoal(agentId, safeSpot, state, level);
+        if (path == null || path.isEmpty()) return false;
+        
+        // Execute the clearing path
+        State tempState = state;
+        for (Action action : path) {
+            Action[] jointAction = new Action[numAgents];
+            for (int i = 0; i < numAgents; i++) {
+                jointAction[i] = (i == agentId) ? action : Action.noOp();
+            }
+            jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, agentId);
+            fullPlan.add(jointAction);
+            tempState = applyJointAction(jointAction, tempState, level, numAgents);
+            globalTimeStep++;
+        }
+        
+        // Record the clearing path in reservation table
+        List<Position> clearingPath = extractAgentPath(agentId, state, path, level);
+        reservationTable.reservePath(agentId, clearingPath, globalTimeStep - path.size(), false);
+        
+        return true;
+    }
+    
+    /**
+     * Find a safe spot for an agent to move to.
+     * Safe = not on any box goal, not on any agent goal, has multiple exits (freedom > 1).
+     */
+    private Position findSafeSpotForAgent(int agentId, Position start, State state, Level level) {
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        queue.add(start);
+        visited.add(start);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            
+            // Check if this is a safe spot (not start, not a goal, has freedom)
+            if (!current.equals(start)) {
+                boolean isBoxGoal = level.getBoxGoal(current) != '\0';
+                boolean isAgentGoal = level.getAgentGoal(current) >= 0;
+                int freedom = countFreeNeighbors(current, state, level);
+                
+                if (!isBoxGoal && !isAgentGoal && freedom >= 2) {
+                    return current;
+                }
+            }
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!visited.contains(next) && !level.isWall(next) && 
+                    !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        
+        // Fallback: any non-goal position
+        visited.clear();
+        queue.add(start);
+        visited.add(start);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            if (!current.equals(start) && level.getBoxGoal(current) == '\0') {
+                return current;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!visited.contains(next) && !level.isWall(next) && 
+                    !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        return null;
+    }
+    
+    /** Count free neighbors (not wall, not box, not agent). */
+    private int countFreeNeighbors(Position pos, State state, Level level) {
+        int count = 0;
+        for (Direction dir : Direction.values()) {
+            Position next = pos.move(dir);
+            if (!level.isWall(next) && !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     /** Extract agent position path from action sequence. */
     private List<Position> extractAgentPath(int agentId, State startState, List<Action> actions, Level level) {
         List<Position> path = new ArrayList<>();
