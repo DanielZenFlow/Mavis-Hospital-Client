@@ -240,18 +240,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         for (Subgoal subgoal : subgoals) {
             List<Action> path = planSubgoal(subgoal, currentState, level);
             
-            // On-demand Clearing: if planning fails, try to clear blocking agents
+            // On-demand Clearing: if planning fails, try to clear blocking agents iteratively
             if (path == null && !subgoal.isAgentGoal) {
-                int blockingAgent = detectStaticBlockingAgent(subgoal, currentState, level);
-                if (blockingAgent != -1 && blockingAgent != subgoal.agentId) {
+                int clearAttempts = 0;
+                final int MAX_CLEAR_ATTEMPTS = 5; // Prevent infinite loops
+                
+                while (path == null && clearAttempts < MAX_CLEAR_ATTEMPTS) {
+                    int blockingAgent = detectStaticBlockingAgent(subgoal, currentState, level);
+                    if (blockingAgent == -1 || blockingAgent == subgoal.agentId) break;
+                    
                     logVerbose("[PP] Agent " + blockingAgent + " blocks path to " + subgoal.goalPos);
                     boolean cleared = clearBlockingAgent(blockingAgent, currentState, level, fullPlan, numAgents);
-                    if (cleared) {
-                        currentState = recomputeState(initialState, fullPlan, level, numAgents);
-                        path = planSubgoal(subgoal, currentState, level);
-                        if (path != null) {
-                            logNormal("[PP] Cleared agent " + blockingAgent + ", retrying " + subgoal.boxType);
-                        }
+                    if (!cleared) break;
+                    
+                    currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                    path = planSubgoal(subgoal, currentState, level);
+                    clearAttempts++;
+                    
+                    if (path != null) {
+                        logNormal("[PP] Cleared " + clearAttempts + " agents, now executing " + subgoal.boxType);
                     }
                 }
             }
@@ -343,11 +350,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Find a safe position for this agent (not on any goal, not blocking paths)
         Position safeSpot = findSafeSpotForAgent(agentId, agentPos, state, level);
-        if (safeSpot == null) return false;
+        if (safeSpot == null) {
+            logVerbose("[PP] No safe spot found for agent " + agentId);
+            return false;
+        }
         
         // Plan path to safe spot
         List<Action> path = boxSearchPlanner.searchForAgentGoal(agentId, safeSpot, state, level);
-        if (path == null || path.isEmpty()) return false;
+        if (path == null || path.isEmpty()) {
+            logVerbose("[PP] Cannot find path for agent " + agentId + " to safe spot " + safeSpot);
+            return false;
+        }
+        
+        logNormal("[PP] Clearing agent " + agentId + " from " + agentPos + " to " + safeSpot);
         
         // Execute the clearing path
         State tempState = state;
