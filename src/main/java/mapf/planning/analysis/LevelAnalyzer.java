@@ -28,6 +28,10 @@ public class LevelAnalyzer {
         public final int maxDependencyDepth;
         public final boolean hasCircularDependency;
         
+        // MAPF FIX: Bottleneck detection (path intersection points)
+        public final Set<Position> bottleneckPositions;  // positions that block multiple paths
+        public final Map<Position, Integer> bottleneckScores;  // position -> number of paths blocked
+        
         // Structural features
         public final int corridorCells;      // cells with ≤2 neighbors
         public final int junctionCells;      // cells with ≥3 neighbors
@@ -41,6 +45,7 @@ public class LevelAnalyzer {
                             TaskFilter.FilterResult taskFilter,
                             Map<Position, Set<Position>> goalDependsOn,
                             List<Position> executionOrder, int maxDepth, boolean hasCycle,
+                            Set<Position> bottlenecks, Map<Position, Integer> bottleneckScores,
                             int corridorCells, int junctionCells,
                             StrategyType recommended, String report) {
             this.numAgents = numAgents;
@@ -53,6 +58,8 @@ public class LevelAnalyzer {
             this.executionOrder = executionOrder;
             this.maxDependencyDepth = maxDepth;
             this.hasCircularDependency = hasCycle;
+            this.bottleneckPositions = bottlenecks;
+            this.bottleneckScores = bottleneckScores;
             this.corridorCells = corridorCells;
             this.junctionCells = junctionCells;
             this.corridorRatio = (double) corridorCells / Math.max(1, freeSpaces);
@@ -93,20 +100,33 @@ public class LevelAnalyzer {
         // 4. Goal dependency analysis - includes Box-on-Goal dependencies
         Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(activeGoals, level, state);
         boolean hasCycle = detectCycle(goalDependsOn, activeGoals);
-        List<Position> executionOrder = hasCycle ? activeGoals : topologicalSort(goalDependsOn, activeGoals);
+        
+        // 5. MAPF FIX: Bottleneck detection (path intersection analysis)
+        Map<Position, Integer> bottleneckScores = detectBottlenecks(activeGoals, level, state);
+        Set<Position> bottlenecks = new HashSet<>();
+        for (Map.Entry<Position, Integer> e : bottleneckScores.entrySet()) {
+            if (e.getValue() >= 2) {  // Position blocks 2+ paths
+                bottlenecks.add(e.getKey());
+            }
+        }
+        
+        // 6. Adjust execution order: prioritize goals AT bottleneck positions
+        List<Position> executionOrder = hasCycle ? activeGoals : 
+            adjustOrderForBottlenecks(topologicalSort(goalDependsOn, activeGoals), bottleneckScores);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
-        // 5. Strategy recommendation
+        // 7. Strategy recommendation
         StrategyType recommended = recommendStrategy(numAgents, maxDepth, hasCycle, 
                                                      (double) corridorCells / Math.max(1, freeSpaces));
         
-        // 6. Generate report
+        // 8. Generate report
         String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                        goalDependsOn, maxDepth, hasCycle, 
                                        corridorCells, junctionCells, recommended);
         
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                 goalDependsOn, executionOrder, maxDepth, hasCycle,
+                                bottlenecks, bottleneckScores,
                                 corridorCells, junctionCells, recommended, report);
     }
     
@@ -336,6 +356,113 @@ public class LevelAnalyzer {
         
         cache.put(node, maxDepDepth);
         return maxDepDepth;
+    }
+    
+    // ========== MAPF FIX: Bottleneck Detection ==========
+    
+    /**
+     * Detects bottleneck positions by analyzing paths from boxes to goals.
+     * A bottleneck is a position that appears on multiple box-to-goal paths.
+     * 
+     * @return Map of position -> number of paths passing through it
+     */
+    private static Map<Position, Integer> detectBottlenecks(List<Position> goals, Level level, State state) {
+        Map<Position, Integer> passCount = new HashMap<>();
+        
+        // For each goal, find the nearest matching box and trace the path
+        for (Position goal : goals) {
+            char goalType = level.getBoxGoal(goal);
+            if (goalType == '\0') continue;
+            
+            // Find nearest box of this type
+            Position nearestBox = null;
+            int minDist = Integer.MAX_VALUE;
+            for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+                if (entry.getValue() == goalType) {
+                    int dist = manhattanDistance(entry.getKey(), goal);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearestBox = entry.getKey();
+                    }
+                }
+            }
+            
+            if (nearestBox == null) continue;
+            
+            // BFS to find path from box to goal
+            List<Position> path = findPath(nearestBox, goal, level, state);
+            if (path != null) {
+                // Count how many paths pass through each position
+                for (Position p : path) {
+                    passCount.merge(p, 1, Integer::sum);
+                }
+            }
+        }
+        
+        return passCount;
+    }
+    
+    /**
+     * BFS pathfinding from start to target, avoiding walls.
+     */
+    private static List<Position> findPath(Position start, Position target, Level level, State state) {
+        if (start.equals(target)) return Collections.singletonList(start);
+        
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Position> parent = new HashMap<>();
+        queue.add(start);
+        parent.put(start, null);
+        
+        while (!queue.isEmpty()) {
+            Position curr = queue.poll();
+            
+            if (curr.equals(target)) {
+                // Reconstruct path
+                List<Position> path = new ArrayList<>();
+                Position p = curr;
+                while (p != null) {
+                    path.add(0, p);
+                    p = parent.get(p);
+                }
+                return path;
+            }
+            
+            for (Direction dir : Direction.values()) {
+                Position next = curr.move(dir);
+                if (!level.isWall(next) && !parent.containsKey(next)) {
+                    parent.put(next, curr);
+                    queue.add(next);
+                }
+            }
+        }
+        return null;  // No path found
+    }
+    
+    private static int manhattanDistance(Position a, Position b) {
+        return Math.abs(a.row - b.row) + Math.abs(a.col - b.col);
+    }
+    
+    /**
+     * Adjusts goal execution order: goals AT high-traffic bottleneck positions
+     * should be completed earlier to clear the bottleneck.
+     */
+    private static List<Position> adjustOrderForBottlenecks(List<Position> baseOrder, 
+                                                            Map<Position, Integer> bottleneckScores) {
+        if (bottleneckScores.isEmpty()) return baseOrder;
+        
+        List<Position> adjusted = new ArrayList<>(baseOrder);
+        
+        // Sort: higher bottleneck score = earlier execution (to clear the position)
+        adjusted.sort((a, b) -> {
+            int scoreA = bottleneckScores.getOrDefault(a, 0);
+            int scoreB = bottleneckScores.getOrDefault(b, 0);
+            // Higher score first (descending)
+            if (scoreA != scoreB) return Integer.compare(scoreB, scoreA);
+            // Otherwise keep original order
+            return Integer.compare(baseOrder.indexOf(a), baseOrder.indexOf(b));
+        });
+        
+        return adjusted;
     }
     
     // ========== Structural Analysis ==========
