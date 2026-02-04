@@ -32,6 +32,9 @@ public class LevelAnalyzer {
         public final Set<Position> bottleneckPositions;  // positions that block multiple paths
         public final Map<Position, Integer> bottleneckScores;  // position -> number of paths blocked
         
+        // MAPF FIX: Coupling degree (for strategy selection)
+        public final double couplingDegree;  // 0.0 = independent, 1.0 = fully coupled
+        
         // Structural features
         public final int corridorCells;      // cells with ≤2 neighbors
         public final int junctionCells;      // cells with ≥3 neighbors
@@ -46,6 +49,7 @@ public class LevelAnalyzer {
                             Map<Position, Set<Position>> goalDependsOn,
                             List<Position> executionOrder, int maxDepth, boolean hasCycle,
                             Set<Position> bottlenecks, Map<Position, Integer> bottleneckScores,
+                            double couplingDegree,
                             int corridorCells, int junctionCells,
                             StrategyType recommended, String report) {
             this.numAgents = numAgents;
@@ -60,6 +64,7 @@ public class LevelAnalyzer {
             this.hasCircularDependency = hasCycle;
             this.bottleneckPositions = bottlenecks;
             this.bottleneckScores = bottleneckScores;
+            this.couplingDegree = couplingDegree;
             this.corridorCells = corridorCells;
             this.junctionCells = junctionCells;
             this.corridorRatio = (double) corridorCells / Math.max(1, freeSpaces);
@@ -110,23 +115,27 @@ public class LevelAnalyzer {
             }
         }
         
-        // 6. Adjust execution order: prioritize goals AT bottleneck positions
+        // 6. MAPF FIX: Compute coupling degree for strategy selection
+        double couplingDegree = computeCouplingDegree(goalDependsOn, bottleneckScores, 
+                                                      numAgents, numGoals, activeGoals);
+        
+        // 7. Adjust execution order: prioritize goals AT bottleneck positions
         List<Position> executionOrder = hasCycle ? activeGoals : 
             adjustOrderForBottlenecks(topologicalSort(goalDependsOn, activeGoals), bottleneckScores);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
-        // 7. Strategy recommendation
+        // 8. Strategy recommendation (now uses coupling degree)
         StrategyType recommended = recommendStrategy(numAgents, maxDepth, hasCycle, 
-                                                     (double) corridorCells / Math.max(1, freeSpaces));
+                                                     couplingDegree, bottlenecks.size());
         
-        // 8. Generate report
+        // 9. Generate report
         String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                        goalDependsOn, maxDepth, hasCycle, 
                                        corridorCells, junctionCells, recommended);
         
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                 goalDependsOn, executionOrder, maxDepth, hasCycle,
-                                bottlenecks, bottleneckScores,
+                                bottlenecks, bottleneckScores, couplingDegree,
                                 corridorCells, junctionCells, recommended, report);
     }
     
@@ -515,10 +524,65 @@ public class LevelAnalyzer {
         return goals;
     }
     
+    // ========== MAPF FIX: Coupling Degree Calculation ==========
+    
+    /**
+     * Computes coupling degree between agents/goals.
+     * 
+     * Coupling degree is a value between 0.0 and 1.0:
+     * - 0.0: Fully independent (agents don't interact)
+     * - 1.0: Fully coupled (every goal depends on others)
+     * 
+     * Factors considered:
+     * 1. Dependency ratio: how many goals have dependencies
+     * 2. Bottleneck ratio: how many bottleneck positions exist relative to goals
+     * 3. Agent density in bottlenecks: multiple agents needing same bottleneck
+     */
+    private static double computeCouplingDegree(Map<Position, Set<Position>> goalDependsOn,
+                                                Map<Position, Integer> bottleneckScores,
+                                                int numAgents, int numGoals,
+                                                List<Position> activeGoals) {
+        if (numGoals == 0 || numAgents <= 1) return 0.0;
+        
+        // Factor 1: Dependency ratio (goals with dependencies / total goals)
+        int goalsWithDeps = 0;
+        int totalDeps = 0;
+        for (Set<Position> deps : goalDependsOn.values()) {
+            if (!deps.isEmpty()) {
+                goalsWithDeps++;
+                totalDeps += deps.size();
+            }
+        }
+        double dependencyRatio = (double) goalsWithDeps / numGoals;
+        
+        // Factor 2: Average dependencies per goal
+        double avgDeps = (double) totalDeps / Math.max(1, numGoals);
+        double depIntensity = Math.min(1.0, avgDeps / 3.0);  // Normalize: 3+ deps = 1.0
+        
+        // Factor 3: Bottleneck intensity (how congested are bottlenecks)
+        int highTrafficBottlenecks = 0;
+        for (int score : bottleneckScores.values()) {
+            if (score >= 3) highTrafficBottlenecks++;  // Position used by 3+ paths
+        }
+        double bottleneckRatio = (double) highTrafficBottlenecks / Math.max(1, numGoals);
+        
+        // Weighted combination
+        double coupling = 0.4 * dependencyRatio + 0.3 * depIntensity + 0.3 * bottleneckRatio;
+        return Math.min(1.0, coupling);
+    }
+    
     // ========== Strategy Recommendation ==========
     
+    /**
+     * MAPF FIX: Strategy recommendation now uses coupling degree.
+     * 
+     * - Low coupling (< 0.2): Independent planning (PP) works well
+     * - Medium coupling (0.2-0.5): CBS recommended for optimal conflict resolution
+     * - High coupling (> 0.5): Joint search or strict ordering required
+     */
     private static StrategyType recommendStrategy(int numAgents, int maxDepth, 
-                                                   boolean hasCycle, double corridorRatio) {
+                                                   boolean hasCycle, double couplingDegree,
+                                                   int numBottlenecks) {
         if (numAgents == 1) {
             return StrategyType.SINGLE_AGENT;
         }
@@ -527,12 +591,19 @@ public class LevelAnalyzer {
             return StrategyType.CYCLE_BREAKER;
         }
         
-        if (maxDepth >= 3 || corridorRatio > 0.5) {
-            // Strong sequential dependencies or corridor-heavy level
+        // MAPF FIX: Use coupling degree for strategy selection
+        if (couplingDegree > 0.5 || maxDepth >= 3) {
+            // High coupling: need strict ordering
             return StrategyType.STRICT_ORDER;
         }
         
-        if (numAgents <= 3) {
+        if (couplingDegree > 0.2 && numAgents <= 4) {
+            // Medium coupling with few agents: joint search handles conflicts well
+            return StrategyType.JOINT_SEARCH;
+        }
+        
+        if (numAgents <= 3 && numBottlenecks == 0) {
+            // Few agents, no bottlenecks: joint search is optimal
             return StrategyType.JOINT_SEARCH;
         }
         
