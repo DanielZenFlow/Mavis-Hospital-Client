@@ -411,7 +411,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
     
-    /** Plan path for a single subgoal. First tries fast 2D A*, then space-time A* if needed. */
+    /** Plan path for a single subgoal. Uses Space-Time A* by default for MAPF compliance. */
     private List<Action> planSubgoal(Subgoal subgoal, State state, Level level) {
         if (subgoal.isAgentGoal) {
             return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
@@ -419,15 +419,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
             if (boxPos == null) return null;
             
-            // First try fast 2D A* (no reservation table)
+            // MAPF FIX: Use Space-Time A* by default for multi-agent coordination
+            // This ensures paths respect reservations from higher-priority agents
             List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>());
-            if (path != null) return path;
-            
-            // Fallback to space-time A* if 2D search fails
-            return boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, new HashSet<>(),
+                    subgoal.goalPos, subgoal.boxType, state, level, completedBoxGoals,
                     reservationTable, globalTimeStep);
+            
+            // Fallback to 2D A* if space-time fails (e.g., no reservations yet)
+            if (path == null) {
+                path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                        subgoal.goalPos, subgoal.boxType, state, level, completedBoxGoals);
+            }
+            return path;
         }
     }
     
