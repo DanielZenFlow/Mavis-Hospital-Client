@@ -23,7 +23,7 @@ public class LevelAnalyzer {
         public final TaskFilter.FilterResult taskFilter;
         
         // Goal dependency analysis
-        public final Map<Position, Set<Position>> goalBlockedBy;  // goal -> goals that block it
+        public final Map<Position, Set<Position>> goalDependsOn;  // goal -> goals it depends on
         public final List<Position> executionOrder;  // topologically sorted goals
         public final int maxDependencyDepth;
         public final boolean hasCircularDependency;
@@ -39,7 +39,7 @@ public class LevelAnalyzer {
         
         public LevelFeatures(int numAgents, int numBoxes, int numGoals, int freeSpaces,
                             TaskFilter.FilterResult taskFilter,
-                            Map<Position, Set<Position>> goalBlockedBy,
+                            Map<Position, Set<Position>> goalDependsOn,
                             List<Position> executionOrder, int maxDepth, boolean hasCycle,
                             int corridorCells, int junctionCells,
                             StrategyType recommended, String report) {
@@ -49,7 +49,7 @@ public class LevelAnalyzer {
             this.freeSpaces = freeSpaces;
             this.density = (double)(numAgents + numBoxes) / Math.max(1, freeSpaces);
             this.taskFilter = taskFilter;
-            this.goalBlockedBy = goalBlockedBy;
+            this.goalDependsOn = goalDependsOn;
             this.executionOrder = executionOrder;
             this.maxDependencyDepth = maxDepth;
             this.hasCircularDependency = hasCycle;
@@ -91,10 +91,10 @@ public class LevelAnalyzer {
         int junctionCells = corridorJunction[1];
         
         // 4. Goal dependency analysis - includes Box-on-Goal dependencies
-        Map<Position, Set<Position>> goalBlockedBy = computeGoalDependencies(activeGoals, level, state);
-        boolean hasCycle = detectCycle(goalBlockedBy, activeGoals);
-        List<Position> executionOrder = hasCycle ? activeGoals : topologicalSort(goalBlockedBy, activeGoals);
-        int maxDepth = computeMaxDependencyDepth(goalBlockedBy, activeGoals);
+        Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(activeGoals, level, state);
+        boolean hasCycle = detectCycle(goalDependsOn, activeGoals);
+        List<Position> executionOrder = hasCycle ? activeGoals : topologicalSort(goalDependsOn, activeGoals);
+        int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 5. Strategy recommendation
         StrategyType recommended = recommendStrategy(numAgents, maxDepth, hasCycle, 
@@ -102,263 +102,145 @@ public class LevelAnalyzer {
         
         // 6. Generate report
         String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
-                                       goalBlockedBy, maxDepth, hasCycle, 
+                                       goalDependsOn, maxDepth, hasCycle, 
                                        corridorCells, junctionCells, recommended);
         
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
-                                goalBlockedBy, executionOrder, maxDepth, hasCycle,
+                                goalDependsOn, executionOrder, maxDepth, hasCycle,
                                 corridorCells, junctionCells, recommended, report);
     }
     
     // ========== Goal Dependency Analysis ==========
     
     /**
-     * Computes goal dependencies using MAPF standard "Push Reachability" analysis.
+     * Computes goal dependencies using Global Reachability analysis.
      * 
-     * Dependency rule: Goal A depends on Goal B if:
-     *   - Currently we CAN push a box to A
-     *   - But if B is filled first, we can NO LONGER push a box to A
-     * 
-     * This correctly handles nested/corner goals without hardcoded thresholds.
+     * MAPF Standard Terminology:
+     *   - dependsOn.get(A) contains B means: A depends on B (B must complete before A)
+     *   - If filling goal A blocks access to goal B from open space,
+     *     then A depends on B (B must be filled first, while path is still open)
+     *   - Topological sort outputs: dependencies first, then dependents
      */
     private static Map<Position, Set<Position>> computeGoalDependencies(
             List<Position> goals, Level level, State state) {
-        Map<Position, Set<Position>> blockedBy = new HashMap<>();
+        Map<Position, Set<Position>> dependsOn = new HashMap<>();
         
-        // Build goal type map for quick lookup
-        Map<Position, Character> goalTypes = new HashMap<>();
-        for (Position goal : goals) {
-            char type = level.getBoxGoal(goal);
-            if (type != '\0') {
-                goalTypes.put(goal, type);
-            }
+        // Initialize dependency map
+        for (Position g : goals) {
+            dependsOn.put(g, new HashSet<>());
         }
         
-        // Separate box goals from agent goals
-        List<Position> boxGoals = new ArrayList<>();
-        Set<Position> boxGoalSet = new HashSet<>();
-        List<Position> agentGoals = new ArrayList<>();
-        Set<Position> agentGoalSet = new HashSet<>();
-        for (Position goal : goals) {
-            if (goalTypes.containsKey(goal)) {
-                boxGoals.add(goal);
-                boxGoalSet.add(goal);
-            } else {
-                agentGoals.add(goal);
-                agentGoalSet.add(goal);
-            }
+        // Find root position representing "Main Open Space"
+        Position root = findOpenSpaceRoot(level, goals);
+        if (root == null) {
+            return dependsOn; // Degenerate case
         }
         
+        // Get current box positions as obstacles (MAPF: consider dynamic state)
+        Set<Position> boxPositions = state.getBoxes().keySet();
+
+        // Build dependency graph
         for (Position goalA : goals) {
-            blockedBy.put(goalA, new HashSet<>());
-            char goalAType = goalTypes.getOrDefault(goalA, '\0');
-            
-            // Check 1: Box-on-Goal dependency (a box of wrong type sits on this goal)
-            // Only triggers when there IS a box at the goal, and it's the WRONG type
-            char boxAtGoal = state.getBoxAt(goalA);
-            if (boxAtGoal != '\0' && boxAtGoal != goalAType) {
-                // A wrong-type box is sitting on this goal - find where that box type should go
-                for (Position goalX : boxGoals) {  // Only box goals can be blockers
-                    char goalXType = goalTypes.getOrDefault(goalX, '\0');
-                    if (goalXType == boxAtGoal) {
-                        blockedBy.get(goalA).add(goalX);
-                    }
-                }
-            }
-            
-            // Check 2: Push Position Overlap - detect which goals block other goals' push access
-            // If goalB occupies a position needed to push to goalA, then B depends on A
-            if (boxGoalSet.contains(goalA)) {
-                // Find all valid push positions for goalA (where agent must stand to push)
-                Set<Position> pushPositions = getPushPositions(goalA, level);
+            for (Position goalB : goals) {
+                if (goalA.equals(goalB)) continue;
                 
-                // If any push position is also a box goal, that goal depends on goalA
-                for (Position pushPos : pushPositions) {
-                    if (boxGoalSet.contains(pushPos) && !pushPos.equals(goalA)) {
-                        // pushPos is a goal that would block pushing to goalA
-                        // So pushPos (goalB) depends on goalA - goalA must be filled first
-                        blockedBy.computeIfAbsent(pushPos, k -> new HashSet<>()).add(goalA);
-                    }
-                }
-            }
-            
-            // Check 3: Agent goal blocked by box goals on path
-            if (!boxGoalSet.contains(goalA)) {
-                int directDist = bfsDistanceFromEdge(goalA, level, Collections.emptySet());
-                for (Position goalX : boxGoals) {
-                    if (goalX.equals(goalA)) continue;
-                    int avoidDist = bfsDistanceFromEdge(goalA, level, Collections.singleton(goalX));
-                    if (avoidDist > directDist) {
-                        blockedBy.get(goalA).add(goalX);
-                    }
-                }
-            }
-            
-            // Check 4: Agent goal blocking other agent goals (stay-at-target dependency)
-            // If goalA is on the path to goalB, and agent at goalA would block access to goalB,
-            // then goalA depends on goalB (B must complete first, so A doesn't block it)
-            if (agentGoalSet.contains(goalA)) {
-                for (Position goalB : agentGoals) {
-                    if (goalB.equals(goalA)) continue;
-                    // Check if goalA blocks path to goalB
-                    int directDist = bfsDistanceFromEdge(goalB, level, Collections.emptySet());
-                    int avoidDist = bfsDistanceFromEdge(goalB, level, Collections.singleton(goalA));
-                    if (avoidDist > directDist) {
-                        // goalA blocks path to goalB, so goalA depends on goalB
-                        blockedBy.get(goalA).add(goalB);
-                    }
+                // Check: Does filling goalA block access to goalB?
+                // If yes, goalB must be filled BEFORE goalA.
+                // So goalA depends on goalB.
+                if (!isReachable(root, goalB, level, goalA, boxPositions)) {
+                    dependsOn.get(goalA).add(goalB);
                 }
             }
         }
         
-        return blockedBy;
+        return dependsOn;
     }
     
-    /**
-     * Get all valid push positions for a goal (positions where agent stands AFTER pushing box to goal).
-     * Push mechanics: agent at (goal+2*dir) pushes box at (goal+dir) into goal.
-     * After push: agent ends at (goal+dir), box ends at goal.
-     */
-    private static Set<Position> getPushPositions(Position goal, Level level) {
-        Set<Position> pushPositions = new HashSet<>();
-        for (Direction dir : Direction.values()) {
-            Position boxFromPos = goal.move(dir);         // Box starts here, agent ends here after push
-            Position agentFromPos = boxFromPos.move(dir); // Agent starts here before push
-            
-            // Both positions must be non-wall for this push direction to be valid
-            if (!level.isWall(boxFromPos) && !level.isWall(agentFromPos)) {
-                pushPositions.add(boxFromPos);
-            }
-        }
-        return pushPositions;
-    }
-    
-    /**
-     * MAPF standard: Check if a box can be pushed to the goal position.
-     * A push requires: agent at one adjacent cell, box comes from opposite direction.
-     * Returns true if at least one push direction is available.
-     */
-    private static boolean canPushToGoal(Position goal, Level level, Set<Position> filledGoals) {
-        for (Direction dir : Direction.values()) {
-            Position agentPos = goal.move(dir);  // Agent stands here to push
-            Position boxFromPos = goal.move(dir.opposite());  // Box comes from here
-            
-            // Agent position must be valid and not filled
-            if (level.isWall(agentPos) || filledGoals.contains(agentPos)) {
-                continue;
-            }
-            
-            // Box source position must be valid (not wall)
-            if (level.isWall(boxFromPos)) {
-                continue;
-            }
-            
-            // Check if agent can reach agentPos (avoiding filled goals as obstacles)
-            if (canReachPosition(agentPos, level, filledGoals)) {
-                return true;  // At least one push direction works
-            }
-        }
-        return false;
-    }
-    
-    /**
-     * Check if a position is reachable from any open area, avoiding filled goals.
-     */
-    private static boolean canReachPosition(Position target, Level level, Set<Position> obstacles) {
-        if (obstacles.contains(target)) return false;
-        
-        Queue<Position> queue = new LinkedList<>();
+    private static Position findOpenSpaceRoot(Level level, List<Position> goals) {
+        Set<Position> goalSet = new HashSet<>(goals);
         Set<Position> visited = new HashSet<>();
         
-        // Start BFS from target, try to reach any "open" cell (>= 3 free neighbors)
-        queue.add(target);
-        visited.add(target);
+        Position bestRoot = null;
+        int maxComponentSize = -1;
         
-        while (!queue.isEmpty()) {
-            Position curr = queue.poll();
-            
-            // Check if this is an open area
-            int freeNeighbors = 0;
-            for (Direction d : Direction.values()) {
-                Position n = curr.move(d);
-                if (!level.isWall(n) && !obstacles.contains(n)) {
-                    freeNeighbors++;
-                }
-            }
-            if (freeNeighbors >= 3) {
-                return true;  // Reached open area
-            }
-            
-            // Continue BFS
-            for (Direction d : Direction.values()) {
-                Position next = curr.move(d);
-                if (level.isWall(next) || obstacles.contains(next) || visited.contains(next)) {
-                    continue;
-                }
-                visited.add(next);
-                queue.add(next);
-            }
-        }
-        
-        return false;
-    }
-    
-    /**
-     * BFS distance from level edges to target, avoiding specified positions.
-     */
-    private static int bfsDistanceFromEdge(Position target, Level level, Set<Position> avoid) {
-        Queue<Position> queue = new LinkedList<>();
-        Map<Position, Integer> distances = new HashMap<>();
-        
-        // Start from all edge cells (potential entry points)
-        for (int r = 0; r < level.getRows(); r++) {
-            for (int c = 0; c < level.getCols(); c++) {
+        // Scan all cells to find the largest connected component
+        for (int r=0; r<level.getRows(); r++) {
+            for (int c=0; c<level.getCols(); c++) {
                 if (level.isWall(r, c)) continue;
-                Position pos = new Position(r, c);
-                if (avoid.contains(pos)) continue;
+                Position p = new Position(r, c);
+                if (visited.contains(p)) continue;
                 
-                // Check if this is an "open" cell (has space to maneuver)
-                int neighbors = countFreeNeighbors(pos, level);
-                if (neighbors >= 3) {
-                    queue.add(pos);
-                    distances.put(pos, 0);
+                // BFS to explore component
+                int componentSize = 0;
+                Position bestInComponent = null;
+                int maxNeighbors = -1;
+                
+                Queue<Position> q = new LinkedList<>();
+                q.add(p);
+                visited.add(p);
+                
+                while (!q.isEmpty()) {
+                    Position curr = q.poll();
+                    componentSize++;
+                    
+                    // Track best candidate root in this component (non-goal, high degree)
+                    if (!goalSet.contains(curr)) {
+                        int neighbors = countFreeNeighbors(curr, level);
+                        if (bestInComponent == null || neighbors > maxNeighbors) {
+                            bestInComponent = curr;
+                            maxNeighbors = neighbors;
+                        }
+                    }
+                    
+                    for (Direction dir : Direction.values()) {
+                        Position next = curr.move(dir);
+                        if (!level.isWall(next) && !visited.contains(next)) {
+                            visited.add(next);
+                            q.add(next);
+                        }
+                    }
+                }
+                
+                // Keep the root from the largest component
+                if (componentSize > maxComponentSize && bestInComponent != null) {
+                    maxComponentSize = componentSize;
+                    bestRoot = bestInComponent;
                 }
             }
         }
+        return bestRoot;
+    }
+
+    /**
+     * BFS reachability check considering walls, boxes, and a hypothetically blocked position.
+     * Per MAPF standard: dynamic obstacles (boxes) affect reachability analysis.
+     */
+    private static boolean isReachable(Position start, Position target, Level level, 
+                                        Position blocked, Set<Position> boxPositions) {
+        if (start.equals(target)) return true;
         
-        // If no open cells, start from all free cells
-        if (queue.isEmpty()) {
-            for (int r = 0; r < level.getRows(); r++) {
-                for (int c = 0; c < level.getCols(); c++) {
-                    if (level.isWall(r, c)) continue;
-                    Position pos = new Position(r, c);
-                    if (avoid.contains(pos)) continue;
-                    queue.add(pos);
-                    distances.put(pos, 0);
-                }
-            }
-        }
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
         
-        // BFS to target
-        while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            int dist = distances.get(current);
-            
-            if (current.equals(target)) {
-                return dist;
-            }
+        q.add(start);
+        visited.add(start);
+        visited.add(blocked); // Treat hypothetically filled goal as wall
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
             
             for (Direction dir : Direction.values()) {
                 Position next = current.move(dir);
-                if (level.isWall(next) || avoid.contains(next) || distances.containsKey(next)) {
-                    continue;
+                // Check: not wall, not visited, not a box (unless it's the target)
+                if (!level.isWall(next) && !visited.contains(next) &&
+                    (!boxPositions.contains(next) || next.equals(target))) {
+                    visited.add(next);
+                    q.add(next);
                 }
-                distances.put(next, dist + 1);
-                queue.add(next);
             }
         }
-        
-        return Integer.MAX_VALUE;
+        return false;
     }
     
     // ========== Cycle Detection ==========
@@ -366,19 +248,19 @@ public class LevelAnalyzer {
     /**
      * Detects if there's a circular dependency among goals.
      */
-    private static boolean detectCycle(Map<Position, Set<Position>> blockedBy, List<Position> goals) {
+    private static boolean detectCycle(Map<Position, Set<Position>> dependsOn, List<Position> goals) {
         Set<Position> visited = new HashSet<>();
         Set<Position> inStack = new HashSet<>();
         
         for (Position goal : goals) {
-            if (hasCycleDFS(goal, blockedBy, visited, inStack)) {
+            if (hasCycleDFS(goal, dependsOn, visited, inStack)) {
                 return true;
             }
         }
         return false;
     }
     
-    private static boolean hasCycleDFS(Position node, Map<Position, Set<Position>> blockedBy,
+    private static boolean hasCycleDFS(Position node, Map<Position, Set<Position>> dependsOn,
                                        Set<Position> visited, Set<Position> inStack) {
         if (inStack.contains(node)) return true;
         if (visited.contains(node)) return false;
@@ -386,8 +268,8 @@ public class LevelAnalyzer {
         visited.add(node);
         inStack.add(node);
         
-        for (Position blocker : blockedBy.getOrDefault(node, Collections.emptySet())) {
-            if (hasCycleDFS(blocker, blockedBy, visited, inStack)) {
+        for (Position dep : dependsOn.getOrDefault(node, Collections.emptySet())) {
+            if (hasCycleDFS(dep, dependsOn, visited, inStack)) {
                 return true;
             }
         }
@@ -401,25 +283,25 @@ public class LevelAnalyzer {
     /**
      * Returns goals in execution order (dependencies first).
      */
-    private static List<Position> topologicalSort(Map<Position, Set<Position>> blockedBy, List<Position> goals) {
+    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals) {
         List<Position> result = new ArrayList<>();
         Set<Position> visited = new HashSet<>();
         
         for (Position goal : goals) {
-            topologicalDFS(goal, blockedBy, visited, result);
+            topologicalDFS(goal, dependsOn, visited, result);
         }
         
         return result;
     }
     
-    private static void topologicalDFS(Position node, Map<Position, Set<Position>> blockedBy,
+    private static void topologicalDFS(Position node, Map<Position, Set<Position>> dependsOn,
                                        Set<Position> visited, List<Position> result) {
         if (visited.contains(node)) return;
         visited.add(node);
         
-        // Visit all blockers first (they must be completed before this goal)
-        for (Position blocker : blockedBy.getOrDefault(node, Collections.emptySet())) {
-            topologicalDFS(blocker, blockedBy, visited, result);
+        // Visit all dependencies first (they must be completed before this goal)
+        for (Position dep : dependsOn.getOrDefault(node, Collections.emptySet())) {
+            topologicalDFS(dep, dependsOn, visited, result);
         }
         
         result.add(node);
@@ -428,32 +310,32 @@ public class LevelAnalyzer {
     /**
      * Computes maximum depth in dependency graph.
      */
-    private static int computeMaxDependencyDepth(Map<Position, Set<Position>> blockedBy, List<Position> goals) {
+    private static int computeMaxDependencyDepth(Map<Position, Set<Position>> dependsOn, List<Position> goals) {
         Map<Position, Integer> depths = new HashMap<>();
         int maxDepth = 0;
         
         for (Position goal : goals) {
-            int depth = computeDepth(goal, blockedBy, depths, new HashSet<>());
+            int depth = computeDepth(goal, dependsOn, depths, new HashSet<>());
             maxDepth = Math.max(maxDepth, depth);
         }
         
         return maxDepth;
     }
     
-    private static int computeDepth(Position node, Map<Position, Set<Position>> blockedBy,
+    private static int computeDepth(Position node, Map<Position, Set<Position>> dependsOn,
                                     Map<Position, Integer> cache, Set<Position> visiting) {
         if (cache.containsKey(node)) return cache.get(node);
         if (visiting.contains(node)) return 0; // Cycle detected, break it
         
         visiting.add(node);
-        int maxBlockerDepth = 0;
-        for (Position blocker : blockedBy.getOrDefault(node, Collections.emptySet())) {
-            maxBlockerDepth = Math.max(maxBlockerDepth, computeDepth(blocker, blockedBy, cache, visiting) + 1);
+        int maxDepDepth = 0;
+        for (Position dep : dependsOn.getOrDefault(node, Collections.emptySet())) {
+            maxDepDepth = Math.max(maxDepDepth, computeDepth(dep, dependsOn, cache, visiting) + 1);
         }
         visiting.remove(node);
         
-        cache.put(node, maxBlockerDepth);
-        return maxBlockerDepth;
+        cache.put(node, maxDepDepth);
+        return maxDepDepth;
     }
     
     // ========== Structural Analysis ==========
@@ -534,7 +416,7 @@ public class LevelAnalyzer {
     
     private static String generateReport(int numAgents, int numBoxes, int numGoals, int freeSpaces,
                                         TaskFilter.FilterResult taskFilter,
-                                        Map<Position, Set<Position>> blockedBy, int maxDepth,
+                                        Map<Position, Set<Position>> dependsOn, int maxDepth,
                                         boolean hasCycle, int corridors, int junctions,
                                         StrategyType recommended) {
         StringBuilder sb = new StringBuilder();
@@ -556,12 +438,12 @@ public class LevelAnalyzer {
         sb.append(String.format("Max dependency depth: %d, Has cycle: %s\n", maxDepth, hasCycle));
         
         // Show dependencies if any
-        int depCount = blockedBy.values().stream().mapToInt(Set::size).sum();
+        int depCount = dependsOn.values().stream().mapToInt(Set::size).sum();
         if (depCount > 0) {
             sb.append("\nGoal dependencies (").append(depCount).append(" total):\n");
-            for (Map.Entry<Position, Set<Position>> entry : blockedBy.entrySet()) {
+            for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
                 if (!entry.getValue().isEmpty()) {
-                    sb.append("  ").append(entry.getKey()).append(" blocked by: ");
+                    sb.append("  ").append(entry.getKey()).append(" depends on: ");
                     sb.append(entry.getValue()).append("\n");
                 }
             }

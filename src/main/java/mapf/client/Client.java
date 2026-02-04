@@ -57,7 +57,7 @@ public class Client {
     private final SearchConfig config;
 
     /** Whether to use Portfolio Controller for strategy selection */
-    public static boolean USE_PORTFOLIO = true;
+    public static boolean USE_PORTFOLIO = false;
 
     static {
         // Check environment variable to enable new simplified strategy

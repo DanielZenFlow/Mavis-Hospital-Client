@@ -142,39 +142,6 @@ public class AgentCoordinator {
     }
 
     /**
-     * Compute dynamic priorities based on topological analysis.
-     * Simplified version - uses Map of current goals.
-     */
-    public void computeDynamicPriorities(State state, Level level, int numAgents,
-            TopologicalAnalyzer topoAnalyzer, Map<Integer, Position> currentGoalPositions) {
-        
-        // TODO: Fix computeTopologicalDepths to return Map<Integer, Integer>
-        // Map<Integer, Integer> depths = topoAnalyzer.computeTopologicalDepths(level);
-
-        List<Integer> sortedAgents = new ArrayList<>();
-        for (int i = 0; i < numAgents; i++) {
-            sortedAgents.add(i);
-        }
-
-        // Simplified sorting by agent ID for now
-        sortedAgents.sort((a, b) -> {
-            Position goalA = currentGoalPositions.get(a);
-            Position goalB = currentGoalPositions.get(b);
-            if (goalA != null && goalB != null) {
-                int distA = manhattan(state.getAgentPosition(a), goalA);
-                int distB = manhattan(state.getAgentPosition(b), goalB);
-                return Integer.compare(distA, distB);
-            }
-            
-            return Integer.compare(a, b);
-        });
-
-        for (int priority = 0; priority < sortedAgents.size(); priority++) {
-            agentPriorities.put(sortedAgents.get(priority), priority);
-        }
-    }
-
-    /**
      * Get execution order based on priorities.
      */
     public List<Integer> getExecutionOrder(int numAgents) {

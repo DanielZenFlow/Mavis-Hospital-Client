@@ -147,10 +147,43 @@ public class LevelParser {
             }
         }
         
-        // Count actual agents and create properly sized array
-        int numAgents = 0;
-        for (Position pos : agentPositions) {
-            if (pos != null) numAgents++;
+        // Find max agent ID and validate contiguity (PRODUCT.md: "consecutively numbered starting from 0")
+        int maxAgentId = -1;
+        for (int i = 0; i < agentPositions.length; i++) {
+            if (agentPositions[i] != null) {
+                maxAgentId = i;
+            }
+        }
+        
+        // Validate agent IDs are contiguous 0..maxAgentId
+        for (int i = 0; i <= maxAgentId; i++) {
+            if (agentPositions[i] == null) {
+                throw new IllegalArgumentException("Agent IDs must be contiguous: missing Agent " + i);
+            }
+        }
+        
+        // Validate all agents have colors defined (PRODUCT.md: critical constraint)
+        for (int i = 0; i <= maxAgentId; i++) {
+            if (!agentColors.containsKey(i)) {
+                throw new IllegalArgumentException("Agent " + i + " has no color defined in #colors section");
+            }
+        }
+        
+        // Validate all box types have colors defined
+        Set<Character> boxTypes = new HashSet<>();
+        for (char boxType : boxes.values()) {
+            boxTypes.add(boxType);
+        }
+        for (char boxType : boxTypes) {
+            if (!boxColors.containsKey(boxType)) {
+                throw new IllegalArgumentException("Box type '" + boxType + "' has no color defined in #colors section");
+            }
+        }
+        
+        // Validate grid dimensions match (PRODUCT.md: "Walls must match exactly")
+        if (goalGrid.size() != rows) {
+            throw new IllegalArgumentException("Goal grid rows (" + goalGrid.size() + 
+                ") must match initial grid rows (" + rows + ")");
         }
         
         // Parse goal grid
@@ -162,10 +195,19 @@ public class LevelParser {
             Arrays.fill(agentGoals[r], -1);
         }
         
-        for (int r = 0; r < goalGrid.size() && r < rows; r++) {
+        for (int r = 0; r < goalGrid.size(); r++) {
             String gridLine = goalGrid.get(r);
             for (int c = 0; c < cols; c++) {
                 char ch = c < gridLine.length() ? gridLine.charAt(c) : ' ';
+                
+                // Validate walls match between initial and goal (PRODUCT.md requirement)
+                char initialCh = c < initialGrid.get(r).length() ? initialGrid.get(r).charAt(c) : ' ';
+                boolean isWallInInitial = (initialCh == '+');
+                boolean isWallInGoal = (ch == '+');
+                if (isWallInInitial != isWallInGoal) {
+                    throw new IllegalArgumentException("Wall mismatch at (" + r + "," + c + 
+                        "): initial=" + isWallInInitial + ", goal=" + isWallInGoal);
+                }
                 
                 if (ch >= 'A' && ch <= 'Z') {
                     boxGoals[r][c] = ch;
@@ -178,15 +220,6 @@ public class LevelParser {
         // Create Level and State
         Level level = new Level(levelName, rows, cols, walls, boxGoals, agentGoals, 
                                boxColors, agentColors);
-        
-        // Find the highest agent ID to determine array size
-        // Agent IDs must be contiguous starting from 0 in the level format
-        int maxAgentId = -1;
-        for (int i = 0; i < agentPositions.length; i++) {
-            if (agentPositions[i] != null) {
-                maxAgentId = i;
-            }
-        }
         
         // Create properly sized array (maxAgentId + 1 elements)
         // This preserves agent ID as array index

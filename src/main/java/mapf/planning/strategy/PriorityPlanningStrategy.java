@@ -4,6 +4,7 @@ import mapf.domain.*;
 import mapf.planning.SearchConfig;
 import mapf.planning.SearchStrategy;
 import mapf.planning.analysis.DependencyAnalyzer;
+import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
@@ -24,7 +25,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     // Core helper classes (SRP: each handles one responsibility)
     private final SubgoalManager subgoalManager;
-    private final TopologicalAnalyzer topologicalAnalyzer;
     private final ConflictResolver conflictResolver;
     private final BoxSearchPlanner boxSearchPlanner;
     private final GreedyPlanner greedyPlanner;
@@ -74,7 +74,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         this.maxStates = config.getMaxStates();
         
         this.subgoalManager = new SubgoalManager(heuristic);
-        this.topologicalAnalyzer = new TopologicalAnalyzer();
         this.conflictResolver = new ConflictResolver();
         this.boxSearchPlanner = new BoxSearchPlanner(heuristic);
         this.greedyPlanner = new GreedyPlanner();
@@ -111,6 +110,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         long startTime = System.currentTimeMillis();
         int numAgents = initialState.getNumAgents();
 
+        // Ensure robust dependency analysis is used (SRP fix form step 2)
+        // If external controller provided no order, compute it ourselves using the standard analyzer
+        if (precomputedGoalOrder == null) {
+             LevelAnalyzer.LevelFeatures features = LevelAnalyzer.analyze(level, initialState);
+             setGoalExecutionOrder(features.executionOrder);
+             if (features.taskFilter != null && (immovableBoxes == null || immovableBoxes.isEmpty())) {
+                 setImmovableBoxes(features.taskFilter.immovableBoxes);
+             }
+        }
+
         // Reset for new search
         displacementHistory.clear();
         displacementAttempts = 0;
@@ -121,15 +130,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return planWithSubgoals(initialState, level, startTime);
     }
 
+    /** Cached subgoal order - MAPF PP requires fixed priority (computed once, reused). */
+    private List<Subgoal> cachedSubgoalOrder = null;
+
     /**
      * Core PP algorithm: iteratively solve subgoals in priority order.
      * Per ARCHITECTURE.md: "moves one box at a time, naturally handles dependencies"
+     * MAPF FIX: Priority is fixed at start, not recomputed each iteration.
      */
     private List<Action[]> planWithSubgoals(State initialState, Level level, long startTime) {
         List<Action[]> fullPlan = new ArrayList<>();
         State currentState = initialState;
         int numAgents = initialState.getNumAgents();
         int stuckCount = 0;
+        
+        // MAPF FIX: Compute subgoal order ONCE at start, then reuse
+        cachedSubgoalOrder = null;
 
         while (!currentState.isGoalState(level)) {
             // PRODUCT.md constraints: 3 minutes, 20,000 actions
@@ -152,11 +168,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (cbsResult != null) return cbsResult;
             }
 
-            // Get and sort unsatisfied subgoals (excluding completed goals)
-            List<Subgoal> unsatisfied = subgoalManager.getUnsatisfiedSubgoals(currentState, level, completedBoxGoals);
+            // MAPF FIX: Use cached order, only filter out completed goals
+            List<Subgoal> unsatisfied = getOrComputeSubgoalOrder(currentState, level);
             if (unsatisfied.isEmpty()) break;
-
-            sortSubgoals(unsatisfied, currentState);
             
             // Log goal order once at start
             if (fullPlan.isEmpty() && SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
@@ -192,8 +206,41 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
     
+    /**
+     * MAPF FIX: Get cached subgoal order or compute once.
+     * Priority is fixed at start - only filter out completed goals.
+     */
+    private List<Subgoal> getOrComputeSubgoalOrder(State currentState, Level level) {
+        if (cachedSubgoalOrder == null) {
+            // First call: compute and cache the order
+            cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(currentState, level, completedBoxGoals);
+            sortSubgoals(cachedSubgoalOrder, currentState, level);
+            logNormal("[PP] Fixed priority order computed: " + cachedSubgoalOrder.size() + " subgoals");
+        }
+        
+        // Filter out completed goals from cached order
+        List<Subgoal> remaining = new ArrayList<>();
+        for (Subgoal sg : cachedSubgoalOrder) {
+            if (!completedBoxGoals.contains(sg.goalPos)) {
+                // Check if still unsatisfied
+                if (sg.isAgentGoal) {
+                    Position agentPos = currentState.getAgentPosition(sg.agentId);
+                    if (!agentPos.equals(sg.goalPos)) {
+                        remaining.add(sg);
+                    }
+                } else {
+                    Character boxAtGoal = currentState.getBoxes().get(sg.goalPos);
+                    if (boxAtGoal == null || boxAtGoal != sg.boxType) {
+                        remaining.add(sg);
+                    }
+                }
+            }
+        }
+        return remaining;
+    }
+    
     /** Sort subgoals by pre-computed order or difficulty. */
-    private void sortSubgoals(List<Subgoal> subgoals, State state) {
+    private void sortSubgoals(List<Subgoal> subgoals, State state, Level level) {
         if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
             Map<Position, Integer> orderMap = new HashMap<>();
             for (int i = 0; i < precomputedGoalOrder.size(); i++) {
@@ -207,9 +254,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         } else {
             // Fallback: sort by difficulty (easier first)
             final State s = state;
+            final Level lv = level;
             subgoals.sort((a, b) -> {
-                int diffA = subgoalManager.estimateSubgoalDifficulty(a, s, null);
-                int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, null);
+                int diffA = subgoalManager.estimateSubgoalDifficulty(a, s, lv);
+                int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, lv);
                 return Integer.compare(diffA, diffB);
             });
         }
