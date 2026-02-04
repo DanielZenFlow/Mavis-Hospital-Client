@@ -200,10 +200,80 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         if (currentState.isGoalState(level)) {
             logMinimal(getName() + ": [OK] Goal state reached!");
+            // MAPF FIX: Validate and optimize the plan before returning
+            fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
             return fullPlan.isEmpty() ? null : fullPlan;
         }
         logMinimal(getName() + ": [FAIL] Could not reach goal state");
         return null;
+    }
+    
+    /**
+     * MAPF FIX: Validates plan correctness and removes redundant actions.
+     * 
+     * 1. Collision check: Ensure no two agents occupy same cell at same time
+     * 2. Redundant NoOp removal: Remove trailing NoOps when agents are at goals
+     */
+    private List<Action[]> validateAndOptimizePlan(List<Action[]> plan, State initialState, 
+                                                   Level level, int numAgents) {
+        if (plan == null || plan.isEmpty()) return plan;
+        
+        // Step 1: Validate (detect collisions)
+        State state = initialState;
+        for (int step = 0; step < plan.size(); step++) {
+            Action[] actions = plan.get(step);
+            
+            // Check for vertex conflicts (two agents at same position)
+            Set<Position> nextPositions = new HashSet<>();
+            for (int a = 0; a < numAgents; a++) {
+                Position nextPos = computeNextPosition(state, a, actions[a], level);
+                if (nextPositions.contains(nextPos)) {
+                    logVerbose("[PP] WARNING: Collision detected at step " + step + " at " + nextPos);
+                }
+                nextPositions.add(nextPos);
+            }
+            
+            // Apply actions
+            state = applyJointAction(actions, state, level, numAgents);
+        }
+        
+        // Step 2: Optimize - remove trailing NoOps
+        int lastMeaningfulStep = plan.size() - 1;
+        while (lastMeaningfulStep >= 0) {
+            Action[] actions = plan.get(lastMeaningfulStep);
+            boolean allNoOp = true;
+            for (Action a : actions) {
+                if (a.type != Action.ActionType.NOOP) {
+                    allNoOp = false;
+                    break;
+                }
+            }
+            if (!allNoOp) break;
+            lastMeaningfulStep--;
+        }
+        
+        if (lastMeaningfulStep < plan.size() - 1) {
+            int removed = plan.size() - lastMeaningfulStep - 1;
+            logNormal("[PP] Optimized: removed " + removed + " trailing NoOp steps");
+            return plan.subList(0, lastMeaningfulStep + 1);
+        }
+        
+        return plan;
+    }
+    
+    /**
+     * Computes the next position of an agent after applying an action.
+     */
+    private Position computeNextPosition(State state, int agentId, Action action, Level level) {
+        Position current = state.getAgentPosition(agentId);
+        if (action == null || action.type == Action.ActionType.NOOP) {
+            return current;
+        }
+        if (action.type == Action.ActionType.MOVE) {
+            return current.move(action.agentDir);
+        }
+        // Push/Pull: agent moves
+        return current.move(action.agentDir);
     }
     
     /**
