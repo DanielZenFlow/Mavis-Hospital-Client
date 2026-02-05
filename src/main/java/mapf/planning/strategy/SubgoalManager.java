@@ -63,8 +63,9 @@ public class SubgoalManager {
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
                     Color boxColor = level.getBoxColor(goalType);
-                    // MAPF FIX: Choose NEAREST agent instead of first available (index-based)
-                    int agentId = findNearestAgentForColor(boxColor, goalPos, level, state);
+                    // MAPF FIX: Choose agent based on minimizing (Agent->Box + Box->Goal) cost
+                    // instead of just (Agent->Goal) or (Agent->Box)
+                    int agentId = findBestAgentForTask(boxColor, goalType, goalPos, level, state);
                     if (agentId != -1) {
                         unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentId, goalType, goalPos, false));
                     }
@@ -159,6 +160,64 @@ public class SubgoalManager {
         return bestBox;
     }
     
+    /**
+     * Finds the best agent to handle a specific box goal.
+     * Cost Function = Distance(Agent, AnyValidBox) + Distance(ThatBox, Goal).
+     * This ensures the agent physically closest to a valid box and closer to goal is picked.
+     */
+    private int findBestAgentForTask(Color color, char boxType, Position goalPos, Level level, State state) {
+        int bestAgentId = -1;
+        int minTotalCost = Integer.MAX_VALUE;
+        int numAgents = state.getNumAgents();
+        
+        // Pre-calculate agent positions of the matching color
+        List<Integer> validAgents = new ArrayList<>();
+        for (int i = 0; i < numAgents; i++) {
+            if (level.getAgentColor(i) == color) {
+                validAgents.add(i);
+            }
+        }
+        
+        if (validAgents.isEmpty()) return -1;
+        
+        // Find all available boxes of the required type
+        Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
+        
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != boxType) continue; 
+            Position boxPos = entry.getKey();
+            
+            // Skip satisfied, frozen, or immovable boxes
+            if (level.getBoxGoal(boxPos) == boxType) continue; // Already at goal
+            if (immovableBoxes.contains(boxPos)) continue;
+            
+            // Calculate Box->Goal distance (constant for this box)
+            int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(boxPos, goalPos, state, level);
+            if (boxToGoal == Integer.MAX_VALUE) continue;
+            
+            // Check all agents against this box
+            for (int agentId : validAgents) {
+                Position agentPos = state.getAgentPosition(agentId);
+                // Agent->Box distance
+                int agentToBox = agentPos.manhattanDistance(boxPos); 
+                
+                int totalCost = agentToBox + boxToGoal;
+                
+                if (totalCost < minTotalCost) {
+                    minTotalCost = totalCost;
+                    bestAgentId = agentId;
+                }
+            }
+        }
+        
+        // Fallback: If no valid box found/reachable (e.g. all blocked), just use nearest agent to goal
+        if (bestAgentId == -1) {
+             return findNearestAgentForColor(color, goalPos, level, state);
+        }
+        
+        return bestAgentId;
+    }
+
     /**
      * Finds the nearest agent of the matching color to the target position.
      * Uses heuristic distance (Manhattan) for efficiency.
