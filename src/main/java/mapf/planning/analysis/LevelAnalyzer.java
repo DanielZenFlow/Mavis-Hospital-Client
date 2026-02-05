@@ -103,7 +103,8 @@ public class LevelAnalyzer {
         int junctionCells = corridorJunction[1];
         
         // 4. Goal dependency analysis - includes Box-on-Goal dependencies
-        Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(activeGoals, level, state);
+        // CRITICAL FIX: Pass immovable boxes so they are treated as walls, not movable obstacles
+        Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(activeGoals, level, state, taskFilter.immovableBoxes);
         boolean hasCycle = detectCycle(goalDependsOn, activeGoals);
         
         // 5. MAPF FIX: Bottleneck detection (path intersection analysis)
@@ -120,8 +121,17 @@ public class LevelAnalyzer {
                                                       numAgents, numGoals, activeGoals);
         
         // 7. Adjust execution order: prioritize goals AT bottleneck positions
+        // NEW GENERIC FIX: Use BFS distance ("fill from back") for topological sort tie-breaking
+        Position root = findOpenSpaceRoot(level, activeGoals, taskFilter.immovableBoxes);
+        Map<Position, Integer> distances = (root != null) ? 
+            computeDistancesFromRoot(level, root, taskFilter.immovableBoxes) : new HashMap<>();
+            
+        // MAPF FIX: Removed adjustOrderForBottlenecks. 
+        // Logic was flawed (executing bottleneck goals first blocks the path).
+        // Reachability analysis (computeGoalDependencies) already handles blocking correctly so
+        // we should rely purely on topological sort + distance tie-breaking.
         List<Position> executionOrder = hasCycle ? activeGoals : 
-            adjustOrderForBottlenecks(topologicalSort(goalDependsOn, activeGoals), bottleneckScores);
+            topologicalSort(goalDependsOn, activeGoals, distances);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
@@ -142,16 +152,24 @@ public class LevelAnalyzer {
     // ========== Goal Dependency Analysis ==========
     
     /**
-     * Computes goal dependencies using Global Reachability analysis.
+     * Reachability-Based Goal Dependency Analysis (非硬编码方法)
      * 
-     * MAPF Standard Terminology:
-     *   - dependsOn.get(A) contains B means: A depends on B (B must complete before A)
-     *   - If filling goal A blocks access to goal B from open space,
-     *     then A depends on B (B must be filled first, while path is still open)
-     *   - Topological sort outputs: dependencies first, then dependents
+     * 核心思想（来自Gemini/SIW理论）：
+     * 不使用BFS层级硬编码，而是通过"假设测试"动态发现依赖关系。
+     * 
+     * 算法：
+     * 对于每对目标 (Gi, Gj)：
+     *   假设在 Gi 位置放置障碍物（模拟 Gi 已被box占据）
+     *   检测从开放空间是否还能到达 Gj
+     *   如果不可达 → Gj 必须在 Gi 之前完成 → Gi 依赖于 Gj
+     * 
+     * 这种方法的优点：
+     * - 不依赖几何坐标或层级
+     * - 基于因果逻辑（Causality）
+     * - 适用于任何地图结构（死胡同、桥梁、机关门等）
      */
     private static Map<Position, Set<Position>> computeGoalDependencies(
-            List<Position> goals, Level level, State state) {
+            List<Position> goals, Level level, State state, Set<Position> immovableBoxes) {
         Map<Position, Set<Position>> dependsOn = new HashMap<>();
         
         // Initialize dependency map
@@ -159,33 +177,163 @@ public class LevelAnalyzer {
             dependsOn.put(g, new HashSet<>());
         }
         
-        // Find root position representing "Main Open Space"
-        Position root = findOpenSpaceRoot(level, goals);
+        if (goals.isEmpty()) return dependsOn;
+        
+        // Find root position representing "Main Open Space" (agent accessible area)
+        // CRITICAL FIX: Treat immovable boxes as walls when finding open space root
+        Position root = findOpenSpaceRoot(level, goals, immovableBoxes);
         if (root == null) {
-            return dependsOn; // Degenerate case
+            System.err.println("[LevelAnalyzer] Warning: No open space root found");
+            return dependsOn;
         }
         
-        // Get current box positions as obstacles (MAPF: consider dynamic state)
-        Set<Position> boxPositions = state.getBoxes().keySet();
-
-        // Build dependency graph
-        for (Position goalA : goals) {
-            for (Position goalB : goals) {
-                if (goalA.equals(goalB)) continue;
+        System.err.println("[LevelAnalyzer] Reachability-based dependency analysis");
+        System.err.println("[LevelAnalyzer] Open space root: " + root);
+        System.err.println("[LevelAnalyzer] Testing " + goals.size() + " goals...");
+        System.err.println("[LevelAnalyzer] Immovable boxes (treated as walls): " + immovableBoxes.size());
+        
+        // Get MOVABLE box positions only (exclude immovable boxes - they are permanent walls)
+        Set<Position> movableBoxPositions = new HashSet<>();
+        for (Position boxPos : state.getBoxes().keySet()) {
+            if (!immovableBoxes.contains(boxPos)) {
+                movableBoxPositions.add(boxPos);
+            }
+        }
+        
+        // Build dependency graph using hypothetical reachability testing
+        // For each pair (Gi, Gj): if blocking Gi makes Gj unreachable, then Gi depends on Gj
+        // 
+        // KEY INSIGHT: We need to check if a BOX can be PUSHED into Gj, not just agent reachability.
+        // A box can be pushed into Gj if agent can reach a position adjacent to Gj 
+        // (to push from) AND there's a path for the box.
+        
+        int dependencyCount = 0;
+        for (Position goalI : goals) {
+            for (Position goalJ : goals) {
+                if (goalI.equals(goalJ)) continue;
                 
-                // Check: Does filling goalA block access to goalB?
-                // If yes, goalB must be filled BEFORE goalA.
-                // So goalA depends on goalB.
-                if (!isReachable(root, goalB, level, goalA, boxPositions)) {
-                    dependsOn.get(goalA).add(goalB);
+                // Hypothetical test: if goalI is filled, can we still push a box into goalJ?
+                // This requires checking if there's at least one push-entry direction available
+                // CRITICAL FIX: Use movableBoxPositions (excludes immovable boxes) and pass immovableBoxes
+                boolean canPushToGoalJ = canPushBoxToGoalWithBlock(goalJ, goalI, level, movableBoxPositions, immovableBoxes, root);
+                
+                if (!canPushToGoalJ) {
+                    // Cannot push to goalJ when goalI is blocked
+                    // Therefore: goalJ must be completed BEFORE goalI
+                    // In dependency terms: goalI depends on goalJ
+                    dependsOn.get(goalI).add(goalJ);
+                    dependencyCount++;
+                    
+                    char charI = level.getBoxGoal(goalI.row, goalI.col);
+                    char charJ = level.getBoxGoal(goalJ.row, goalJ.col);
+                    System.err.println("[DEBUG] " + goalI + "(" + charI + ") depends on " + 
+                                       goalJ + "(" + charJ + ") - blocking " + goalI + " makes " + goalJ + " unreachable for push");
                 }
+            }
+        }
+        System.err.println("[LevelAnalyzer] Found " + dependencyCount + " dependencies");
+        
+        // Debug: Log dependency graph
+        System.err.println("[LevelAnalyzer] Dependency graph (A depends on B means B executes first):");
+        for (Position goal : goals) {
+            Set<Position> deps = dependsOn.get(goal);
+            if (deps != null && !deps.isEmpty()) {
+                char goalChar = level.getBoxGoal(goal.row, goal.col);
+                StringBuilder sb = new StringBuilder();
+                sb.append("[LevelAnalyzer] Dep: ").append(goal).append("(").append(goalChar).append(") depends on: ");
+                for (Position dep : deps) {
+                    char depChar = level.getBoxGoal(dep.row, dep.col);
+                    sb.append(dep).append("(").append(depChar).append(") ");
+                }
+                System.err.println(sb.toString());
             }
         }
         
         return dependsOn;
     }
     
-    private static Position findOpenSpaceRoot(Level level, List<Position> goals) {
+    /**
+     * Checks if a box can be pushed into goalPos when blockedPos is occupied.
+     * 
+     * For push operation to work, agent needs to:
+     * 1. Be adjacent to the box (from the opposite side of push direction)
+     * 2. Push the box into the goal
+     * 
+     * So we check: is there at least one direction from which agent can approach
+     * the goal's adjacent cell (push position) while the block is in place?
+     * 
+     * CRITICAL: immovableBoxes are treated as permanent walls.
+     */
+    private static boolean canPushBoxToGoalWithBlock(Position goalPos, Position blockedPos,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes, Position openSpaceRoot) {
+        
+        // For each possible push direction into the goal
+        for (Direction pushDir : Direction.values()) {
+            // Agent would be on the opposite side of the goal
+            Position agentPushPosition = goalPos.move(pushDir.opposite());
+            
+            // The box would come from where the agent is, pushed into goal
+            // Agent needs to reach agentPushPosition to push
+            
+            if (level.isWall(agentPushPosition)) continue;
+            if (immovableBoxes.contains(agentPushPosition)) continue;  // Immovable box = wall
+            if (agentPushPosition.equals(blockedPos)) continue;  // Blocked
+            
+            // Check if agent can reach the push position with the block in place
+            boolean canReach = isReachableWithHypotheticalBlock(
+                openSpaceRoot, agentPushPosition, level, blockedPos, movableBoxPositions, immovableBoxes);
+            
+            if (canReach) {
+                return true;  // At least one push direction works
+            }
+        }
+        
+        return false;  // No valid push direction available
+    }
+    
+    /**
+     * Checks if target is reachable from start with a hypothetical block at blockedPos.
+     * This simulates "if blockedPos is filled with a box, can we still reach target?"
+     * 
+     * CRITICAL: immovableBoxes are treated as permanent walls (not passable).
+     */
+    private static boolean isReachableWithHypotheticalBlock(Position start, Position target, 
+            Level level, Position blockedPos, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (target.equals(blockedPos)) return false;  // Target itself is blocked
+        if (immovableBoxes.contains(target)) return false;  // Target is an immovable box (wall)
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        q.add(start);
+        visited.add(start);
+        visited.add(blockedPos);  // Treat hypothetically blocked position as impassable
+        visited.addAll(immovableBoxes);  // Treat all immovable boxes as walls
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                // Note: movableBoxPositions are NOT blocking agent movement for reachability
+                // because the agent can push/pull them out of the way.
+                // We only block on: walls, hypothetical block, and immovable boxes (already in visited)
+                if (!level.isWall(next) && !visited.contains(next)) {
+                    visited.add(next);
+                    q.add(next);
+                }
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Finds a root position in the main open space (largest connected component).
+     * CRITICAL: immovableBoxes are treated as permanent walls.
+     */
+    private static Position findOpenSpaceRoot(Level level, List<Position> goals, Set<Position> immovableBoxes) {
         Set<Position> goalSet = new HashSet<>(goals);
         Set<Position> visited = new HashSet<>();
         
@@ -198,6 +346,7 @@ public class LevelAnalyzer {
                 if (level.isWall(r, c)) continue;
                 Position p = new Position(r, c);
                 if (visited.contains(p)) continue;
+                if (immovableBoxes.contains(p)) continue;  // Treat immovable boxes as walls
                 
                 // BFS to explore component
                 int componentSize = 0;
@@ -223,7 +372,7 @@ public class LevelAnalyzer {
                     
                     for (Direction dir : Direction.values()) {
                         Position next = curr.move(dir);
-                        if (!level.isWall(next) && !visited.contains(next)) {
+                        if (!level.isWall(next) && !visited.contains(next) && !immovableBoxes.contains(next)) {
                             visited.add(next);
                             q.add(next);
                         }
@@ -311,16 +460,113 @@ public class LevelAnalyzer {
     
     /**
      * Returns goals in execution order (dependencies first).
+     * 
+     * Uses two-level sorting:
+     * 1. Topological Importance (Dependency-based)
+     * 2. BFS Distance from Root (Distance-based): Furthest goals first
      */
-    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals) {
+    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, Map<Position, Integer> distances) {
         List<Position> result = new ArrayList<>();
         Set<Position> visited = new HashSet<>();
         
+        // Build reverse dependency map: who depends on each goal
+        Map<Position, Set<Position>> dependedBy = new HashMap<>();
         for (Position goal : goals) {
+            dependedBy.put(goal, new HashSet<>());
+        }
+        for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
+            for (Position dep : entry.getValue()) {
+                if (dependedBy.containsKey(dep)) {
+                    dependedBy.get(dep).add(entry.getKey());
+                }
+            }
+        }
+        
+        // Calculate "importance": how many goals (transitively) depend on this goal
+        Map<Position, Integer> importance = new HashMap<>();
+        for (Position goal : goals) {
+            computeImportance(goal, dependedBy, importance, new HashSet<>());
+        }
+        
+        // Sort goals by importance (most important = most depended upon = first)
+        // Tie-breaker: Distance from root (Descending) -> Fill deepest rooms first
+        List<Position> sortedGoals = new ArrayList<>(goals);
+        sortedGoals.sort((a, b) -> {
+            int impA = importance.getOrDefault(a, 0);
+            int impB = importance.getOrDefault(b, 0);
+            if (impA != impB) {
+                return Integer.compare(impB, impA);  // Higher importance first
+            }
+            // Tie-breaker: Furthest distance first
+            int distA = distances.getOrDefault(a, 0);
+            int distB = distances.getOrDefault(b, 0);
+            return Integer.compare(distB, distA);
+        });
+        
+        // Now do topological DFS - dependencies visited before dependents
+        for (Position goal : sortedGoals) {
             topologicalDFS(goal, dependsOn, visited, result);
         }
         
+        // DEBUG: Log topological sort result
+        System.err.println("[LevelAnalyzer] Topological sort result:");
+        for (int i = 0; i < result.size(); i++) {
+            Position p = result.get(i);
+            int dist = distances.getOrDefault(p, -1);
+            System.err.println("[LevelAnalyzer] Topo: " + (i+1) + ". " + p + " (Dist: " + dist + ")");
+        }
+        
         return result;
+    }
+
+    /**
+     * Computes BFS distances from the root to all reachable cells.
+     */
+    private static Map<Position, Integer> computeDistancesFromRoot(Level level, Position root, Set<Position> immovableBoxes) {
+        Map<Position, Integer> distances = new HashMap<>();
+        if (root == null) return distances;
+        
+        Queue<Position> q = new LinkedList<>();
+        q.add(root);
+        distances.put(root, 0);
+        
+        while (!q.isEmpty()) {
+            Position curr = q.poll();
+            int dist = distances.get(curr);
+            
+            for (Direction dir : Direction.values()) {
+                Position next = curr.move(dir);
+                if (!level.isWall(next) && !immovableBoxes.contains(next) && !distances.containsKey(next)) {
+                    distances.put(next, dist + 1);
+                    q.add(next);
+                }
+            }
+        }
+        return distances;
+    }
+    
+    /**
+     * Compute how many goals (transitively) depend on this goal.
+     * Higher value = this goal is more "important" and should be filled earlier.
+     */
+    private static int computeImportance(Position node, Map<Position, Set<Position>> dependedBy,
+                                         Map<Position, Integer> cache, Set<Position> visiting) {
+        if (cache.containsKey(node)) return cache.get(node);
+        if (visiting.contains(node)) return 0;
+        
+        visiting.add(node);
+        
+        int count = 0;
+        Set<Position> dependents = dependedBy.getOrDefault(node, Collections.emptySet());
+        count += dependents.size();  // Direct dependents
+        
+        for (Position dep : dependents) {
+            count += computeImportance(dep, dependedBy, cache, visiting);  // Transitive
+        }
+        
+        visiting.remove(node);
+        cache.put(node, count);
+        return count;
     }
     
     private static void topologicalDFS(Position node, Map<Position, Set<Position>> dependsOn,
