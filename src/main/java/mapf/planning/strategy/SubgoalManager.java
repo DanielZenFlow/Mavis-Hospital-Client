@@ -63,7 +63,8 @@ public class SubgoalManager {
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
                     Color boxColor = level.getBoxColor(goalType);
-                    int agentId = findAgentForColor(boxColor, level, state.getNumAgents());
+                    // MAPF FIX: Choose NEAREST agent instead of first available (index-based)
+                    int agentId = findNearestAgentForColor(boxColor, goalPos, level, state);
                     if (agentId != -1) {
                         unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentId, goalType, goalPos, false));
                     }
@@ -158,6 +159,31 @@ public class SubgoalManager {
         return bestBox;
     }
     
+    /**
+     * Finds the nearest agent of the matching color to the target position.
+     * Uses heuristic distance (Manhattan) for efficiency.
+     */
+    private int findNearestAgentForColor(Color color, Position target, Level level, State state) {
+        int bestAgentId = -1;
+        int minDistance = Integer.MAX_VALUE;
+        int numAgents = state.getNumAgents();
+
+        for (int i = 0; i < numAgents; i++) {
+            if (level.getAgentColor(i) == color) {
+                Position agentPos = state.getAgentPosition(i);
+                // Use heuristic distance (Manhattan) - accurate enough for assignment and fast
+                int dist = agentPos.manhattanDistance(target);
+                
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    bestAgentId = i;
+                }
+            }
+        }
+        return bestAgentId;
+    }
+    
+    /** Legacy method maintained for compilation if referenced elsewhere, but discouraged. */
     private int findAgentForColor(Color color, Level level, int numAgents) {
         for (int i = 0; i < numAgents; i++) {
             if (level.getAgentColor(i) == color) return i;

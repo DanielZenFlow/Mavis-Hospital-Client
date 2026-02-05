@@ -279,18 +279,36 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /**
      * MAPF FIX: Get cached subgoal order or compute once.
      * Priority is fixed at start - only filter out completed goals.
+     * UPDATED: Allows refreshing if list is empty but goal state not reached (Phase 1 -> Phase 2).
      */
     private List<Subgoal> getOrComputeSubgoalOrder(State currentState, Level level) {
         if (cachedSubgoalOrder == null) {
-            // First call: compute and cache the order
-            cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(currentState, level, completedBoxGoals);
-            sortSubgoals(cachedSubgoalOrder, currentState, level);
-            logNormal("[PP] Fixed priority order computed: " + cachedSubgoalOrder.size() + " subgoals");
+            computeAndCacheSubgoals(currentState, level);
         }
         
         // Filter out completed goals from cached order
+        List<Subgoal> remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState);
+        
+        // Fail-safe: If ran out of goals but not at goal state, refresh!
+        // This handles the transition from Box Goals (Phase 1) to Agent Goals (Phase 2)
+        if (remaining.isEmpty() && !currentState.isGoalState(level)) {
+            logNormal("[PP] No subgoals remaining, but not at goal state. Refreshing subgoal list (Phase switch?)");
+            computeAndCacheSubgoals(currentState, level);
+            remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState);
+        }
+        
+        return remaining;
+    }
+    
+    private void computeAndCacheSubgoals(State state, Level level) {
+        cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
+        sortSubgoals(cachedSubgoalOrder, state, level);
+        logNormal("[PP] Subgoal order computed: " + cachedSubgoalOrder.size() + " subgoals");
+    }
+    
+    private List<Subgoal> filterUnsatisfiedSubgoals(List<Subgoal> source, State currentState) {
         List<Subgoal> remaining = new ArrayList<>();
-        for (Subgoal sg : cachedSubgoalOrder) {
+        for (Subgoal sg : source) {
             if (!completedBoxGoals.contains(sg.goalPos)) {
                 // Check if still unsatisfied
                 if (sg.isAgentGoal) {
@@ -316,11 +334,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             for (int i = 0; i < precomputedGoalOrder.size(); i++) {
                 orderMap.put(precomputedGoalOrder.get(i), i);
             }
+            
+            // DEBUG: Show order mapping for subgoals
+            System.err.println("[PP] Sorting " + subgoals.size() + " subgoals with precomputed order:");
+            for (Subgoal sg : subgoals) {
+                int order = orderMap.getOrDefault(sg.goalPos, Integer.MAX_VALUE);
+                System.err.println("  " + sg.goalPos + " (Box " + sg.boxType + ") -> order " + order);
+            }
+            
             subgoals.sort((a, b) -> {
                 int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
                 int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
                 return Integer.compare(orderA, orderB);
             });
+            
+            // DEBUG: Show sorted result
+            System.err.println("[PP] After sorting:");
+            for (int i = 0; i < subgoals.size(); i++) {
+                Subgoal sg = subgoals.get(i);
+                System.err.println("  " + (i+1) + ". " + sg.goalPos + " (Box " + sg.boxType + ")");
+            }
         } else {
             // Fallback: sort by difficulty (easier first)
             final State s = state;
@@ -336,7 +369,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Log the goal execution order for debugging. */
     private void logGoalOrder(List<Subgoal> subgoals) {
         System.err.println("[PP] Goal execution order (" + subgoals.size() + " subgoals):");
-        for (int i = 0; i < Math.min(15, subgoals.size()); i++) {
+        for (int i = 0; i < subgoals.size(); i++) {
             Subgoal sg = subgoals.get(i);
             String desc = sg.isAgentGoal ? "Agent " + sg.agentId : "Box " + sg.boxType;
             System.err.println("  " + (i+1) + ". " + desc + " -> " + sg.goalPos);
