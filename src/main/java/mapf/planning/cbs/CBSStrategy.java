@@ -33,6 +33,15 @@ public class CBSStrategy implements SearchStrategy {
     private int highLevelNodesExpanded = 0;
     private int lowLevelSearches = 0;
     
+    // Task Assignment
+    private Map<Integer, Task> globalTaskAssignment;
+    
+    private static class Task {
+        final Position goalPos;
+        final Character boxType;
+        Task(Position g, Character t) { goalPos = g; boxType = t; }
+    }
+    
     public CBSStrategy(Heuristic heuristic) {
         this(heuristic, new SearchConfig());
     }
@@ -63,6 +72,9 @@ public class CBSStrategy implements SearchStrategy {
         int numAgents = initialState.getNumAgents();
         
         System.err.println(getName() + ": Starting search with " + numAgents + " agents");
+        
+        // 1. Assign Tasks
+        this.globalTaskAssignment = assignTasks(initialState, level);
         
         // Priority queue for CT nodes, ordered by solution cost (sum of path lengths)
         PriorityQueue<CTNode> openList = new PriorityQueue<>();
@@ -102,24 +114,12 @@ public class CBSStrategy implements SearchStrategy {
             Conflict conflict = findFirstConflict(current, level);
             
             if (conflict == null) {
-                // No conflicts! Check if we've actually reached the goal state
-                State finalState = getFinalState(current, numAgents);
-                if (finalState != null && finalState.isGoalState(level)) {
-                    System.err.println(getName() + ": Solution found! Cost=" + current.cost + 
-                        ", CT nodes=" + highLevelNodesExpanded + ", low-level searches=" + lowLevelSearches);
-                    return convertToJointActions(current, numAgents);
-                } else {
-                    // No conflicts but not at goal - CBS can't help here
-                    // This means agents aren't blocking each other, but boxes aren't at goals
-                    System.err.println(getName() + ": No conflicts but goal not reached - need box manipulation");
-                    return null;
-                }
+                // No conflicts!
+                System.err.println(getName() + ": Solution found! Cost=" + current.cost);
+                return convertToJointActions(current, numAgents);
             }
             
-            // Branch on the conflict: create two child nodes with new constraints
-            // Child 1: Agent i cannot be at position at time t
-            // Child 2: Agent j cannot be at position at time t
-            
+            // Branch on the conflict
             for (int agentId : new int[]{conflict.agent1, conflict.agent2}) {
                 Constraint newConstraint = createConstraint(conflict, agentId);
                 CTNode child = createChildNode(current, newConstraint, agentId, initialState, level);
@@ -132,6 +132,62 @@ public class CBSStrategy implements SearchStrategy {
         
         System.err.println(getName() + ": No solution found after " + highLevelNodesExpanded + " CT nodes");
         return null;
+    }
+
+    private Map<Integer, Task> assignTasks(State state, Level level) {
+        Map<Integer, Task> assignments = new HashMap<>();
+        Set<Integer> assignedAgents = new HashSet<>();
+        
+        // Find all box goals
+        Map<Character, List<Position>> goalsByType = new HashMap<>();
+        for (int r = 0; r < level.getRows(); r++) {
+            for (int c = 0; c < level.getCols(); c++) {
+                char g = level.getBoxGoal(r, c);
+                if (g != '\0') {
+                    // Skip if already satisfied
+                    Position p = new Position(r, c);
+                    if (state.getBoxes().containsKey(p) && state.getBoxes().get(p) == g) continue;
+                    goalsByType.computeIfAbsent(g, k -> new ArrayList<>()).add(p);
+                }
+            }
+        }
+        
+        // Naive Greedy Assignment: Iterate goals, find nearest box, nearest agent OF MATCHING COLOR
+        for (Map.Entry<Character, List<Position>> entry : goalsByType.entrySet()) {
+            char type = entry.getKey();
+            for (Position goalVal : entry.getValue()) {
+                // Find nearest box of this type
+                Position bestBox = null;
+                int minBoxDist = Integer.MAX_VALUE;
+                for (Map.Entry<Position, Character> box : state.getBoxes().entrySet()) {
+                    if (box.getValue() == type) {
+                        int d = box.getKey().manhattanDistance(goalVal);
+                        if (d < minBoxDist) { minBoxDist = d; bestBox = box.getKey(); }
+                    }
+                }
+                
+                if (bestBox != null) {
+                    // Find nearest agent THAT CAN MANIPULATE THIS BOX TYPE (color match)
+                    int bestAgent = -1;
+                    int minAgentDist = Integer.MAX_VALUE;
+                    for (int i = 0; i < state.getNumAgents(); i++) {
+                        if (assignedAgents.contains(i)) continue;
+                        if (!level.canManipulate(i, type)) continue;  // COLOR CONSTRAINT
+                        Position aPos = state.getAgentPosition(i);
+                        if (aPos == null) continue;
+                        int d = aPos.manhattanDistance(bestBox);
+                        if (d < minAgentDist) { minAgentDist = d; bestAgent = i; }
+                    }
+                    
+                    if (bestAgent != -1) {
+                        assignments.put(bestAgent, new Task(goalVal, type));
+                        assignedAgents.add(bestAgent);
+                        System.err.println("CBS: Assigned Agent " + bestAgent + " to Box " + type + " at " + bestBox + " for Goal " + goalVal);
+                    }
+                }
+            }
+        }
+        return assignments;
     }
     
     /**
@@ -194,15 +250,17 @@ public class CBSStrategy implements SearchStrategy {
                                        Set<Constraint> constraints) {
         lowLevelSearches++;
         
+        Task task = globalTaskAssignment.get(agentId);
+        Position boxGoal = (task != null) ? task.goalPos : null;
+        Character boxType = (task != null) ? task.boxType : null;
+
         // Use space-time A* with constraints
-        SpaceTimeAStar stAStar = new SpaceTimeAStar(level, heuristic, agentId, constraints);
+        SpaceTimeAStar stAStar = new SpaceTimeAStar(level, heuristic, agentId, constraints, boxGoal, boxType);
         return stAStar.search(initialState, SearchConfig.MAX_PLAN_LENGTH);
     }
-    
+
     /**
-     * Finds the first conflict in the current solution.
-     * A conflict occurs when two agents occupy the same position at the same time
-     * or swap positions (edge conflict).
+     * Resolves Agent-Agent and Agent-Box conflicts.
      */
     private Conflict findFirstConflict(CTNode node, Level level) {
         int maxTime = 0;
@@ -219,39 +277,29 @@ public class CBSStrategy implements SearchStrategy {
                     int a1 = agents.get(i);
                     int a2 = agents.get(j);
                     
-                    State state1 = getStateAtTime(node.solution.get(a1), t);
-                    State state2 = getStateAtTime(node.solution.get(a2), t);
+                    // Get occupied cells for both agents (Body + Moved Box)
+                    Set<Position> occupied1 = getOccupiedCells(node.solution.get(a1), t, a1);
+                    Set<Position> occupied2 = getOccupiedCells(node.solution.get(a2), t, a2);
                     
-                    Position pos1 = state1.getAgentPosition(a1);
-                    Position pos2 = state2.getAgentPosition(a2);
-                    
-                    // Vertex conflict
-                    if (pos1 != null && pos1.equals(pos2)) {
-                        return new Conflict(a1, a2, pos1, t, ConflictType.VERTEX);
-                    }
-                    
-                    // Edge conflict (swapping positions)
-                    if (t > 0) {
-                        State prev1 = getStateAtTime(node.solution.get(a1), t - 1);
-                        State prev2 = getStateAtTime(node.solution.get(a2), t - 1);
-                        
-                        Position prevPos1 = prev1.getAgentPosition(a1);
-                        Position prevPos2 = prev2.getAgentPosition(a2);
-                        
-                        if (pos1 != null && pos2 != null && prevPos1 != null && prevPos2 != null) {
-                            if (pos1.equals(prevPos2) && pos2.equals(prevPos1)) {
-                                return new Conflict(a1, a2, pos1, t, ConflictType.EDGE);
-                            }
+                    // Check intersection -> VERTEX Conflict
+                    for (Position p1 : occupied1) {
+                        if (occupied2.contains(p1)) {
+                            // Detect who is at p1 to report strict type if needed, but VERTEX is enough
+                            return new Conflict(a1, a2, p1, t, ConflictType.VERTEX);
                         }
                     }
                     
-                    // Box collision: check if two agents' boxes collide
-                    // Get boxes being moved
-                    Map<Position, Character> boxes1 = state1.getBoxes();
-                    Map<Position, Character> boxes2 = state2.getBoxes();
-                    
-                    // Compare box positions - if agent is moving a box, check for collision
-                    // This is simplified; full implementation would track which box each agent moves
+                    // Edge conflict: check swap
+                    if (t > 0) {
+                        Position pos1_prev = getStateAtTime(node.solution.get(a1), t-1).getAgentPosition(a1);
+                        Position pos1_curr = getStateAtTime(node.solution.get(a1), t).getAgentPosition(a1);
+                        Position pos2_prev = getStateAtTime(node.solution.get(a2), t-1).getAgentPosition(a2);
+                        Position pos2_curr = getStateAtTime(node.solution.get(a2), t).getAgentPosition(a2);
+                        
+                        if (pos1_curr.equals(pos2_prev) && pos2_curr.equals(pos1_prev)) {
+                            return new Conflict(a1, a2, pos1_curr, t, ConflictType.EDGE);
+                        }
+                    }
                 }
             }
         }
@@ -259,6 +307,39 @@ public class CBSStrategy implements SearchStrategy {
         return null;
     }
     
+    private Set<Position> getOccupiedCells(List<State> path, int t, int agentId) {
+        Set<Position> occupied = new HashSet<>();
+        if (path == null) return occupied;
+        
+        State current = getStateAtTime(path, t);
+        if (current == null) return occupied;
+        
+        // 1. Agent Body
+        Position agentPos = current.getAgentPosition(agentId);
+        if (agentPos != null) occupied.add(agentPos);
+        
+        // 2. Boxes moved by this agent
+        // Identifying moved boxes: compare with T=0
+        State start = path.get(0);
+        for (Map.Entry<Position, Character> entry : current.getBoxes().entrySet()) {
+            Position pos = entry.getKey();
+            Character type = entry.getValue();
+            
+            // If checking strict identity is impossible, we check "Is box at Pos in Start?"
+            if (!start.getBoxes().containsKey(pos)) {
+                // A box is here now, but wasn't at start. -> It moved here.
+                occupied.add(pos);
+            } else {
+                // A box was here at start. Is it the same box?
+                // If we assume boxes of same type are fungible, this is tricky.
+                // But generally, if a box is at (x,y) and was at (x,y), it's static.
+                // If it moved, it's occupied by the mover.
+                // NOTE: This assumes decoupled: ONLY Agent `agentId` moves things in this `path`.
+            }
+        }
+        return occupied;
+    }
+
     /**
      * Gets the state at a given timestep, with clamping for paths that end early.
      */

@@ -75,7 +75,8 @@ public class LevelAnalyzer {
     
     public enum StrategyType {
         SINGLE_AGENT,           // 1 agent: simple A*
-        JOINT_SEARCH,           // 2-3 agents, low coupling: joint A*
+        CBS,                    // 2-10 agents, medium coupling: Conflict-Based Search
+        JOINT_SEARCH,           // 2-3 agents, very high coupling: joint A*
         STRICT_ORDER,           // Strong dependencies: execute in order
         GREEDY_WITH_RETRY,      // General case: greedy + retry on failure
         CYCLE_BREAKER           // Circular dependencies: break cycle first
@@ -843,9 +844,15 @@ public class LevelAnalyzer {
             return StrategyType.STRICT_ORDER;
         }
         
+        if (numAgents <= 10) {
+            // Medium/Low coupling with manageable agent count: CBS is efficient
+            return StrategyType.CBS;
+        }
+
         if (couplingDegree > 0.2 && numAgents <= 4) {
             // Medium coupling with few agents: joint search handles conflicts well
-            return StrategyType.JOINT_SEARCH;
+            // But CBS is generally preferred now.
+            return StrategyType.CBS;
         }
         
         if (numAgents <= 3 && numBottlenecks == 0) {

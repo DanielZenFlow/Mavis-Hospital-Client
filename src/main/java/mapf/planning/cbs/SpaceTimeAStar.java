@@ -22,6 +22,8 @@ public class SpaceTimeAStar {
     private final Heuristic heuristic;
     private final int agentId;
     private final Set<CBSStrategy.Constraint> constraints;
+    private final Position boxGoalPos;
+    private final Character boxGoalType;
     
     /**
      * Node in space-time search.
@@ -60,10 +62,17 @@ public class SpaceTimeAStar {
     
     public SpaceTimeAStar(Level level, Heuristic heuristic, int agentId, 
                           Set<CBSStrategy.Constraint> constraints) {
+        this(level, heuristic, agentId, constraints, null, null);
+    }
+
+    public SpaceTimeAStar(Level level, Heuristic heuristic, int agentId, 
+                          Set<CBSStrategy.Constraint> constraints, Position boxGoalPos, Character boxGoalType) {
         this.level = level;
         this.heuristic = heuristic;
         this.agentId = agentId;
         this.constraints = constraints;
+        this.boxGoalPos = boxGoalPos;
+        this.boxGoalType = boxGoalType;
     }
     
     /**
@@ -147,11 +156,15 @@ public class SpaceTimeAStar {
     
     /**
      * Checks if the agent has reached its goals in this state.
-     * For CBS low-level search, we only check if the agent reaches its position goal.
-     * Box goals are handled at the high level through conflict detection.
+     * Supports both Box Goals (pushing box to target) and Agent Goals (position).
      */
     private boolean isGoalForAgent(State state) {
-        // Find agent's goal position by scanning the level
+        // 1. If assigned a Box Goal, check if satisfied
+        if (boxGoalPos != null && boxGoalType != null) {
+            return boxGoalType.equals(state.getBoxes().get(boxGoalPos));
+        }
+
+        // 2. Fallback: Check Agent Position Goal
         Position agentPos = state.getAgentPosition(agentId);
         
         // Scan for this agent's goal position
@@ -164,8 +177,7 @@ public class SpaceTimeAStar {
             }
         }
         
-        // No position goal for this agent - check if its boxes are at goals
-        // For simplicity in CBS, we consider agent done if it has no position goal
+        // No goals at all for this agent -> assumed done at start
         return true;
     }
     
@@ -175,12 +187,24 @@ public class SpaceTimeAStar {
     private boolean violatesConstraint(State state, int time) {
         Position agentPos = state.getAgentPosition(agentId);
         
+        // Check constraints against Agent Body
+        if (isConstrained(agentPos, time)) return true;
+
+        // Check constraints against Boxes
+        // If the agent places a box at a position that is constrained for this agent, it's a violation.
+        for (Position boxPos : state.getBoxes().keySet()) {
+             if (isConstrained(boxPos, time)) return true;
+        }
+
+        return false;
+    }
+
+    private boolean isConstrained(Position pos, int time) {
         for (CBSStrategy.Constraint c : constraints) {
-            if (c.agentId == agentId && c.time == time && c.position.equals(agentPos)) {
+            if (c.agentId == agentId && c.time == time && c.position.equals(pos)) {
                 return true;
             }
         }
-        
         return false;
     }
     
