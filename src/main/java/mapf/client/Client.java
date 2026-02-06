@@ -56,8 +56,10 @@ public class Client {
     /** Search configuration */
     private final SearchConfig config;
 
-    /** Whether to use Portfolio Controller for strategy selection */
-    public static boolean USE_PORTFOLIO = false;
+    /** Whether to use Portfolio Controller for strategy selection.
+     *  Default: true. Portfolio provides multi-strategy fallback (CBS → PP → greedy).
+     *  Set USE_PORTFOLIO=false env var to fall back to legacy StrategySelector (no fallback). */
+    public static boolean USE_PORTFOLIO = true;
 
     static {
         // Check environment variable to enable new simplified strategy
@@ -67,11 +69,11 @@ public class Client {
             System.err.println("[Client] USE_SIMPLE_STRATEGY enabled via environment variable");
         }
 
-        // Check environment variable to enable Portfolio Controller
+        // Check environment variable to disable Portfolio Controller (for legacy testing)
         String usePortfolio = System.getenv("USE_PORTFOLIO");
-        if ("true".equalsIgnoreCase(usePortfolio)) {
-            USE_PORTFOLIO = true;
-            System.err.println("[Client] USE_PORTFOLIO enabled via environment variable");
+        if ("false".equalsIgnoreCase(usePortfolio)) {
+            USE_PORTFOLIO = false;
+            System.err.println("[Client] USE_PORTFOLIO disabled via environment variable (legacy mode)");
         }
     }
 

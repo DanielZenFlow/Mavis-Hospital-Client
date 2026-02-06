@@ -172,7 +172,7 @@ public class CBSStrategy implements SearchStrategy {
                     int minAgentDist = Integer.MAX_VALUE;
                     for (int i = 0; i < state.getNumAgents(); i++) {
                         if (assignedAgents.contains(i)) continue;
-                        if (!level.canManipulate(i, type)) continue;  // COLOR CONSTRAINT
+                        if (level.getAgentColor(i) != level.getBoxColor(type)) continue;  // COLOR CONSTRAINT
                         Position aPos = state.getAgentPosition(i);
                         if (aPos == null) continue;
                         int d = aPos.manhattanDistance(bestBox);

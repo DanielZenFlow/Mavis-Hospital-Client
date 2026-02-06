@@ -13,7 +13,7 @@ on a grid-based map. The system communicates with a competition server via stdin
 These rules are **non-negotiable** and must never be violated:
 
 1. **Color constraint**: Agents can ONLY push/pull boxes of the **same color**.
-   Use `level.canManipulate(agentId, boxType)` before any agent-box interaction.
+   Use `level.getAgentColor(agentId) == level.getBoxColor(boxType)` before any agent-box interaction.
 2. **Actions**: Move(dir), Push(agentDir, boxDir), Pull(agentDir, boxDir), NoOp.
 3. **Conflicts**: Two agents moving into the same cell → both get NoOp.
    Two agents pushing boxes into the same cell → both get NoOp.
@@ -91,21 +91,24 @@ mapf/
 ## Strategy Selection Flow
 
 ```
-LevelAnalyzer.analyze(level, state)
-    → LevelFeatures { couplingDegree, maxDependencyDepth, hasCycle, ... }
-    → StrategyType recommendation
+Client.searchWithFallback()
+    → PortfolioController.search()  (default, USE_PORTFOLIO=true)
+        → LevelAnalyzer.analyze() → LevelFeatures
+        → buildStrategySequence() → ordered list of (StrategyType, weight)
+        → try each strategy with timeout budget, return first success
 
-StrategySelector.selectStrategy(level, state)
-    SINGLE_AGENT  → SingleAgentStrategy (A*)
-    CBS           → CBSStrategy (2-10 agents, medium coupling)
-    JOINT_SEARCH  → JointAStarStrategy (only if ≤3 agents AND coupling > 0.8)
-    STRICT_ORDER  → PriorityPlanningStrategy (high coupling / deep dependencies)
-    CYCLE_BREAKER → PriorityPlanningStrategy (with CBS fallback)
-    GREEDY_WITH_RETRY → PriorityPlanningStrategy
+Fallback sequences by recommendation:
+    SINGLE_AGENT  → [A*(w=1), A*(w=5)]
+    CBS           → [CBS(w=1), PP(w=1), PP(w=2)]
+    JOINT_SEARCH  → [JointA*(w=1), CBS(w=1), PP(w=1)]
+    STRICT_ORDER  → [PP(w=1), PP(w=2), Greedy(w=5)]
+    CYCLE_BREAKER → [PP(w=1), JointA*(w=2)¹, Greedy(w=5)]
+    GREEDY        → [Greedy(w=1), Greedy(w=2), Greedy(w=5)]
+
+    ¹ Only if ≤4 agents
 ```
 
-**Key decision**: CBS is now preferred over JointA* for most multi-agent cases.
-JointA* state space explodes as O(b^{d·n}) and becomes unusable above 3 agents.
+Legacy path: `USE_PORTFOLIO=false` env var → StrategySelector (single strategy, no fallback).
 
 ## Key Algorithms
 
@@ -183,8 +186,9 @@ ARCHITECTURE.md suggests adding `h_conflicts` — not yet implemented.
 ### Adding a new strategy
 1. Implement `SearchStrategy` interface: `search(State, Level) → List<Action[]>`
 2. Add enum value to `LevelAnalyzer.StrategyType`
-3. Add case in `StrategySelector.selectStrategy()`
-4. Set timeout/maxStates via `setTimeout()` / `setMaxStates()`
+3. Add case in `PortfolioController.buildStrategySequence()` (fallback sequence)
+4. Add case in `PortfolioController.createStrategy()` (instantiation)
+5. Set timeout/maxStates via `setTimeout()` / `setMaxStates()`
 
 ### Testing a level
 ```bash
@@ -201,11 +205,13 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 ## Known Issues and TODOs
 
 ### P0 — Must Fix
-- [ ] Multi-strategy fallback: currently single strategy per run, should cascade
-      (e.g., CBS timeout → PriorityPlanning → SimplePriority)
+- [x] Multi-strategy fallback: PortfolioController is now default entry point.
+      CBS → PP → Greedy cascade with timeout budget.
 - [ ] Weighted A* fallback: w=1.0 first, timeout → w=1.5 retry
 
 ### P1 — Should Fix
+- [ ] Agent-level dependency analysis: map goal deps → agent deps via color/reachability,
+      detect cross-agent push-route conflicts, enable independent subproblem decomposition
 - [ ] Simple deadlock pruning: reject Push into corners/edges with no exit
       (ARCHITECTURE.md: "don't push boxes into corners")
 - [ ] Conflict-aware heuristic: h += estimated conflict resolution cost

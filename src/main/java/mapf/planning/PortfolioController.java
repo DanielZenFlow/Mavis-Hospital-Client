@@ -4,6 +4,7 @@ import mapf.domain.*;
 import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer.LevelFeatures;
 import mapf.planning.analysis.LevelAnalyzer.StrategyType;
+import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
@@ -134,11 +135,18 @@ public class PortfolioController implements SearchStrategy {
                 strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0));
                 break;
                 
+            case CBS:
+                // CBS preferred for 2-10 agents with moderate coupling
+                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0));
+                // Fallback to priority planning if CBS times out
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 2.0));
+                break;
+                
             case JOINT_SEARCH:
-                // Few agents, try joint search first
+                // Few agents with very high coupling: try joint search, then CBS, then PP
                 strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 2.0));
-                // Fallback to priority planning
+                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0));
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0));
                 break;
                 
@@ -205,6 +213,10 @@ public class PortfolioController implements SearchStrategy {
                 SingleAgentStrategy singleAgent = new SingleAgentStrategy(heuristic, strategyConfig);
                 singleAgent.setWeight(config.weight);
                 return singleAgent;
+                
+            case CBS:
+                CBSStrategy cbs = new CBSStrategy(heuristic, strategyConfig);
+                return cbs;
                 
             case JOINT_SEARCH:
                 JointAStarStrategy jointAStar = new JointAStarStrategy(heuristic, strategyConfig);
