@@ -443,7 +443,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Parking moves it off the goal position, causing it to be re-added to
                     // unsatisfied subgoals next iteration → infinite loop (park ↔ re-solve).
                     if (!subgoal.isAgentGoal) {
-                        tempState = parkAgentAfterSubgoal(subgoal.agentId, tempState, level, fullPlan, numAgents);
+                        // Pass remaining subgoals for task-aware critical path checking
+                        List<Subgoal> remainingSubgoals = new ArrayList<>();
+                        for (Subgoal sg : subgoals) {
+                            if (sg != subgoal) remainingSubgoals.add(sg);
+                        }
+                        tempState = parkAgentAfterSubgoal(subgoal.agentId, tempState, level, fullPlan, numAgents, remainingSubgoals);
                     }
                     
                     // Track phantom progress: re-solving an agent goal that was already done
@@ -493,28 +498,58 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * - Other agent positions
      */
     private State parkAgentAfterSubgoal(int agentId, State state, Level level, 
-            List<Action[]> fullPlan, int numAgents) {
+            List<Action[]> fullPlan, int numAgents, List<Subgoal> pendingSubgoals) {
         Position agentPos = state.getAgentPosition(agentId);
         
         // Check if agent is already at a safe position:
         // Not on a goal, not in a corridor (2 passable neighbors = corridor)
+        // TASK-AWARE FIX: Also check if agent is on the critical path of any pending subgoal
         boolean onBoxGoal = level.getBoxGoal(agentPos) != '\0';
         boolean onAgentGoal = level.getAgentGoal(agentPos.row, agentPos.col) >= 0;
         boolean inCorridor = pathAnalyzer.isInCorridor(agentPos, level);
+        boolean onCriticalPath = isOnPendingSubgoalCriticalPath(agentPos, agentId, pendingSubgoals, state, level);
         
-        if (!onBoxGoal && !onAgentGoal && !inCorridor) {
+        if (!onBoxGoal && !onAgentGoal && !inCorridor && !onCriticalPath) {
             return state; // Already in a safe parking spot
         }
+        
+        logNormal("[PP] Yielding agent " + agentId + " from " + agentPos
+                + " (onBoxGoal=" + onBoxGoal + ", onAgentGoal=" + onAgentGoal 
+                + ", inCorridor=" + inCorridor + ", onCriticalPath=" + onCriticalPath + ")");
         
         // Compute positions to avoid: all frozen/completed goal positions
         Set<Position> satisfiedGoals = GoalChecker.computeSatisfiedGoalPositions(state, level);
         satisfiedGoals.addAll(completedBoxGoals);
         
-        // Critical positions: other agents' current and goal positions
+        // Critical positions: other agents' current positions + pending subgoal paths
         Set<Position> criticalPositions = new HashSet<>();
         for (int i = 0; i < numAgents; i++) {
             if (i == agentId) continue;
             criticalPositions.add(state.getAgentPosition(i));
+        }
+        
+        // Also add critical positions from pending subgoals so parking doesn't block them
+        for (Subgoal sg : pendingSubgoals) {
+            if (sg.isAgentGoal) {
+                criticalPositions.add(sg.goalPos);
+            } else {
+                criticalPositions.add(sg.goalPos);
+                Position boxPos = subgoalManager.findBestBoxForGoal(sg, state, level);
+                if (boxPos != null) {
+                    List<Position> boxPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                            boxPos, sg.goalPos, level);
+                    if (boxPath != null) {
+                        criticalPositions.addAll(boxPath);
+                        // Add adjacent cells (agent push positions)
+                        for (Position p : boxPath) {
+                            for (Direction dir : Direction.values()) {
+                                Position adj = p.move(dir);
+                                if (!level.isWall(adj)) criticalPositions.add(adj);
+                            }
+                        }
+                    }
+                }
+            }
         }
         
         // Find parking position using PathAnalyzer's existing logic
@@ -555,6 +590,80 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return tempState;
     }
     
+    /**
+     * Task-aware critical path check: determines if an agent's current position
+     * lies on the critical path of any pending (not yet completed) subgoal.
+     * 
+     * This is the key improvement over position-based-only yielding: even if an
+     * agent is in an open area (not on a goal, not in a corridor), it may still
+     * block a future box-to-goal or agent-to-box path. By checking against all
+     * remaining subgoals, we proactively move the agent before BSP even attempts
+     * to plan around it.
+     * 
+     * @param agentPos       Current position of the agent
+     * @param agentId        ID of the agent being checked
+     * @param pendingSubgoals List of subgoals not yet completed
+     * @param state          Current world state
+     * @param level          Level definition
+     * @return true if the agent is on the critical path of at least one pending subgoal
+     */
+    private boolean isOnPendingSubgoalCriticalPath(Position agentPos, int agentId,
+            List<Subgoal> pendingSubgoals, State state, Level level) {
+        if (pendingSubgoals == null || pendingSubgoals.isEmpty()) {
+            return false;
+        }
+        
+        for (Subgoal sg : pendingSubgoals) {
+            if (sg.isAgentGoal) {
+                // Agent goal: check if position is on agent's path to its goal
+                Position otherAgentPos = state.getAgentPosition(sg.agentId);
+                List<Position> path = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                        otherAgentPos, sg.goalPos, level);
+                if (path != null && path.contains(agentPos)) {
+                    logVerbose("[PP] Agent " + agentId + " at " + agentPos 
+                            + " is on critical path for Agent " + sg.agentId + " goal " + sg.goalPos);
+                    return true;
+                }
+            } else {
+                // Box goal: check both agent-to-box path AND box-to-goal path
+                Position boxPos = subgoalManager.findBestBoxForGoal(sg, state, level);
+                if (boxPos == null) continue;
+                
+                // Check box-to-goal path (and adjacent cells, since agent pushes from beside)
+                List<Position> boxPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                        boxPos, sg.goalPos, level);
+                if (boxPath != null) {
+                    for (Position p : boxPath) {
+                        if (p.equals(agentPos)) {
+                            logVerbose("[PP] Agent " + agentId + " at " + agentPos 
+                                    + " is on box-to-goal path for Box " + sg.boxType + " -> " + sg.goalPos);
+                            return true;
+                        }
+                        // Also check adjacent cells (agent needs to stand next to box to push)
+                        for (Direction dir : Direction.values()) {
+                            if (p.move(dir).equals(agentPos)) {
+                                logVerbose("[PP] Agent " + agentId + " at " + agentPos 
+                                        + " is adjacent to box path for Box " + sg.boxType + " -> " + sg.goalPos);
+                                return true;
+                            }
+                        }
+                    }
+                }
+                
+                // Check agent-to-box path (the agent assigned to this subgoal must reach the box)
+                Position sgAgentPos = state.getAgentPosition(sg.agentId);
+                List<Position> agentToBox = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                        sgAgentPos, boxPos, level);
+                if (agentToBox != null && agentToBox.contains(agentPos)) {
+                    logVerbose("[PP] Agent " + agentId + " at " + agentPos 
+                            + " is on agent-to-box path for Agent " + sg.agentId + " -> Box " + sg.boxType);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** Get direction from one position to adjacent position. */
     private Direction getDirection(Position from, Position to) {
         int dRow = to.row - from.row;
