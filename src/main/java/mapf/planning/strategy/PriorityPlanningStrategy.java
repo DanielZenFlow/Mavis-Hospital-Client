@@ -340,14 +340,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         
         // Filter out completed goals from cached order
-        List<Subgoal> remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState);
+        List<Subgoal> remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState, level);
         
         // Fail-safe: If ran out of goals but not at goal state, refresh!
         // This handles the transition from Box Goals (Phase 1) to Agent Goals (Phase 2)
         if (remaining.isEmpty() && !currentState.isGoalState(level)) {
             logNormal("[PP] No subgoals remaining, but not at goal state. Refreshing subgoal list (Phase switch?)");
             computeAndCacheSubgoals(currentState, level);
-            remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState);
+            remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState, level);
         }
         
         return remaining;
@@ -359,25 +359,53 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         logNormal("[PP] Subgoal order computed: " + cachedSubgoalOrder.size() + " subgoals");
     }
     
-    private List<Subgoal> filterUnsatisfiedSubgoals(List<Subgoal> source, State currentState) {
+    private List<Subgoal> filterUnsatisfiedSubgoals(List<Subgoal> source, State currentState, Level level) {
         List<Subgoal> remaining = new ArrayList<>();
         for (Subgoal sg : source) {
-            if (!completedBoxGoals.contains(sg.goalPos)) {
-                // Check if still unsatisfied
-                if (sg.isAgentGoal) {
-                    Position agentPos = currentState.getAgentPosition(sg.agentId);
-                    if (!agentPos.equals(sg.goalPos)) {
-                        remaining.add(sg);
-                    }
-                } else {
-                    Character boxAtGoal = currentState.getBoxes().get(sg.goalPos);
-                    if (boxAtGoal == null || boxAtGoal != sg.boxType) {
-                        remaining.add(sg);
-                    }
+            // MAPF FIX: Basic satisfaction check + strict dependency check
+            if (completedBoxGoals.contains(sg.goalPos)) continue;
+            
+            // Check if dependencies are met (Strict Ordering Enforcement)
+            if (!areDependenciesMet(sg.goalPos, level)) {
+                continue;
+            }
+
+            if (sg.isAgentGoal) {
+                // For agent goals, we check if current position matches goal
+                Position agentPos = currentState.getAgentPosition(sg.agentId);
+                if (!agentPos.equals(sg.goalPos)) {
+                    remaining.add(sg);
+                }
+            } else {
+                Character boxAtGoal = currentState.getBoxes().get(sg.goalPos);
+                if (boxAtGoal == null || boxAtGoal != sg.boxType) {
+                    remaining.add(sg);
                 }
             }
         }
         return remaining;
+    }
+
+    /**
+     * Checks if all dependencies for a goal are satisfied.
+     * A dependency is satisfied if the prerequisite goal is completed.
+     */
+    private boolean areDependenciesMet(Position goal, Level level) {
+        Set<Position> deps = goalDependsOn.get(goal);
+        if (deps == null || deps.isEmpty()) return true;
+
+        for (Position dep : deps) {
+            boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
+            if (isBoxGoal) {
+                if (!completedBoxGoals.contains(dep)) return false;
+            } else {
+                // Agent dependency: less common, but check if satisfied
+                // Note: completedAgentGoals tracks *ever* completed, but agent might move.
+                // However, for dependency logic, we assume "Completed" means "Done".
+                if (!completedAgentGoals.contains(dep)) return false;
+            }
+        }
+        return true;
     }
     
     /** Sort subgoals based on the current OrderingMode. */
@@ -474,7 +502,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             State currentState, Level level, int numAgents, State initialState) {
         
         for (Subgoal subgoal : subgoals) {
-            List<Action> path = planSubgoal(subgoal, currentState, level);
+            // Task-Aware: Pass the full list of subgoals for global allocation checking
+            List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);
             
             if (path != null && !path.isEmpty()) {
                 
@@ -602,7 +631,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 criticalPositions.add(sg.goalPos);
             } else {
                 criticalPositions.add(sg.goalPos);
-                Position boxPos = subgoalManager.findBestBoxForGoal(sg, state, level);
+                // Task-Aware: Use globally valid box allocation for critical path checking
+                Position boxPos = subgoalManager.findBestBoxForGoal(sg, state, level, pendingSubgoals);
                 if (boxPos != null) {
                     List<Position> boxPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
                             boxPos, sg.goalPos, level);
@@ -743,11 +773,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     /** Plan path for a single subgoal. Uses Space-Time A* by default for MAPF compliance. */
-    private List<Action> planSubgoal(Subgoal subgoal, State state, Level level) {
+    private List<Action> planSubgoal(Subgoal subgoal, State state, Level level, List<Subgoal> allSubgoals) {
         if (subgoal.isAgentGoal) {
             return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
         } else {
-            Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level);
+            // Task-Aware Allocation: Pass all remaining subgoals to ensure global feasibility
+            Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals);
             if (boxPos == null) {
                 return null;
             }
@@ -957,7 +988,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Strategy 3: Random reorder and retry
         Collections.shuffle(subgoals, random);
         for (Subgoal sg : subgoals) {
-            List<Action> path = planSubgoal(sg, currentState, level);
+            List<Action> path = planSubgoal(sg, currentState, level, subgoals);
             if (path != null && !path.isEmpty()) {
                 State tempState = currentState;
                 for (Action action : path) {

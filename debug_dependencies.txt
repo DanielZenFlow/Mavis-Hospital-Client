@@ -1,0 +1,8 @@
+[LevelAnalyzer] Reachability-based dependency analysis for 41 goals
+[LevelAnalyzer] Found 7 dependencies
+(2,26)(D) depends on: (1,26)(C) 
+(2,28)(D) depends on: (1,28)(C) 
+(2,30)(D) depends on: (1,30)(C) 
+(4,9)(J) depends on: (4,8)(J) 
+(6,9)(K) depends on: (6,8)(K) 
+(6,10)(K) depends on: (6,8)(K) (6,9)(K) 

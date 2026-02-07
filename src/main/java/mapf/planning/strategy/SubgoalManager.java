@@ -149,12 +149,23 @@ public class SubgoalManager {
     }
     
     public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level) {
+        return findBestBoxForGoal(subgoal, state, level, Collections.emptyList());
+    }
+
+    /**
+     * Finds the best box for a goal, ensuring that the assignment doesn't leave other goals unsolvable.
+     * Uses Bipartite Matching to verify feasibility (Global Allocation Check).
+     */
+    public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals) {
         Position bestBox = null;
         int bestTotalDist = Integer.MAX_VALUE;
         Position agentPos = state.getAgentPosition(subgoal.agentId);
         
         Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
         
+        // Collect all valid candidates first
+        List<BoxCandidate> candidates = new ArrayList<>();
+
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
             if (entry.getValue() != subgoal.boxType) continue;
             
@@ -167,8 +178,6 @@ public class SubgoalManager {
             if (immovableBoxes.contains(boxPos)) continue;
             
             // Pukoban fix: check box has at least one direction where push or pull is possible
-            // Push: agent on one side, empty on the other -> needs two opposite-side free neighbors
-            // Pull: agent adjacent, agent can move away -> needs at least one free neighbor for agent
             if (!isBoxMovable(boxPos, state, level)) continue;
             
             // Check if agent can reach box
@@ -179,13 +188,161 @@ public class SubgoalManager {
             if (boxToGoal == Integer.MAX_VALUE) continue;
             
             int totalDist = agentToBox + boxToGoal;
-            if (totalDist < bestTotalDist) {
-                bestTotalDist = totalDist;
-                bestBox = boxPos;
+            candidates.add(new BoxCandidate(boxPos, totalDist));
+        }
+
+        // Sort by distance (greedy preference)
+        candidates.sort(Comparator.comparingInt(c -> c.dist));
+
+        // Iterate candidates and check feasibility
+        for (BoxCandidate candidate : candidates) {
+            // Task-Aware Allocation: Check if using this box leaves other goals solvable
+            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
+                return candidate.pos;
+            } else {
+                if (mapf.planning.SearchConfig.isVerbose()) {
+                    System.err.println("[SubgoalManager] Allocation rejected: Box " + candidate.pos 
+                        + " for " + subgoal.goalPos + " would block other " + subgoal.boxType + " goals.");
+                }
+            }
+        }
+
+        // Fallback: If strict feasibility check fails for ALL (e.g. tight spacing), 
+        // return NULL to indicate this goal cannot be safely served yet.
+        // This allows PriorityPlanningStrategy to skip this goal and try others (Dynamic Reordering).
+        if (!candidates.isEmpty()) {
+            if (mapf.planning.SearchConfig.isNormal()) {
+                System.err.println("[SubgoalManager] All " + candidates.size() + " candidates for " + subgoal.goalPos 
+                    + " rejected by global feasibility check. Deferring goal.");
+            }
+            return null;
+        }
+        
+        return null;
+    }
+
+    private static class BoxCandidate {
+        Position pos;
+        int dist;
+        BoxCandidate(Position p, int d) { pos = p; dist = d; }
+    }
+
+    /**
+     * Checks if assigning candidateBox to currentSubgoal leaves a valid assignment for all 
+     * other pending subgoals of the SAME type.
+     */
+    private boolean isAllocationFeasible(Position candidateBox, PriorityPlanningStrategy.Subgoal currentSubgoal, 
+                                         State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals) {
+        if (allPendingSubgoals == null || allPendingSubgoals.isEmpty()) return true;
+
+        // 1. Identify remaining goals of same type
+        List<Position> remainingGoals = new ArrayList<>();
+        for (PriorityPlanningStrategy.Subgoal sg : allPendingSubgoals) {
+            if (sg != currentSubgoal && !sg.isAgentGoal && sg.boxType == currentSubgoal.boxType) {
+                remainingGoals.add(sg.goalPos);
             }
         }
         
-        return bestBox;
+        if (remainingGoals.isEmpty()) return true; // No other goals of this type, trivial yes
+
+        // 2. Identify remaining boxes of same type (excluding candidateBox)
+        List<Position> remainingBoxes = new ArrayList<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() == currentSubgoal.boxType) {
+                Position p = entry.getKey();
+                // Exclude the box we are planning to use
+                if (!p.equals(candidateBox)) {
+                    // Exclude boxes already at correct goals (they verify themselves)
+                    if (level.getBoxGoal(p) != currentSubgoal.boxType) {
+                        remainingBoxes.add(p);
+                    }
+                }
+            }
+        }
+
+        // If fewer boxes than goals, obviously infeasible (but shouldn't happen in valid level)
+        if (remainingBoxes.size() < remainingGoals.size()) return false;
+
+        // 3. Build Reachability Graph (Bipartite)
+        // Constraints:
+        // - candidateBox is GONE (already removed from remainingBoxes)
+        // - currentSubgoal.goalPos is BLOCKED (it will be filled)
+        // - Existing immovable boxes are BLOCKED
+        // - Agents? We assume agent can move almost anywhere reachable. 
+        //   We check box-path reachability.
+        
+        Set<Position> obstacles = new HashSet<>(immovableDetector.getImmovableBoxes(state, level));
+        obstacles.add(currentSubgoal.goalPos); // The goal we are filling becomes an obstacle
+
+        // Adjacency: goals -> reachable boxes
+        Map<Position, List<Position>> adj = new HashMap<>();
+        for (Position g : remainingGoals) {
+            List<Position> reachable = new ArrayList<>();
+            for (Position b : remainingBoxes) {
+                if (isReachable(b, g, obstacles, level)) {
+                    reachable.add(b);
+                }
+            }
+            adj.put(g, reachable);
+            if (reachable.isEmpty()) return false; // Optimization: goal unreachable by ANY box
+        }
+
+        // 4. Max Bipartite Matching
+        // goal -> box matching
+        return canMatchAll(remainingGoals, remainingBoxes, adj);
+    }
+    
+    // Simple BFS for reachability with custom obstacles
+    private boolean isReachable(Position from, Position to, Set<Position> obstacles, Level level) {
+        if (from.equals(to)) return true;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        q.add(from);
+        visited.add(from);
+        
+        while(!q.isEmpty()) {
+            Position cur = q.poll();
+            if (cur.equals(to)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = cur.move(dir);
+                if (!level.isWall(next) && !obstacles.contains(next) && !visited.contains(next)) {
+                    visited.add(next);
+                    q.add(next);
+                }
+            }
+        }
+        return false;
+    }
+
+    // Maximum Bipartite Matching (Hopcroft-Karp or simply augmenting paths for small graphs)
+    private boolean canMatchAll(List<Position> goals, List<Position> boxes, Map<Position, List<Position>> adj) {
+        Map<Position, Position> match = new HashMap<>(); // goal -> box (not needed actually, we need box->goal)
+        Map<Position, Position> boxMatch = new HashMap<>(); // box -> matching goal
+        
+        int matches = 0;
+        for (Position goal : goals) {
+            Set<Position> visitedBoxes = new HashSet<>();
+            if (dfsMatch(goal, visitedBoxes, boxMatch, adj)) {
+                matches++;
+            }
+        }
+        return matches == goals.size();
+    }
+
+    private boolean dfsMatch(Position goal, Set<Position> visitedBoxes, Map<Position, Position> boxMatch, Map<Position, List<Position>> adj) {
+        for (Position box : adj.getOrDefault(goal, Collections.emptyList())) {
+            if (visitedBoxes.contains(box)) continue;
+            visitedBoxes.add(box);
+            
+            Position assignedGoal = boxMatch.get(box);
+            if (assignedGoal == null || dfsMatch(assignedGoal, visitedBoxes, boxMatch, adj)) {
+                boxMatch.put(box, goal);
+                return true;
+            }
+        }
+        return false;
     }
     
     /**
@@ -219,7 +376,7 @@ public class SubgoalManager {
     
     /**
      * Finds the nearest agent of the matching color to the target position.
-     * Uses heuristic distance (Manhattan) for efficiency.
+     * Uses connectivity-aware BFS distance instead of Manhattan.
      */
     private int findNearestAgentForColor(Color color, Position target, Level level, State state) {
         int bestAgentId = -1;
@@ -229,8 +386,11 @@ public class SubgoalManager {
         for (int i = 0; i < numAgents; i++) {
             if (level.getAgentColor(i) == color) {
                 Position agentPos = state.getAgentPosition(i);
-                // Use heuristic distance (Manhattan) - accurate enough for assignment and fast
-                int dist = agentPos.manhattanDistance(target);
+                
+                // FIX: Use reachable distance instead of Manhattan logic
+                // This prevents assigning tasks to agents in disconnected components (e.g., trapped in rooms).
+                // getDistanceWithImmovableBoxes returns MAX_VALUE if unreachable.
+                int dist = immovableDetector.getDistanceWithImmovableBoxes(agentPos, target, state, level);
                 
                 if (dist < minDistance) {
                     minDistance = dist;
@@ -251,14 +411,23 @@ public class SubgoalManager {
     
     private boolean hasCompletedBoxTasks(int agentId, State state, Level level) {
         Color agentColor = level.getAgentColor(agentId);
+        Position agentPos = state.getAgentPosition(agentId);
+
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
                     Position goalPos = new Position(row, col);
                     Character actualBox = state.getBoxes().get(goalPos);
+                    
+                    // If goal is not satisfied...
                     if (actualBox == null || actualBox != goalType) {
-                        return false;
+                        // FIX: Only consider it "my task" if I can actually reach the goal area.
+                        // If the goal is in a disconnected component (e.g. locked room), 
+                        // I shouldn't wait for it.
+                        if (immovableDetector.getDistanceWithImmovableBoxes(agentPos, goalPos, state, level) != Integer.MAX_VALUE) {
+                            return false; // Found a reachable, unsatisfied goal of my color
+                        }
                     }
                 }
             }
