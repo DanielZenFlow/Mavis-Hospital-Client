@@ -193,12 +193,27 @@ public class LevelAnalyzer {
         System.err.println("[LevelAnalyzer] Testing " + goals.size() + " goals...");
         System.err.println("[LevelAnalyzer] Immovable boxes (treated as walls): " + immovableBoxes.size());
         
-        // Get MOVABLE box positions only (exclude immovable boxes - they are permanent walls)
-        Set<Position> movableBoxPositions = new HashSet<>();
-        for (Position boxPos : state.getBoxes().keySet()) {
-            if (!immovableBoxes.contains(boxPos)) {
-                movableBoxPositions.add(boxPos);
+        // COLOR-AWARE FIX: Pre-compute per-color effective impassable box sets.
+        // An agent of color X can only push boxes of color X.
+        // Boxes of OTHER colors are impassable obstacles for that agent.
+        // This prevents false dependencies (e.g., blue agent assumed to push through orange boxes).
+        Map<Color, Set<Position>> effectiveImpassableByColor = new HashMap<>();
+        for (Map.Entry<Position, Character> boxEntry : state.getBoxes().entrySet()) {
+            Position boxPos = boxEntry.getKey();
+            if (immovableBoxes.contains(boxPos)) continue; // Already globally impassable
+            Color boxColor = level.getBoxColor(boxEntry.getValue());
+            // This box is impassable for agents of EVERY OTHER color
+            for (Color agentColor : Color.values()) {
+                if (agentColor != boxColor) {
+                    effectiveImpassableByColor
+                        .computeIfAbsent(agentColor, k -> new HashSet<>(immovableBoxes))
+                        .add(boxPos);
+                }
             }
+        }
+        // Ensure every color has at least the base immovable set
+        for (Color c : Color.values()) {
+            effectiveImpassableByColor.putIfAbsent(c, new HashSet<>(immovableBoxes));
         }
         
         // Build dependency graph using hypothetical reachability testing
@@ -207,19 +222,48 @@ public class LevelAnalyzer {
         // KEY INSIGHT: We need to check if a BOX can be PUSHED into Gj, not just agent reachability.
         // A box can be pushed into Gj if agent can reach a position adjacent to Gj 
         // (to push from) AND there's a path for the box.
+        // COLOR-AWARE: The agent servicing goalJ can only push same-color boxes.
+        // LOCAL ROOT: Each goal uses a root within its own connected component (under color
+        // constraints), avoiding false dependencies when cross-color boxes split the map.
         
         int dependencyCount = 0;
-        for (Position goalI : goals) {
-            for (Position goalJ : goals) {
+        for (Position goalJ : goals) {
+            // Determine the color of the agent that services goalJ
+            Color servicingColor = getGoalServicingColor(goalJ, level);
+            Set<Position> effectiveImpassable = (servicingColor != null) 
+                ? effectiveImpassableByColor.get(servicingColor) 
+                : immovableBoxes;
+            
+            // Determine if goalJ is an agent goal vs box goal
+            boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0) 
+                                  && (level.getBoxGoal(goalJ.row, goalJ.col) == '\0');
+            
+            // COLOR-AWARE ROOT: Use a root within goalJ's own connected component.
+            // When cross-color boxes split the map into multiple areas, the global colorRoot
+            // may be in a different component than goalJ. We need a root reachable from goalJ
+            // within the effective impassable constraints.
+            Position localRoot = findLocalRoot(goalJ, level, effectiveImpassable);
+            if (localRoot == null) {
+                // goalJ is completely walled off (on an impassable cell itself) - skip
+                System.err.println("[LevelAnalyzer] Goal " + goalJ + " is on an impassable cell. Skipping.");
+                continue;
+            }
+            
+            for (Position goalI : goals) {
                 if (goalI.equals(goalJ)) continue;
                 
-                // Hypothetical test: if goalI is filled, can we still push a box into goalJ?
-                // This requires checking if there's at least one push-entry direction available
-                // CRITICAL FIX: Use movableBoxPositions (excludes immovable boxes) and pass immovableBoxes
-                boolean canPushToGoalJ = canPushBoxToGoalWithBlock(goalJ, goalI, level, movableBoxPositions, immovableBoxes, root);
+                boolean canReachGoalJ;
+                if (isAgentGoal) {
+                    // Agent goal: agent just needs to WALK to goalJ (no push required)
+                    canReachGoalJ = isReachableWithHypotheticalBlock(
+                        localRoot, goalJ, level, goalI, Collections.emptySet(), effectiveImpassable);
+                } else {
+                    // Box goal: agent needs to PUSH a box into goalJ
+                    canReachGoalJ = canPushBoxToGoalWithBlock(goalJ, goalI, level, Collections.emptySet(), effectiveImpassable, localRoot);
+                }
                 
-                if (!canPushToGoalJ) {
-                    // Cannot push to goalJ when goalI is blocked
+                if (!canReachGoalJ) {
+                    // Cannot reach goalJ when goalI is blocked
                     // Therefore: goalJ must be completed BEFORE goalI
                     // In dependency terms: goalI depends on goalJ
                     dependsOn.get(goalI).add(goalJ);
@@ -227,8 +271,9 @@ public class LevelAnalyzer {
                     
                     char charI = level.getBoxGoal(goalI.row, goalI.col);
                     char charJ = level.getBoxGoal(goalJ.row, goalJ.col);
+                    String typeJ = isAgentGoal ? "agent-walk" : "box-push";
                     System.err.println("[DEBUG] " + goalI + "(" + charI + ") depends on " + 
-                                       goalJ + "(" + charJ + ") - blocking " + goalI + " makes " + goalJ + " unreachable for push");
+                                       goalJ + "(" + charJ + ") - blocking " + goalI + " makes " + goalJ + " unreachable for " + typeJ);
                 }
             }
         }
@@ -254,42 +299,137 @@ public class LevelAnalyzer {
     }
     
     /**
-     * Checks if a box can be pushed into goalPos when blockedPos is occupied.
+     * Determines the color of the agent that services a goal position.
+     * - For box goals: the color of the required box type (agent must match to push)
+     * - For agent goals: the color of the target agent
+     * - Returns null if undetermined
+     */
+    private static Color getGoalServicingColor(Position goalPos, Level level) {
+        char boxGoalType = level.getBoxGoal(goalPos.row, goalPos.col);
+        if (boxGoalType != '\0') {
+            return level.getBoxColor(boxGoalType);
+        }
+        int agentGoal = level.getAgentGoal(goalPos.row, goalPos.col);
+        if (agentGoal >= 0) {
+            return level.getAgentColor(agentGoal);
+        }
+        return null;
+    }
+    
+    /**
+     * Finds a local root within the same connected component as goalPos,
+     * considering effectiveImpassable positions as walls.
+     * Returns a non-goal, high-degree cell in the same component, or goalPos itself
+     * if no better candidate exists. Returns null if goalPos is on an impassable cell.
+     */
+    private static Position findLocalRoot(Position goalPos, Level level, Set<Position> effectiveImpassable) {
+        if (level.isWall(goalPos) || effectiveImpassable.contains(goalPos)) {
+            return null;
+        }
+        
+        // BFS from goalPos to find the best root in its connected component
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        q.add(goalPos);
+        visited.add(goalPos);
+        
+        Position bestRoot = goalPos;
+        int bestNeighbors = 0;
+        
+        while (!q.isEmpty()) {
+            Position curr = q.poll();
+            int neighbors = 0;
+            for (Direction dir : Direction.values()) {
+                Position next = curr.move(dir);
+                if (!level.isWall(next) && !effectiveImpassable.contains(next)) {
+                    neighbors++;
+                    if (!visited.contains(next)) {
+                        visited.add(next);
+                        q.add(next);
+                    }
+                }
+            }
+            // Prefer non-goal cells with high degree
+            if (neighbors > bestNeighbors) {
+                bestNeighbors = neighbors;
+                bestRoot = curr;
+            }
+        }
+        
+        return bestRoot;
+    }
+    
+    /**
+     * Checks if a box can be pushed OR PULLED into goalPos when blockedPos is occupied.
      * 
-     * For push operation to work, agent needs to:
-     * 1. Be adjacent to the box (from the opposite side of push direction)
-     * 2. Push the box into the goal
-     * 
-     * So we check: is there at least one direction from which agent can approach
-     * the goal's adjacent cell (push position) while the block is in place?
+     * Push: agent approaches from opposite side and pushes box into goal.
+     * Pull (Pukoban): agent stands on goalPos, then moves away pulling box onto goalPos.
+     *   - Agent must be able to reach goalPos
+     *   - Box must be adjacent to goalPos (from some direction)
+     *   - Agent must have an exit direction from goalPos (to pull the box in)
      * 
      * CRITICAL: immovableBoxes are treated as permanent walls.
      */
     private static boolean canPushBoxToGoalWithBlock(Position goalPos, Position blockedPos,
             Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes, Position openSpaceRoot) {
         
+        // === CHECK 1: Push paths ===
         // For each possible push direction into the goal
         for (Direction pushDir : Direction.values()) {
             // Agent would be on the opposite side of the goal
             Position agentPushPosition = goalPos.move(pushDir.opposite());
             
-            // The box would come from where the agent is, pushed into goal
-            // Agent needs to reach agentPushPosition to push
-            
             if (level.isWall(agentPushPosition)) continue;
-            if (immovableBoxes.contains(agentPushPosition)) continue;  // Immovable box = wall
-            if (agentPushPosition.equals(blockedPos)) continue;  // Blocked
+            if (immovableBoxes.contains(agentPushPosition)) continue;
+            if (agentPushPosition.equals(blockedPos)) continue;
             
             // Check if agent can reach the push position with the block in place
             boolean canReach = isReachableWithHypotheticalBlock(
                 openSpaceRoot, agentPushPosition, level, blockedPos, movableBoxPositions, immovableBoxes);
             
             if (canReach) {
-                return true;  // At least one push direction works
+                return true;  // Push path works
             }
         }
         
-        return false;  // No valid push direction available
+        // === CHECK 2: Pull paths (Pukoban) ===
+        // For Pull: agent needs to reach goalPos itself, then pull box from adjacent cell.
+        // The box approaches from some adjacent cell; agent stands on goal and moves away,
+        // pulling box onto goalPos.
+        // Requirements:
+        //   1. goalPos is reachable by agent (not blocked, not wall)
+        //   2. At least one adjacent cell of goalPos is not wall/blocked (box can come from there)
+        //   3. Agent has at least one exit direction from goalPos (to move away while pulling)
+        
+        if (!level.isWall(goalPos) && !immovableBoxes.contains(goalPos) && !goalPos.equals(blockedPos)) {
+            boolean agentCanReachGoal = isReachableWithHypotheticalBlock(
+                openSpaceRoot, goalPos, level, blockedPos, movableBoxPositions, immovableBoxes);
+            
+            if (agentCanReachGoal) {
+                // Check that agent has at least one exit direction from goalPos
+                // AND at least one adjacent cell where a box could come from
+                boolean hasExit = false;
+                boolean hasBoxApproach = false;
+                
+                for (Direction dir : Direction.values()) {
+                    Position adjacent = goalPos.move(dir);
+                    if (!level.isWall(adjacent) && !immovableBoxes.contains(adjacent) && !adjacent.equals(blockedPos)) {
+                        hasExit = true;
+                        // Box could come from this direction (agent pulls from opposite side)
+                    }
+                    // Box approach: box could be at an adjacent cell
+                    if (!level.isWall(adjacent) && !adjacent.equals(blockedPos)) {
+                        hasBoxApproach = true;
+                    }
+                }
+                
+                if (hasExit && hasBoxApproach) {
+                    return true;  // Pull path works
+                }
+            }
+        }
+        
+        return false;  // No valid push or pull direction available
     }
     
     /**

@@ -58,16 +58,9 @@ public class ConflictResolver {
     
     /**
      * Applies a joint action to a state.
+     * Per CLAUDE.md: actions are simultaneous — cell occupancy evaluated at START.
      */
     public State applyJointAction(Action[] jointAction, State state, Level level, int numAgents) {
-        State current = state;
-        
-        for (int i = 0; i < numAgents; i++) {
-            if (jointAction[i] != null && jointAction[i].type != Action.ActionType.NOOP) {
-                current = current.apply(jointAction[i], i);
-            }
-        }
-        
-        return current;
+        return state.applyJointAction(jointAction, level);
     }
 }

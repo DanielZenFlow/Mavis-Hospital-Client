@@ -191,12 +191,6 @@ public class AgentCoordinator {
         for (int idleAgent = 0; idleAgent < numAgents; idleAgent++) {
             if (idleAgent == activeAgent)
                 continue;
-            // Only clear agents that have completed their task (not just any idle agent)
-            if (!hasCompletedTask(idleAgent))
-                continue;
-            // Skip agents already yielding (they're already being handled)
-            if (isYielding(idleAgent))
-                continue;
 
             Position idlePos = state.getAgentPosition(idleAgent);
 
@@ -208,15 +202,16 @@ public class AgentCoordinator {
                     List<Action> path = pathAnalyzer.planAgentPath(idleAgent, parkingPos, state, level, numAgents);
 
                     if (path != null && !path.isEmpty()) {
-                        Action clearAction = path.get(0);
-                        Action[] jointAction = new Action[numAgents];
-                        Arrays.fill(jointAction, Action.noOp());
-                        jointAction[idleAgent] = clearAction;
-                        jointAction = conflictResolver.resolveConflicts(jointAction, state, level);
-                        plan.add(jointAction);
-                        
-                        // Store the target position for continued movement
-                        setYieldingTargetPosition(idleAgent, parkingPos);
+                        // Execute the FULL path, not just the first step
+                        State tempState = state;
+                        for (Action moveAction : path) {
+                            Action[] jointAction = new Action[numAgents];
+                            Arrays.fill(jointAction, Action.noOp());
+                            jointAction[idleAgent] = moveAction;
+                            jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level);
+                            plan.add(jointAction);
+                            tempState = tempState.applyJointAction(jointAction, level);
+                        }
                         
                         return ClearingResult.success(idleAgent, parkingPos);
                     }

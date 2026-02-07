@@ -22,7 +22,8 @@ public class SubgoalManager {
     /**
      * Gets all unsatisfied subgoals in priority order.
      * Phase 1: Box goals (excluding already completed ones)
-     * Phase 2: Remaining agent goals (after all boxes placed)
+     * Phase 2: Agent goals for agents whose own-color box tasks are done
+     *          (not deferred until ALL box goals complete)
      */
     public List<PriorityPlanningStrategy.Subgoal> getUnsatisfiedSubgoals(State state, Level level, Set<Position> completedBoxGoals) {
         List<PriorityPlanningStrategy.Subgoal> unsatisfied = new ArrayList<>();
@@ -32,8 +33,14 @@ public class SubgoalManager {
         // Phase 1: Box goals (skip completed ones - MAPF permanent obstacle)
         addBoxGoals(unsatisfied, state, level, staticGoals, completedBoxGoals);
         
-        // Phase 2: Agent goals (only when no box goals remain)
-        if (unsatisfied.isEmpty()) {
+        // Phase 2: Agent goals for agents that have completed their own box tasks.
+        // This allows agent goals to be attempted in parallel with other agents' box goals,
+        // rather than waiting for ALL box goals to complete first.
+        addCompletedAgentGoals(unsatisfied, state, level);
+        
+        // Phase 3: If no box goals remain at all, add ALL remaining agent goals
+        // (catches agent goals for agents that had no box tasks)
+        if (unsatisfied.isEmpty() || !hasAnyBoxGoals(unsatisfied)) {
             addAllAgentGoals(unsatisfied, state, level);
         }
         
@@ -63,9 +70,8 @@ public class SubgoalManager {
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
                     Color boxColor = level.getBoxColor(goalType);
-                    // MAPF FIX: Choose agent based on minimizing (Agent->Box + Box->Goal) cost
-                    // instead of just (Agent->Goal) or (Agent->Box)
-                    int agentId = findBestAgentForTask(boxColor, goalType, goalPos, level, state);
+                    // MAPF FIX: Choose NEAREST agent instead of first available (index-based)
+                    int agentId = findNearestAgentForColor(boxColor, goalPos, level, state);
                     if (agentId != -1) {
                         unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentId, goalType, goalPos, false));
                     }
@@ -91,10 +97,19 @@ public class SubgoalManager {
     
     private void addAllAgentGoals(List<PriorityPlanningStrategy.Subgoal> unsatisfied,
                                  State state, Level level) {
+        // Collect agent IDs already present in the list to avoid duplicates
+        Set<Integer> existingAgentGoals = new HashSet<>();
+        for (PriorityPlanningStrategy.Subgoal sg : unsatisfied) {
+            if (sg.isAgentGoal) {
+                existingAgentGoals.add(sg.agentId);
+            }
+        }
+        
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 int agentGoal = level.getAgentGoal(row, col);
                 if (agentGoal >= 0 && agentGoal < state.getNumAgents()) {
+                    if (existingAgentGoals.contains(agentGoal)) continue; // Already added
                     Position goalPos = new Position(row, col);
                     Position agentPos = state.getAgentPosition(agentGoal);
                     if (!agentPos.equals(goalPos)) {
@@ -103,6 +118,14 @@ public class SubgoalManager {
                 }
             }
         }
+    }
+    
+    /** Checks if the subgoal list contains any box goals. */
+    private boolean hasAnyBoxGoals(List<PriorityPlanningStrategy.Subgoal> subgoals) {
+        for (PriorityPlanningStrategy.Subgoal sg : subgoals) {
+            if (!sg.isAgentGoal) return true;
+        }
+        return false;
     }
     
     public int estimateSubgoalDifficulty(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level) {
@@ -143,6 +166,11 @@ public class SubgoalManager {
             // Skip if box is immovable
             if (immovableBoxes.contains(boxPos)) continue;
             
+            // Pukoban fix: check box has at least one direction where push or pull is possible
+            // Push: agent on one side, empty on the other -> needs two opposite-side free neighbors
+            // Pull: agent adjacent, agent can move away -> needs at least one free neighbor for agent
+            if (!isBoxMovable(boxPos, state, level)) continue;
+            
             // Check if agent can reach box
             int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
             if (agentToBox == Integer.MAX_VALUE) continue;
@@ -161,63 +189,34 @@ public class SubgoalManager {
     }
     
     /**
-     * Finds the best agent to handle a specific box goal.
-     * Cost Function = Distance(Agent, AnyValidBox) + Distance(ThatBox, Goal).
-     * This ensures the agent physically closest to a valid box and closer to goal is picked.
+     * Checks if a box can be pushed or pulled in at least one direction.
+     * Push: requires agent-side free AND push-direction free (opposite neighbors along an axis)
+     * Pull: requires agent adjacent AND agent has somewhere to move while pulling
+     * Returns true if box is not stuck.
      */
-    private int findBestAgentForTask(Color color, char boxType, Position goalPos, Level level, State state) {
-        int bestAgentId = -1;
-        int minTotalCost = Integer.MAX_VALUE;
-        int numAgents = state.getNumAgents();
+    private boolean isBoxMovable(Position boxPos, State state, Level level) {
+        int freeNeighborCount = 0;
+        boolean hasPushAxis = false;
         
-        // Pre-calculate agent positions of the matching color
-        List<Integer> validAgents = new ArrayList<>();
-        for (int i = 0; i < numAgents; i++) {
-            if (level.getAgentColor(i) == color) {
-                validAgents.add(i);
-            }
-        }
-        
-        if (validAgents.isEmpty()) return -1;
-        
-        // Find all available boxes of the required type
-        Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
-        
-        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
-            if (entry.getValue() != boxType) continue; 
-            Position boxPos = entry.getKey();
-            
-            // Skip satisfied, frozen, or immovable boxes
-            if (level.getBoxGoal(boxPos) == boxType) continue; // Already at goal
-            if (immovableBoxes.contains(boxPos)) continue;
-            
-            // Calculate Box->Goal distance (constant for this box)
-            int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(boxPos, goalPos, state, level);
-            if (boxToGoal == Integer.MAX_VALUE) continue;
-            
-            // Check all agents against this box
-            for (int agentId : validAgents) {
-                Position agentPos = state.getAgentPosition(agentId);
-                // Agent->Box distance
-                int agentToBox = agentPos.manhattanDistance(boxPos); 
-                
-                int totalCost = agentToBox + boxToGoal;
-                
-                if (totalCost < minTotalCost) {
-                    minTotalCost = totalCost;
-                    bestAgentId = agentId;
+        Direction[] dirs = Direction.values();
+        for (Direction dir : dirs) {
+            Position neighbor = boxPos.move(dir);
+            if (!level.isWall(neighbor) && !state.hasBoxAt(neighbor)) {
+                freeNeighborCount++;
+                // Check opposite direction for push possibility
+                Position opposite = boxPos.move(dir.opposite());
+                if (!level.isWall(opposite) && !state.hasBoxAt(opposite)) {
+                    hasPushAxis = true; // Can push along this axis
                 }
             }
         }
         
-        // Fallback: If no valid box found/reachable (e.g. all blocked), just use nearest agent to goal
-        if (bestAgentId == -1) {
-             return findNearestAgentForColor(color, goalPos, level, state);
-        }
-        
-        return bestAgentId;
+        // Pull only needs 1 free neighbor (agent stands adjacent, pulls box toward itself)
+        // Push needs 2 opposite free neighbors
+        // Either is sufficient to move the box
+        return hasPushAxis || freeNeighborCount >= 1;
     }
-
+    
     /**
      * Finds the nearest agent of the matching color to the target position.
      * Uses heuristic distance (Manhattan) for efficiency.

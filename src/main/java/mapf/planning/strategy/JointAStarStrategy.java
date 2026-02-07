@@ -199,13 +199,7 @@ public class JointAStarStrategy implements SearchStrategy {
     }
     
     private State applyJointAction(State state, Action[] actions) {
-        State current = state;
-        for (int i = 0; i < actions.length; i++) {
-            if (actions[i].type != Action.ActionType.NOOP) {
-                current = current.apply(actions[i], i);
-            }
-        }
-        return current;
+        return state.applyJointAction(actions, null);
     }
     
     private List<Action[]> reconstructPath(SearchNode goalNode) {

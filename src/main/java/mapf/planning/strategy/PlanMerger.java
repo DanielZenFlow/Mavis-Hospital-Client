@@ -232,15 +232,17 @@ public class PlanMerger {
 
     /**
      * Apply a joint action and return the new state.
+     * Per CLAUDE.md: actions are simultaneous — cell occupancy evaluated at START.
      */
     public State applyJointAction(Action[] jointAction, State state, int numAgents) {
-        State newState = state;
-        for (int agentId = 0; agentId < numAgents; agentId++) {
-            if (jointAction[agentId] != null && jointAction[agentId].type != Action.ActionType.NOOP) {
-                newState = newState.apply(jointAction[agentId], agentId);
-            }
-        }
-        return newState;
+        return state.applyJointAction(jointAction, null);
+    }
+    
+    /**
+     * Apply a joint action with level context for simultaneous evaluation.
+     */
+    public State applyJointAction(Action[] jointAction, State state, int numAgents, Level level) {
+        return state.applyJointAction(jointAction, level);
     }
 
     /**

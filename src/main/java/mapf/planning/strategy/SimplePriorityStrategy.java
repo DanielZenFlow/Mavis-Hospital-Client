@@ -256,82 +256,8 @@ public class SimplePriorityStrategy implements SearchStrategy {
         return jointAction;
     }
     
-    /**
-     * Applies a joint action to a state atomically (all actions simultaneously).
-     * 
-     * Per PRODUCT.md: "Cell occupancy determined at start of joint action 
-     * (no sequential movement within same timestep)"
-     * 
-     * All actions must be checked against the ORIGINAL state, then all changes
-     * are computed and applied together.
-     */
     private State applyJointAction(Action[] jointAction, State state, Level level) {
-        int numAgents = jointAction.length;
-        
-        // Step 1: Check applicability of all actions against the ORIGINAL state
-        boolean[] applicable = new boolean[numAgents];
-        for (int a = 0; a < numAgents; a++) {
-            applicable[a] = (jointAction[a].type == Action.ActionType.NOOP) || 
-                           state.isApplicable(jointAction[a], a, level);
-        }
-        
-        // Step 2: Compute new positions for all agents and boxes (before applying)
-        Position[] newAgentPositions = new Position[numAgents];
-        Map<Position, Character> newBoxes = new HashMap<>(state.getBoxes());
-        
-        // Track box movements to apply them atomically
-        List<Position> boxesToRemove = new ArrayList<>();
-        Map<Position, Character> boxesToAdd = new HashMap<>();
-        
-        for (int a = 0; a < numAgents; a++) {
-            Position agentPos = state.getAgentPosition(a);
-            Action action = jointAction[a];
-            
-            if (!applicable[a] || action.type == Action.ActionType.NOOP) {
-                newAgentPositions[a] = agentPos;
-                continue;
-            }
-            
-            switch (action.type) {
-                case MOVE: {
-                    newAgentPositions[a] = agentPos.move(action.agentDir);
-                    break;
-                }
-                case PUSH: {
-                    Position boxPos = agentPos.move(action.agentDir);
-                    Position newBoxPos = boxPos.move(action.boxDir);
-                    newAgentPositions[a] = boxPos;
-                    
-                    // Record box movement
-                    char boxType = state.getBoxAt(boxPos);
-                    boxesToRemove.add(boxPos);
-                    boxesToAdd.put(newBoxPos, boxType);
-                    break;
-                }
-                case PULL: {
-                    Position newAgentPos = agentPos.move(action.agentDir);
-                    Position boxPos = agentPos.move(action.boxDir.opposite());
-                    newAgentPositions[a] = newAgentPos;
-                    
-                    // Record box movement (box moves to agent's old position)
-                    char boxType = state.getBoxAt(boxPos);
-                    boxesToRemove.add(boxPos);
-                    boxesToAdd.put(agentPos, boxType);
-                    break;
-                }
-                default:
-                    newAgentPositions[a] = agentPos;
-            }
-        }
-        
-        // Step 3: Apply all box changes atomically
-        for (Position pos : boxesToRemove) {
-            newBoxes.remove(pos);
-        }
-        newBoxes.putAll(boxesToAdd);
-        
-        // Step 4: Create new state with all changes applied
-        return new State(newAgentPositions, newBoxes);
+        return state.applyJointAction(jointAction, level);
     }
     
     // ============ Goal Status Tracking ============

@@ -238,19 +238,11 @@ public class JointAStar {
     }
     
     /**
-     * Applies a joint action to a state, returning null if any conflicts occur.
+     * Applies a joint action to a state simultaneously.
+     * Per CLAUDE.md: cell occupancy evaluated at START of timestep.
      */
     private State applyJointAction(State state, Action[] actions) {
-        State current = state;
-        
-        // Apply actions sequentially (order doesn't matter for valid joint actions)
-        for (int i = 0; i < actions.length; i++) {
-            if (actions[i].type != Action.ActionType.NOOP) {
-                current = current.apply(actions[i], i);
-            }
-        }
-        
-        return current;
+        return state.applyJointAction(actions, null);
     }
     
     /**

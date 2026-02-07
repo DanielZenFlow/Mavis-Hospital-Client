@@ -34,12 +34,28 @@ public class BoxSearchPlanner {
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
             char boxType, State initialState, Level level, Set<Position> frozenGoals) {
+        // Try with hard-frozen goals first
+        List<Action> result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType, 
+                                                       initialState, level, frozenGoals, true);
+        if (result != null) return result;
+        
+        // Retry with soft-frozen goals (penalty-based) if hard-freeze fails
+        if (!frozenGoals.isEmpty()) {
+            System.err.println("[BSP] Hard-freeze failed, retrying with soft-freeze for " + boxType + " -> " + goalPos);
+            result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
+                                              initialState, level, frozenGoals, false);
+        }
+        return result;
+    }
+    
+    private List<Action> searchForSubgoalInternal(int agentId, Position boxStart, Position goalPos,
+            char boxType, State initialState, Level level, Set<Position> frozenGoals, boolean hardFreeze) {
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
         Map<StateKey, Integer> bestG = new HashMap<>();
 
-        int h = getDistance(boxStart, goalPos, level);
+        int h = computeBoxSubgoalHeuristic(initialState, agentId, boxStart, goalPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart);
-        StateKey startKey = new StateKey(initialState, agentId, boxStart);
+        StateKey startKey = new StateKey(initialState, agentId, boxStart, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -65,16 +81,19 @@ public class BoxSearchPlanner {
                     continue;
                 }
 
-                // Skip actions that would disturb satisfied goals
-                if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
-                    continue;
+                // Goal protection: hard block or soft penalty
+                if (hardFreeze) {
+                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
+                        continue;
+                    }
                 }
 
                 State newState = current.state.apply(action, agentId);
 
                 Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
-                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos);
-                int newG = current.g + 1;
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
+                int penalty = hardFreeze ? 0 : disturbancePenalty(action, agentId, current.state, frozenGoals);
+                int newG = current.g + 1 + penalty;
 
                 Integer existingG = bestG.get(newKey);
                 if (existingG != null && existingG <= newG) {
@@ -83,12 +102,15 @@ public class BoxSearchPlanner {
 
                 bestG.put(newKey, newG);
 
-                int newH = (newTargetBoxPos != null) ? getDistance(newTargetBoxPos, goalPos, level) : 0;
+                int newH = (newTargetBoxPos != null) ? computeBoxSubgoalHeuristic(newState, agentId, newTargetBoxPos, goalPos, level) : 0;
                 SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos);
                 openList.add(newNode);
             }
         }
 
+        System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "hard" : "soft") + "-freeze): box=" + boxType + " " + boxStart + " -> " + goalPos 
+            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
+            + " openListRemaining=" + openList.size() + " frozenGoals=" + frozenGoals);
         return null;
     }
 
@@ -107,9 +129,9 @@ public class BoxSearchPlanner {
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
         Map<StateKeyWithTime, Integer> bestG = new HashMap<>();
 
-        int h = getDistance(boxStart, goalPos, level);
+        int h = computeBoxSubgoalHeuristic(initialState, agentId, boxStart, goalPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart, startTime);
-        StateKeyWithTime startKey = new StateKeyWithTime(initialState, agentId, boxStart, startTime);
+        StateKeyWithTime startKey = new StateKeyWithTime(initialState, agentId, boxStart, startTime, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -161,7 +183,7 @@ public class BoxSearchPlanner {
                     }
                 }
 
-                StateKeyWithTime newKey = new StateKeyWithTime(newState, agentId, newBoxPos, nextTime);
+                StateKeyWithTime newKey = new StateKeyWithTime(newState, agentId, newBoxPos, nextTime, boxType);
                 int newG = current.g + 1;
 
                 Integer existingG = bestG.get(newKey);
@@ -171,17 +193,22 @@ public class BoxSearchPlanner {
 
                 bestG.put(newKey, newG);
 
-                int newH = (newBoxPos != null) ? getDistance(newBoxPos, goalPos, level) : 0;
+                int newH = (newBoxPos != null) ? computeBoxSubgoalHeuristic(newState, agentId, newBoxPos, goalPos, level) : 0;
                 SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newBoxPos, nextTime);
                 openList.add(newNode);
             }
         }
 
+        System.err.println("[BSP-DEBUG] ST-A* FAILED: box=" + boxType + " " + boxStart + " -> " + goalPos 
+            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
+            + " openListRemaining=" + openList.size() + " frozenGoals=" + frozenGoals);
         return null;
     }
 
     /**
-     * A* search to move an agent to its goal position (no box involved).
+     * A* search to move an agent to its goal position.
+     * Uses all action types (Move/Push/Pull) so the agent can push/pull
+     * same-color boxes out of the way if they block the path.
      */
     public List<Action> searchForAgentGoal(int agentId, Position goalPos,
             State initialState, Level level) {
@@ -191,12 +218,15 @@ public class BoxSearchPlanner {
         }
 
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
-        Map<Position, Integer> bestG = new HashMap<>();
+        // Use StateKey tracking agent position + all box positions for full-state dedup
+        Map<StateKey, Integer> bestG = new HashMap<>();
 
         int h = getDistance(startPos, goalPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, null);
+        // Use a key that captures agent pos (boxes may change if pushed)
+        StateKey startKey = new AgentGoalStateKey(initialState, agentId);
         openList.add(startNode);
-        bestG.put(startPos, 0);
+        bestG.put(startKey, 0);
 
         int exploredCount = 0;
 
@@ -209,8 +239,11 @@ public class BoxSearchPlanner {
                 return reconstructPath(current);
             }
 
-            for (Direction dir : Direction.values()) {
-                Action action = Action.move(dir);
+            // Try all actions: Move, Push, Pull (agent can push/pull same-color boxes blocking path)
+            for (Action action : PlanningUtils.getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) {
+                    continue;
+                }
 
                 if (!current.state.isApplicable(action, agentId, level)) {
                     continue;
@@ -220,12 +253,13 @@ public class BoxSearchPlanner {
                 Position newAgentPos = newState.getAgentPosition(agentId);
                 int newG = current.g + 1;
 
-                Integer existingG = bestG.get(newAgentPos);
+                StateKey newKey = new AgentGoalStateKey(newState, agentId);
+                Integer existingG = bestG.get(newKey);
                 if (existingG != null && existingG <= newG) {
                     continue;
                 }
 
-                bestG.put(newAgentPos, newG);
+                bestG.put(newKey, newG);
 
                 int newH = getDistance(newAgentPos, goalPos, level);
                 SearchNode newNode = new SearchNode(newState, current, action, newG, newH, null);
@@ -248,7 +282,7 @@ public class BoxSearchPlanner {
 
         int h = getDistance(boxStart, targetPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart);
-        StateKey startKey = new StateKey(initialState, agentId, boxStart);
+        StateKey startKey = new StateKey(initialState, agentId, boxStart, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -293,7 +327,7 @@ public class BoxSearchPlanner {
                     }
                 }
 
-                StateKey newKey = new StateKey(newState, agentId, newBoxPos);
+                StateKey newKey = new StateKey(newState, agentId, newBoxPos, boxType);
                 int newG = current.g + 1;
 
                 Integer existingG = bestG.get(newKey);
@@ -344,7 +378,7 @@ public class BoxSearchPlanner {
 
         int h = getDistance(boxPos, targetPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxPos);
-        StateKey startKey = new StateKey(initialState, agentId, boxPos);
+        StateKey startKey = new StateKey(initialState, agentId, boxPos, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -376,7 +410,7 @@ public class BoxSearchPlanner {
                 State newState = current.state.apply(action, agentId);
 
                 Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
-                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos);
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int newG = current.g + 1;
 
                 Integer existingG = bestG.get(newKey);
@@ -417,6 +451,35 @@ public class BoxSearchPlanner {
 
     // ========== Private Helper Methods ==========
 
+    /**
+     * Computes heuristic for box subgoal search.
+     * Includes both box-to-goal distance AND agent-to-box distance.
+     * 
+     * For Push: agent must be adjacent to box (from push side) -> min 1 step to reach box
+     * For Pull: agent must reach box side to pull -> same adjacency requirement
+     * 
+     * h = boxToGoal + max(0, agentToBox - 1)
+     * The -1 accounts for the fact that when agent is adjacent, it's already in position.
+     */
+    private int computeBoxSubgoalHeuristic(State state, int agentId, Position boxPos, Position goalPos, Level level) {
+        int boxToGoal = getDistance(boxPos, goalPos, level);
+        Position agentPos = state.getAgentPosition(agentId);
+        
+        // Check if agent is already adjacent to the box
+        if (agentPos.manhattanDistance(boxPos) <= 1) {
+            return boxToGoal;
+        }
+        
+        // Agent needs to reach the box first
+        int agentToBox = getDistance(agentPos, boxPos, level);
+        if (agentToBox >= Integer.MAX_VALUE) {
+            return boxToGoal; // Fallback if no path found
+        }
+        
+        // Agent-to-box contribution (subtract 1 since agent needs to be adjacent, not on box)
+        return boxToGoal + Math.max(0, agentToBox - 1);
+    }
+
     private int getDistance(Position from, Position to, Level level) {
         if (heuristic instanceof TrueDistanceHeuristic) {
             int dist = ((TrueDistanceHeuristic) heuristic).getDistance(from, to);
@@ -448,14 +511,18 @@ public class BoxSearchPlanner {
             }
         }
 
-        for (Direction dir : Direction.values()) {
-            Position newPos = lastKnownPos.move(dir);
-            Character boxAtNew = state.getBoxes().get(newPos);
-            if (boxAtNew != null && boxAtNew == boxType) {
-                return newPos;
+        // Check adjacent positions (only if we have a last known position)
+        if (lastKnownPos != null) {
+            for (Direction dir : Direction.values()) {
+                Position newPos = lastKnownPos.move(dir);
+                Character boxAtNew = state.getBoxes().get(newPos);
+                if (boxAtNew != null && boxAtNew == boxType) {
+                    return newPos;
+                }
             }
         }
 
+        // Fallback: scan all boxes
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
             if (entry.getValue() == boxType) {
                 return entry.getKey();
@@ -500,16 +567,59 @@ public class BoxSearchPlanner {
 
         return false;
     }
+    
+    /**
+     * Returns a cost penalty for disturbing satisfied goals.
+     * Instead of hard-blocking, returns 0 if no disturbance, or a high penalty if disturbing.
+     * This allows the search to disturb goals as a last resort.
+     */
+    private int disturbancePenalty(Action action, int agentId, State state, Set<Position> satisfiedGoals) {
+        if (satisfiedGoals.isEmpty()) {
+            return 0;
+        }
+
+        Position agentPos = state.getAgentPosition(agentId);
+
+        if (action.type == Action.ActionType.PUSH) {
+            Position boxPos = agentPos.move(action.agentDir);
+            if (satisfiedGoals.contains(boxPos)) return 50;
+        }
+
+        if (action.type == Action.ActionType.PULL) {
+            Position boxPos = agentPos.move(action.boxDir.opposite());
+            if (satisfiedGoals.contains(boxPos)) return 50;
+        }
+
+        return 0;
+    }
 
     // ========== Inner Classes ==========
 
     private static class StateKey {
         final Position agentPos;
         final Position targetBoxPos;
+        /** Hash of ALL same-type box positions. When agent pushes/pulls other boxes
+         *  of the same type to make way, the layout change must be captured. */
+        final int sameTypeBoxHash;
 
         StateKey(State state, int agentId, Position targetBoxPos) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
+            this.sameTypeBoxHash = 0; // legacy: no box type tracking
+        }
+        
+        StateKey(State state, int agentId, Position targetBoxPos, char boxType) {
+            this.agentPos = state.getAgentPosition(agentId);
+            this.targetBoxPos = targetBoxPos;
+            // Hash all positions of boxes with the same type
+            // This ensures different layouts of same-color boxes are distinguished
+            int hash = 0;
+            for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
+                if (e.getValue() == boxType) {
+                    hash ^= e.getKey().hashCode() * 31;
+                }
+            }
+            this.sameTypeBoxHash = hash;
         }
 
         @Override
@@ -518,12 +628,13 @@ public class BoxSearchPlanner {
             if (!(obj instanceof StateKey)) return false;
             StateKey other = (StateKey) obj;
             return agentPos.equals(other.agentPos) &&
-                    Objects.equals(targetBoxPos, other.targetBoxPos);
+                    Objects.equals(targetBoxPos, other.targetBoxPos) &&
+                    sameTypeBoxHash == other.sameTypeBoxHash;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, targetBoxPos);
+            return Objects.hash(agentPos, targetBoxPos, sameTypeBoxHash);
         }
     }
     
@@ -532,11 +643,26 @@ public class BoxSearchPlanner {
         final Position agentPos;
         final Position targetBoxPos;
         final int time;
+        final int sameTypeBoxHash;
 
         StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
+            this.sameTypeBoxHash = 0;
+        }
+        
+        StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time, char boxType) {
+            this.agentPos = state.getAgentPosition(agentId);
+            this.targetBoxPos = targetBoxPos;
+            this.time = time;
+            int hash = 0;
+            for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
+                if (e.getValue() == boxType) {
+                    hash ^= e.getKey().hashCode() * 31;
+                }
+            }
+            this.sameTypeBoxHash = hash;
         }
 
         @Override
@@ -545,12 +671,37 @@ public class BoxSearchPlanner {
             if (!(obj instanceof StateKeyWithTime)) return false;
             StateKeyWithTime other = (StateKeyWithTime) obj;
             return time == other.time && agentPos.equals(other.agentPos) &&
-                    Objects.equals(targetBoxPos, other.targetBoxPos);
+                    Objects.equals(targetBoxPos, other.targetBoxPos) &&
+                    sameTypeBoxHash == other.sameTypeBoxHash;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, targetBoxPos, time);
+            return Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxHash);
+        }
+    }
+    
+    /** State key for agent goal search: tracks agent position + all box positions
+     *  since Push/Pull changes box layout. */
+    private static class AgentGoalStateKey extends StateKey {
+        private final int boxHash;
+        
+        AgentGoalStateKey(State state, int agentId) {
+            super(state, agentId, null);
+            this.boxHash = state.getBoxes().hashCode();
+        }
+        
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+            if (!(obj instanceof AgentGoalStateKey)) return false;
+            AgentGoalStateKey other = (AgentGoalStateKey) obj;
+            return agentPos.equals(other.agentPos) && boxHash == other.boxHash;
+        }
+        
+        @Override
+        public int hashCode() {
+            return Objects.hash(agentPos, boxHash);
         }
     }
 

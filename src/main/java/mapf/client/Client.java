@@ -148,7 +148,13 @@ public class Client {
         // Step 3: Plan and execute
         planAndExecute();
 
-        debugOut.println("Goal reached!");
+        if (currentState.isGoalState(level)) {
+            debugOut.println("Goal reached!");
+        } else {
+            debugOut.println("Partial plan executed - goal NOT reached. Check agent/box positions for debugging.");
+            debugOut.println("Final state:");
+            debugOut.println(currentState.toGridString(level));
+        }
     }
 
     /**
