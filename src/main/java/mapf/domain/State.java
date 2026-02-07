@@ -287,6 +287,83 @@ public class State {
     }
     
     /**
+     * Applies a joint action (one action per agent) simultaneously.
+     * Per CLAUDE.md: "Cell occupancy is evaluated at the START of each timestep.
+     * No agent can move into a cell another is leaving in the same step."
+     * 
+     * All actions are evaluated against the CURRENT state, then all effects
+     * are applied at once to produce the new state.
+     * 
+     * @param jointAction array of actions, one per agent
+     * @param level the level (for applicability checks)
+     * @return the new state after all actions are applied simultaneously
+     */
+    public State applyJointAction(Action[] jointAction, Level level) {
+        Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
+        Map<Position, Character> newBoxes = new HashMap<>(boxes);
+        
+        // Phase 1: Compute all moves based on the CURRENT state (before any changes)
+        // Store deferred box operations to apply atomically
+        List<Position> boxRemovePositions = new ArrayList<>();
+        List<Position> boxAddPositions = new ArrayList<>();
+        List<Character> boxAddTypes = new ArrayList<>();
+        
+        for (int agentId = 0; agentId < jointAction.length; agentId++) {
+            Action action = jointAction[agentId];
+            if (action == null || action.type == Action.ActionType.NOOP) {
+                continue;
+            }
+            
+            Position agentPos = agentPositions[agentId]; // Always read from ORIGINAL state
+            
+            switch (action.type) {
+                case MOVE: {
+                    newAgentPositions[agentId] = agentPos.move(action.agentDir);
+                    break;
+                }
+                case PUSH: {
+                    Position boxPos = agentPos.move(action.agentDir);
+                    Position newBoxPos = boxPos.move(action.boxDir);
+                    newAgentPositions[agentId] = boxPos;
+                    // Read box type from ORIGINAL boxes map
+                    Character boxType = boxes.get(boxPos);
+                    if (boxType != null) {
+                        boxRemovePositions.add(boxPos);
+                        boxAddPositions.add(newBoxPos);
+                        boxAddTypes.add(boxType);
+                    }
+                    break;
+                }
+                case PULL: {
+                    Position newAgentPos = agentPos.move(action.agentDir);
+                    Position boxPos = agentPos.move(action.boxDir.opposite());
+                    newAgentPositions[agentId] = newAgentPos;
+                    // Read box type from ORIGINAL boxes map
+                    Character boxType = boxes.get(boxPos);
+                    if (boxType != null) {
+                        boxRemovePositions.add(boxPos);
+                        boxAddPositions.add(agentPos); // Box moves to agent's old position
+                        boxAddTypes.add(boxType);
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        
+        // Phase 2: Apply all box changes atomically
+        for (Position removePos : boxRemovePositions) {
+            newBoxes.remove(removePos);
+        }
+        for (int i = 0; i < boxAddPositions.size(); i++) {
+            newBoxes.put(boxAddPositions.get(i), boxAddTypes.get(i));
+        }
+        
+        return new State(newAgentPositions, newBoxes, true);
+    }
+
+    /**
      * Generates all successor states for a single agent.
      * 
      * @param agentId the agent to generate successors for
