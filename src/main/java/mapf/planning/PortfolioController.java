@@ -10,6 +10,7 @@ import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
 import mapf.planning.strategy.JointAStarStrategy;
 import mapf.planning.strategy.PriorityPlanningStrategy;
+import mapf.planning.strategy.PriorityPlanningStrategy.OrderingMode;
 import mapf.planning.strategy.SingleAgentStrategy;
 
 import java.util.*;
@@ -70,7 +71,8 @@ public class PortfolioController implements SearchStrategy {
         
         if (SearchConfig.isMinimal()) {
             System.err.println("[Portfolio] Strategy sequence: " + 
-                strategies.stream().map(s -> s.type.name()).toList());
+                strategies.stream().map(s -> s.type.name() + 
+                    (s.orderingMode != null ? "(" + s.orderingMode + ")" : "")).toList());
         }
         
         // Step 3: Try strategies in sequence
@@ -85,7 +87,9 @@ public class PortfolioController implements SearchStrategy {
             
             if (SearchConfig.isMinimal()) {
                 System.err.println("[Portfolio] Trying " + strategyConfig.type + 
-                    " (weight=" + strategyConfig.weight + ", timeout=" + attemptTimeout + "ms)");
+                    (strategyConfig.orderingMode != null ? "(" + strategyConfig.orderingMode + ")" : "") +
+                    " (timeout=" + attemptTimeout + "ms, budget=" + 
+                    String.format("%.0f%%", strategyConfig.timeBudgetFraction * 100) + ")");
             }
             
             // Create and configure strategy
@@ -124,77 +128,34 @@ public class PortfolioController implements SearchStrategy {
     
     /**
      * Builds strategy sequence based on level features.
+     * Multi-agent levels get PP with different ordering modes as the real "retry knob".
+     * Time budget: TOPOLOGICAL 40%, REVERSE 25%, DISTANCE_GREEDY 20%, RANDOM 15%.
      */
     private List<StrategyConfig> buildStrategySequence(LevelFeatures f, State state) {
         List<StrategyConfig> strategies = new ArrayList<>();
         
-        switch (f.recommendedStrategy) {
-            case SINGLE_AGENT:
-                // Simple case: just A* with increasing weights
-                strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0));
-                break;
-                
-            case CBS:
-                // CBS preferred for 2-10 agents with moderate coupling
-                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0));
-                // Fallback to priority planning if CBS times out
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 2.0));
-                break;
-                
-            case JOINT_SEARCH:
-                // Few agents with very high coupling: try joint search, then CBS, then PP
-                strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0));
-                break;
-                
-            case STRICT_ORDER:
-                // Strong dependencies: strict order with the computed execution sequence
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 2.0));
-                // Fallback to greedy
-                strategies.add(new StrategyConfig(StrategyType.GREEDY_WITH_RETRY, 5.0));
-                break;
-                
-            case CYCLE_BREAKER:
-                // Circular dependencies: need to break cycle first
-                strategies.add(new StrategyConfig(StrategyType.CYCLE_BREAKER, 1.0));
-                // Fallback to joint search (may handle cycles better)
-                if (f.numAgents <= 4) {
-                    strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 2.0));
-                }
-                strategies.add(new StrategyConfig(StrategyType.GREEDY_WITH_RETRY, 5.0));
-                break;
-                
-            case GREEDY_WITH_RETRY:
-            default:
-                // General case: greedy with increasing weights
-                strategies.add(new StrategyConfig(StrategyType.GREEDY_WITH_RETRY, 1.0));
-                strategies.add(new StrategyConfig(StrategyType.GREEDY_WITH_RETRY, 2.0));
-                strategies.add(new StrategyConfig(StrategyType.GREEDY_WITH_RETRY, 5.0));
-                break;
+        if (f.recommendedStrategy == StrategyType.SINGLE_AGENT) {
+            // Simple case: just A* with increasing weights
+            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0.40));
+            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0.60));
+        } else {
+            // Multi-agent: PP with different ordering modes
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.40));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.15));
         }
         
         return strategies;
     }
     
     /**
-     * Computes timeout for a single attempt.
-     * Per ARCHITECTURE.md: use shorter first attempt for fast fail/success detection.
+     * Computes timeout for a single attempt based on pre-assigned time budget fraction.
+     * Fractions are relative to total timeout, but capped by remaining time.
      */
     private long computeAttemptTimeout(StrategyConfig config, long remainingTime, int totalStrategies) {
-        // First strategy: 40% of time (fast fail detection)
-        // Second strategy: 30% of remaining
-        // Last resort: all remaining time
-        if (config.weight <= 1.0) {
-            return Math.min(remainingTime * 2 / 5, remainingTime);
-        } else if (config.weight <= 2.0) {
-            return Math.min(remainingTime / 3, remainingTime);
-        } else {
-            return remainingTime;
-        }
+        long budgetMs = (long) (timeoutMs * config.timeBudgetFraction);
+        return Math.min(budgetMs, remainingTime);
     }
     
     /**
@@ -227,7 +188,7 @@ public class PortfolioController implements SearchStrategy {
             case CYCLE_BREAKER:
             case GREEDY_WITH_RETRY:
             default:
-                // All use PriorityPlanningStrategy with different configs
+                // All use PriorityPlanningStrategy with different ordering modes
                 PriorityPlanningStrategy priorityPlanning = new PriorityPlanningStrategy(heuristic, strategyConfig);
                 // Pass execution order from analysis
                 if (features != null && features.executionOrder != null) {
@@ -236,6 +197,10 @@ public class PortfolioController implements SearchStrategy {
                 // Pass immovable boxes (treated as walls)
                 if (features != null && features.taskFilter != null) {
                     priorityPlanning.setImmovableBoxes(features.taskFilter.immovableBoxes);
+                }
+                // Set ordering mode for this retry attempt
+                if (config.orderingMode != null) {
+                    priorityPlanning.setOrderingMode(config.orderingMode);
                 }
                 return priorityPlanning;
         }
@@ -275,10 +240,14 @@ public class PortfolioController implements SearchStrategy {
     private static class StrategyConfig {
         final StrategyType type;
         final double weight;
+        final OrderingMode orderingMode;
+        final double timeBudgetFraction;
         
-        StrategyConfig(StrategyType type, double weight) {
+        StrategyConfig(StrategyType type, double weight, OrderingMode orderingMode, double timeBudgetFraction) {
             this.type = type;
             this.weight = weight;
+            this.orderingMode = orderingMode;
+            this.timeBudgetFraction = timeBudgetFraction;
         }
     }
     

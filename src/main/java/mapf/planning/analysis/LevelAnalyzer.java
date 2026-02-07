@@ -961,11 +961,12 @@ public class LevelAnalyzer {
     // ========== Strategy Recommendation ==========
     
     /**
-     * MAPF FIX: Strategy recommendation now uses coupling degree.
+     * Strategy recommendation: all multi-agent levels use Priority Planning (PP).
      * 
-     * - Low coupling (< 0.2): Independent planning (PP) works well
-     * - Medium coupling (0.2-0.5): CBS recommended for optimal conflict resolution
-     * - High coupling (> 0.5): Joint search or strict ordering required
+     * Rationale: CBS and JointAStar waste time budget on most competition levels.
+     * PP with different ordering modes (topological, reverse, greedy, random) is more
+     * effective than switching between fundamentally different algorithms.
+     * CBS is retained only as an internal PP fallback for cyclic dependencies.
      */
     private static StrategyType recommendStrategy(int numAgents, int maxDepth, 
                                                    boolean hasCycle, double couplingDegree,
@@ -974,33 +975,9 @@ public class LevelAnalyzer {
             return StrategyType.SINGLE_AGENT;
         }
         
-        if (hasCycle) {
-            return StrategyType.CYCLE_BREAKER;
-        }
-        
-        // MAPF FIX: Use coupling degree for strategy selection
-        if (couplingDegree > 0.5 || maxDepth >= 3) {
-            // High coupling: need strict ordering
-            return StrategyType.STRICT_ORDER;
-        }
-        
-        if (numAgents <= 10) {
-            // Medium/Low coupling with manageable agent count: CBS is efficient
-            return StrategyType.CBS;
-        }
-
-        if (couplingDegree > 0.2 && numAgents <= 4) {
-            // Medium coupling with few agents: joint search handles conflicts well
-            // But CBS is generally preferred now.
-            return StrategyType.CBS;
-        }
-        
-        if (numAgents <= 3 && numBottlenecks == 0) {
-            // Few agents, no bottlenecks: joint search is optimal
-            return StrategyType.JOINT_SEARCH;
-        }
-        
-        return StrategyType.GREEDY_WITH_RETRY;
+        // All multi-agent levels: PP with subgoal decomposition.
+        // Portfolio layer handles retries with different ordering modes.
+        return StrategyType.STRICT_ORDER;
     }
     
     // ========== Report Generation ==========

@@ -50,6 +50,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Immovable boxes (treated as walls in pathfinding). */
     private Set<Position> immovableBoxes = Collections.emptySet();
     
+    /**
+     * Ordering mode for subgoal execution. Different modes explore different
+     * orderings, which is the most effective "retry knob" for PP.
+     */
+    public enum OrderingMode {
+        /** Use LevelAnalyzer's topological sort (dependency-first). Default. */
+        TOPOLOGICAL,
+        /** Reverse of topological sort. Breaks deadlocks when normal order fails. */
+        REVERSE_TOPOLOGICAL,
+        /** Sort by box-to-goal distance, nearest first. Good for low-dependency levels. */
+        DISTANCE_GREEDY,
+        /** Random shuffle. Last-resort diversification. */
+        RANDOM
+    }
+    
+    /** Current ordering mode for subgoal sorting. */
+    private OrderingMode orderingMode = OrderingMode.TOPOLOGICAL;
+    
     /** Completed box goals - treated as permanent obstacles per MAPF standard. */
     private Set<Position> completedBoxGoals = new HashSet<>();
     
@@ -109,6 +127,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Sets immovable boxes (treated as walls in pathfinding). */
     public void setImmovableBoxes(Set<Position> immovable) {
         this.immovableBoxes = immovable != null ? immovable : Collections.emptySet();
+    }
+    
+    /** Sets the ordering mode for subgoal execution. */
+    public void setOrderingMode(OrderingMode mode) {
+        this.orderingMode = mode != null ? mode : OrderingMode.TOPOLOGICAL;
     }
 
     @Override
@@ -348,47 +371,83 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return remaining;
     }
     
-    /** Sort subgoals by pre-computed order or difficulty. */
+    /** Sort subgoals based on the current OrderingMode. */
     private void sortSubgoals(List<Subgoal> subgoals, State state, Level level) {
-        if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
-            Map<Position, Integer> orderMap = new HashMap<>();
-            for (int i = 0; i < precomputedGoalOrder.size(); i++) {
-                orderMap.put(precomputedGoalOrder.get(i), i);
-            }
-            
-            // Log order mapping for subgoals (controlled by log level)
-            if (SearchConfig.isNormal()) {
-                System.err.println("[PP] Sorting " + subgoals.size() + " subgoals with precomputed order:");
-                for (Subgoal sg : subgoals) {
-                    int order = orderMap.getOrDefault(sg.goalPos, Integer.MAX_VALUE);
-                    System.err.println("  " + sg.goalPos + " (Box " + sg.boxType + ") -> order " + order);
+        switch (orderingMode) {
+            case REVERSE_TOPOLOGICAL:
+                if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
+                    Map<Position, Integer> orderMap = new HashMap<>();
+                    for (int i = 0; i < precomputedGoalOrder.size(); i++) {
+                        orderMap.put(precomputedGoalOrder.get(i), i);
+                    }
+                    // Reverse: higher index first
+                    subgoals.sort((a, b) -> {
+                        int orderA = orderMap.getOrDefault(a.goalPos, -1);
+                        int orderB = orderMap.getOrDefault(b.goalPos, -1);
+                        return Integer.compare(orderB, orderA);
+                    });
+                    logNormal("[PP] Sorted subgoals in REVERSE topological order");
+                } else {
+                    sortByDifficulty(subgoals, state, level);
                 }
-            }
-            
-            subgoals.sort((a, b) -> {
-                int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
-                int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
-                return Integer.compare(orderA, orderB);
-            });
-            
-            // Log sorted result (controlled by log level)
-            if (SearchConfig.isNormal()) {
-                System.err.println("[PP] After sorting:");
-                for (int i = 0; i < subgoals.size(); i++) {
-                    Subgoal sg = subgoals.get(i);
-                    System.err.println("  " + (i+1) + ". " + sg.goalPos + " (Box " + sg.boxType + ")");
+                break;
+                
+            case DISTANCE_GREEDY:
+                // Sort by estimated difficulty: easiest (nearest) first
+                sortByDifficulty(subgoals, state, level);
+                logNormal("[PP] Sorted subgoals by DISTANCE_GREEDY (nearest first)");
+                break;
+                
+            case RANDOM:
+                Collections.shuffle(subgoals, random);
+                logNormal("[PP] Sorted subgoals in RANDOM order");
+                break;
+                
+            case TOPOLOGICAL:
+            default:
+                if (precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()) {
+                    Map<Position, Integer> orderMap = new HashMap<>();
+                    for (int i = 0; i < precomputedGoalOrder.size(); i++) {
+                        orderMap.put(precomputedGoalOrder.get(i), i);
+                    }
+                    
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[PP] Sorting " + subgoals.size() + " subgoals with precomputed order:");
+                        for (Subgoal sg : subgoals) {
+                            int order = orderMap.getOrDefault(sg.goalPos, Integer.MAX_VALUE);
+                            System.err.println("  " + sg.goalPos + " (Box " + sg.boxType + ") -> order " + order);
+                        }
+                    }
+                    
+                    subgoals.sort((a, b) -> {
+                        int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
+                        int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
+                        return Integer.compare(orderA, orderB);
+                    });
+                    
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[PP] After sorting:");
+                        for (int i = 0; i < subgoals.size(); i++) {
+                            Subgoal sg = subgoals.get(i);
+                            System.err.println("  " + (i+1) + ". " + sg.goalPos + " (Box " + sg.boxType + ")");
+                        }
+                    }
+                } else {
+                    sortByDifficulty(subgoals, state, level);
                 }
-            }
-        } else {
-            // Fallback: sort by difficulty (easier first)
-            final State s = state;
-            final Level lv = level;
-            subgoals.sort((a, b) -> {
-                int diffA = subgoalManager.estimateSubgoalDifficulty(a, s, lv);
-                int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, lv);
-                return Integer.compare(diffA, diffB);
-            });
+                break;
         }
+    }
+    
+    /** Sort subgoals by estimated difficulty (easiest first). */
+    private void sortByDifficulty(List<Subgoal> subgoals, State state, Level level) {
+        final State s = state;
+        final Level lv = level;
+        subgoals.sort((a, b) -> {
+            int diffA = subgoalManager.estimateSubgoalDifficulty(a, s, lv);
+            int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, lv);
+            return Integer.compare(diffA, diffB);
+        });
     }
     
     /** Log the goal execution order for debugging. */
