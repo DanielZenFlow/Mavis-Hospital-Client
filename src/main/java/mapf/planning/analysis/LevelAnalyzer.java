@@ -123,14 +123,15 @@ public class LevelAnalyzer {
         
         // 7. Adjust execution order: prioritize goals AT bottleneck positions
         // NEW GENERIC FIX: Use BFS distance ("fill from back") for topological sort tie-breaking
-        Position root = findOpenSpaceRoot(level, activeGoals, taskFilter.immovableBoxes);
-        Map<Position, Integer> distances = (root != null) ? 
-            computeDistancesFromRoot(level, root, taskFilter.immovableBoxes) : new HashMap<>();
+        // Multi-component BFS: ensures every goal gets a valid distance even when walls
+        // split the map into disconnected regions (fixes Dist:-1 problem on ClosedAI etc.)
+        Map<Position, Integer> distances = computeDistancesAllComponents(level, activeGoals, taskFilter.immovableBoxes);
             
         // MAPF FIX: Removed adjustOrderForBottlenecks. 
         // Logic was flawed (executing bottleneck goals first blocks the path).
         // Reachability analysis (computeGoalDependencies) already handles blocking correctly so
         // we should rely purely on topological sort + distance tie-breaking.
+        
         List<Position> executionOrder = hasCycle ? activeGoals : 
             topologicalSort(goalDependsOn, activeGoals, distances);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
@@ -680,6 +681,67 @@ public class LevelAnalyzer {
                 if (!level.isWall(next) && !immovableBoxes.contains(next) && !distances.containsKey(next)) {
                     distances.put(next, dist + 1);
                     q.add(next);
+                }
+            }
+        }
+        return distances;
+    }
+    
+    /**
+     * Computes BFS distances for ALL cells by finding a root per connected component.
+     * Solves the Dist:-1 problem when walls split the map into multiple regions.
+     * Each component gets its own root (highest-degree non-goal cell) and independent BFS.
+     */
+    private static Map<Position, Integer> computeDistancesAllComponents(Level level, List<Position> goals, Set<Position> immovableBoxes) {
+        Map<Position, Integer> distances = new HashMap<>();
+        Set<Position> globalVisited = new HashSet<>();
+        Set<Position> goalSet = new HashSet<>(goals);
+        
+        for (int r = 0; r < level.getRows(); r++) {
+            for (int c = 0; c < level.getCols(); c++) {
+                if (level.isWall(r, c)) continue;
+                Position p = new Position(r, c);
+                if (globalVisited.contains(p)) continue;
+                if (immovableBoxes.contains(p)) continue;
+                
+                // BFS to discover this component and find its best root
+                List<Position> component = new ArrayList<>();
+                Position bestRoot = null;
+                int bestNeighbors = -1;
+                Queue<Position> q = new LinkedList<>();
+                q.add(p);
+                globalVisited.add(p);
+                
+                while (!q.isEmpty()) {
+                    Position curr = q.poll();
+                    component.add(curr);
+                    
+                    int neighbors = 0;
+                    for (Direction dir : Direction.values()) {
+                        Position next = curr.move(dir);
+                        if (!level.isWall(next) && !immovableBoxes.contains(next)) {
+                            neighbors++;
+                            if (!globalVisited.contains(next)) {
+                                globalVisited.add(next);
+                                q.add(next);
+                            }
+                        }
+                    }
+                    // Prefer non-goal cells with high degree as root
+                    if (!goalSet.contains(curr) && neighbors > bestNeighbors) {
+                        bestNeighbors = neighbors;
+                        bestRoot = curr;
+                    }
+                }
+                
+                if (bestRoot == null && !component.isEmpty()) {
+                    bestRoot = component.get(0); // fallback: use any cell
+                }
+                
+                // BFS from this component's root
+                if (bestRoot != null) {
+                    Map<Position, Integer> componentDist = computeDistancesFromRoot(level, bestRoot, immovableBoxes);
+                    distances.putAll(componentDist);
                 }
             }
         }

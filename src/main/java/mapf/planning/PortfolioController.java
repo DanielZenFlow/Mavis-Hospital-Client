@@ -194,6 +194,10 @@ public class PortfolioController implements SearchStrategy {
                 if (features != null && features.executionOrder != null) {
                     priorityPlanning.setGoalExecutionOrder(features.executionOrder);
                 }
+                // Pass goal dependencies (for hard/soft frozen distinction)
+                if (features != null && features.goalDependsOn != null) {
+                    priorityPlanning.setGoalDependencies(features.goalDependsOn);
+                }
                 // Pass immovable boxes (treated as walls)
                 if (features != null && features.taskFilter != null) {
                     priorityPlanning.setImmovableBoxes(features.taskFilter.immovableBoxes);

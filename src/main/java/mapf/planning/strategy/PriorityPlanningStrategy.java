@@ -47,6 +47,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Pre-computed goal execution order from LevelAnalyzer (optional). */
     private List<Position> precomputedGoalOrder = null;
     
+    /** Goal dependency graph from LevelAnalyzer: goal → set of goals it depends on. */
+    private Map<Position, Set<Position>> goalDependsOn = Collections.emptyMap();
+    
     /** Immovable boxes (treated as walls in pathfinding). */
     private Set<Position> immovableBoxes = Collections.emptySet();
     
@@ -124,6 +127,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
     }
     
+    /** Sets goal dependency graph from LevelAnalyzer. Used to distinguish hard/soft frozen goals. */
+    public void setGoalDependencies(Map<Position, Set<Position>> deps) {
+        this.goalDependsOn = deps != null ? deps : Collections.emptyMap();
+    }
+    
     /** Sets immovable boxes (treated as walls in pathfinding). */
     public void setImmovableBoxes(Set<Position> immovable) {
         this.immovableBoxes = immovable != null ? immovable : Collections.emptySet();
@@ -144,6 +152,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (precomputedGoalOrder == null) {
              LevelAnalyzer.LevelFeatures features = LevelAnalyzer.analyze(level, initialState);
              setGoalExecutionOrder(features.executionOrder);
+             setGoalDependencies(features.goalDependsOn);
              if (features.taskFilter != null && (immovableBoxes == null || immovableBoxes.isEmpty())) {
                  setImmovableBoxes(features.taskFilter.immovableBoxes);
              }
@@ -743,19 +752,66 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 return null;
             }
             
+            // Smart frozen: split completedBoxGoals into hard (has pending dependents) vs soft
+            Set<Position> hardFrozen = computeHardFrozenGoals(state, level);
+            Set<Position> softFrozen = new HashSet<>(completedBoxGoals);
+            softFrozen.removeAll(hardFrozen);
+            
             // MAPF FIX: Use Space-Time A* by default for multi-agent coordination
-            // This ensures paths respect reservations from higher-priority agents
             List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, completedBoxGoals,
+                    subgoal.goalPos, subgoal.boxType, state, level, hardFrozen, softFrozen,
                     reservationTable, globalTimeStep);
             
-            // Fallback to 2D A* if space-time fails (e.g., no reservations yet)
+            // Fallback to 2D A* if space-time fails
             if (path == null) {
                 path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                        subgoal.goalPos, subgoal.boxType, state, level, completedBoxGoals);
+                        subgoal.goalPos, subgoal.boxType, state, level, hardFrozen, softFrozen);
             }
             return path;
         }
+    }
+    
+    /**
+     * Computes the set of completed box goals that MUST remain frozen (hard-frozen).
+     * A completed goal is hard-frozen only if some UNSATISFIED goal depends on it
+     * (i.e., moving it would violate the dependency invariant).
+     * Goals with no pending dependents are soft-frozen (can be temporarily displaced).
+     */
+    private Set<Position> computeHardFrozenGoals(State state, Level level) {
+        if (goalDependsOn.isEmpty()) {
+            // No dependency info: conservative, treat all as hard-frozen
+            return new HashSet<>(completedBoxGoals);
+        }
+        
+        // Build reverse map: goal → set of goals that depend on it
+        // dependedBy(G) = { X : X depends on G }
+        Map<Position, Set<Position>> dependedBy = new HashMap<>();
+        for (Map.Entry<Position, Set<Position>> entry : goalDependsOn.entrySet()) {
+            for (Position dep : entry.getValue()) {
+                dependedBy.computeIfAbsent(dep, k -> new HashSet<>()).add(entry.getKey());
+            }
+        }
+        
+        Set<Position> hardFrozen = new HashSet<>();
+        for (Position completedGoal : completedBoxGoals) {
+            Set<Position> dependents = dependedBy.get(completedGoal);
+            if (dependents == null) continue; // no one depends on this goal
+            
+            // Check if any dependent is still unsatisfied
+            for (Position dependent : dependents) {
+                if (completedBoxGoals.contains(dependent)) continue; // already done
+                // Check current state: is this dependent satisfied?
+                char goalType = level.getBoxGoal(dependent.row, dependent.col);
+                if (goalType == '\0') continue;
+                Character boxAtGoal = state.getBoxes().get(dependent);
+                if (boxAtGoal == null || boxAtGoal != goalType) {
+                    // This dependent is unsatisfied → completedGoal must stay frozen
+                    hardFrozen.add(completedGoal);
+                    break;
+                }
+            }
+        }
+        return hardFrozen;
     }
     
     /** Verify that a subgoal was actually reached. */

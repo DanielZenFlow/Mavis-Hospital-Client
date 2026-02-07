@@ -30,26 +30,44 @@ public class BoxSearchPlanner {
      * A* search to move a specific box to a goal position.
      * Uses optimized StateKey that only tracks agent and target box positions.
      * 
-     * LAYER 2 ENHANCEMENT: Protected goals are treated as immovable.
+     * Smart frozen mechanism:
+     * - hardFrozenGoals: goals with pending dependents, MUST NOT be disturbed
+     * - softFrozenGoals: goals with no pending dependents, can be displaced with penalty
+     * 
+     * 3-tier fallback:
+     * 1. Hard-block hard, penalty soft
+     * 2. Penalty both (all frozen become soft)
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
-            char boxType, State initialState, Level level, Set<Position> frozenGoals) {
-        // Try with hard-frozen goals first
+            char boxType, State initialState, Level level, 
+            Set<Position> hardFrozenGoals, Set<Position> softFrozenGoals) {
+        
+        // Tier 1: hard-block hardFrozen, penalty softFrozen
+        Set<Position> allFrozen = new HashSet<>(hardFrozenGoals);
+        allFrozen.addAll(softFrozenGoals);
         List<Action> result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType, 
-                                                       initialState, level, frozenGoals, true);
+                                                       initialState, level, hardFrozenGoals, softFrozenGoals, true);
         if (result != null) return result;
         
-        // Retry with soft-frozen goals (penalty-based) if hard-freeze fails
-        if (!frozenGoals.isEmpty()) {
-            System.err.println("[BSP] Hard-freeze failed, retrying with soft-freeze for " + boxType + " -> " + goalPos);
+        // Tier 2: penalty-only for ALL frozen goals (hard becomes soft)
+        if (!allFrozen.isEmpty()) {
+            System.err.println("[BSP] Tier 1 failed, retrying with all-soft-freeze for " + boxType + " -> " + goalPos);
             result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
-                                              initialState, level, frozenGoals, false);
+                                              initialState, level, Collections.emptySet(), allFrozen, false);
         }
         return result;
     }
     
+    /** Legacy overload: treats all frozen as hard. */
+    public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
+            char boxType, State initialState, Level level, Set<Position> frozenGoals) {
+        return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, 
+                               frozenGoals, Collections.emptySet());
+    }
+    
     private List<Action> searchForSubgoalInternal(int agentId, Position boxStart, Position goalPos,
-            char boxType, State initialState, Level level, Set<Position> frozenGoals, boolean hardFreeze) {
+            char boxType, State initialState, Level level, 
+            Set<Position> hardFrozenGoals, Set<Position> softFrozenGoals, boolean hardFreeze) {
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
         Map<StateKey, Integer> bestG = new HashMap<>();
 
@@ -81,18 +99,16 @@ public class BoxSearchPlanner {
                     continue;
                 }
 
-                // Goal protection: hard block or soft penalty
-                if (hardFreeze) {
-                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
-                        continue;
-                    }
+                // Goal protection: hard-frozen goals are blocked, soft-frozen get penalty
+                if (hardFreeze && wouldDisturbSatisfiedGoal(action, agentId, current.state, hardFrozenGoals)) {
+                    continue;
                 }
 
                 State newState = current.state.apply(action, agentId);
 
                 Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
-                int penalty = hardFreeze ? 0 : disturbancePenalty(action, agentId, current.state, frozenGoals);
+                int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
                 int newG = current.g + 1 + penalty;
 
                 Integer existingG = bestG.get(newKey);
@@ -108,22 +124,25 @@ public class BoxSearchPlanner {
             }
         }
 
-        System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "hard" : "soft") + "-freeze): box=" + boxType + " " + boxStart + " -> " + goalPos 
+        System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "tier1" : "tier2") + "): box=" + boxType + " " + boxStart + " -> " + goalPos 
             + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
-            + " openListRemaining=" + openList.size() + " frozenGoals=" + frozenGoals);
+            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
     }
 
     /**
      * Space-Time A* search for subgoal with reservation table.
      * Avoids positions reserved by higher-priority agents.
+     * Uses smart frozen: hard-frozen goals are blocked, soft-frozen get penalty.
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
-            char boxType, State initialState, Level level, Set<Position> frozenGoals,
+            char boxType, State initialState, Level level, 
+            Set<Position> hardFrozenGoals, Set<Position> softFrozenGoals,
             ReservationTable reservations, int startTime) {
         
         if (reservations == null) {
-            return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, frozenGoals);
+            return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, 
+                                   hardFrozenGoals, softFrozenGoals);
         }
         
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
@@ -163,7 +182,8 @@ public class BoxSearchPlanner {
                     if (!current.state.isApplicable(action, agentId, level)) {
                         continue;
                     }
-                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
+                    // Hard-frozen: block completely
+                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, hardFrozenGoals)) {
                         continue;
                     }
                     newState = current.state.apply(action, agentId);
@@ -184,7 +204,9 @@ public class BoxSearchPlanner {
                 }
 
                 StateKeyWithTime newKey = new StateKeyWithTime(newState, agentId, newBoxPos, nextTime, boxType);
-                int newG = current.g + 1;
+                // Soft-frozen: penalty-based
+                int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
+                int newG = current.g + 1 + penalty;
 
                 Integer existingG = bestG.get(newKey);
                 if (existingG != null && existingG <= newG) {
@@ -201,8 +223,16 @@ public class BoxSearchPlanner {
 
         System.err.println("[BSP-DEBUG] ST-A* FAILED: box=" + boxType + " " + boxStart + " -> " + goalPos 
             + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
-            + " openListRemaining=" + openList.size() + " frozenGoals=" + frozenGoals);
+            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
+    }
+
+    /** Legacy ST-A* overload: treats all frozen as hard. */
+    public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
+            char boxType, State initialState, Level level, Set<Position> frozenGoals,
+            ReservationTable reservations, int startTime) {
+        return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level,
+                               frozenGoals, Collections.emptySet(), reservations, startTime);
     }
 
     /**
