@@ -1,8 +1,6 @@
 package mapf.planning.strategy;
 
 import mapf.domain.*;
-import mapf.planning.SearchConfig;
-import mapf.planning.coordination.AgentYieldingManager;
 
 import java.util.*;
 
@@ -480,24 +478,6 @@ public class AgentCoordinator {
         }
 
         return true;
-    }
-
-    // ========== Utility ==========
-    
-    /**
-     * Clears the yielding state for all agents that were yielding for a specific beneficiary.
-     */
-    public void clearYieldingForBeneficiary(int beneficiaryId, AgentYieldingManager yieldingManager) {
-        Map<Integer, Integer> yieldingAgents = yieldingManager.getYieldingAgents();
-        for (Map.Entry<Integer, Integer> entry : yieldingAgents.entrySet()) {
-            if (entry.getValue() == beneficiaryId) {
-                int agentId = entry.getKey();
-                yieldingManager.clearYielding(agentId);
-                if (SearchConfig.isVerbose()) {
-                    System.err.println("[YIELD] Agent " + agentId + " RELEASED from yielding (beneficiary Agent " + beneficiaryId + " completed)");
-                }
-            }
-        }
     }
 
     private int manhattan(Position a, Position b) {

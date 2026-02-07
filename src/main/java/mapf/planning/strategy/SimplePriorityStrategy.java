@@ -9,7 +9,6 @@ import mapf.planning.goal.Goal;
 import mapf.planning.goal.GoalExtractor;
 import mapf.planning.pathfinding.AStarPathPlanner;
 import mapf.planning.pathfinding.PathPlanner;
-import mapf.planning.coordination.AgentYieldingManager;
 
 import java.util.*;
 
@@ -34,7 +33,6 @@ import java.util.*;
 public class SimplePriorityStrategy implements SearchStrategy {
     
     private final ConflictDetector conflictDetector = new ConflictDetector();
-    private final AgentYieldingManager yieldingManager = new AgentYieldingManager();
     private final AStarPathPlanner pathPlanner = new AStarPathPlanner();
     
     private long timeoutMs = 180_000; // 3 minutes
@@ -69,7 +67,6 @@ public class SimplePriorityStrategy implements SearchStrategy {
         
         // Initialize
         goalExtractor = new GoalExtractor(level);
-        yieldingManager.reset();
         agentPlans.clear();
         satisfiedGoalPositions.clear();
         

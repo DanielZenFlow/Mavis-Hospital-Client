@@ -76,16 +76,15 @@ mapf/
 │   │   ├── BoxSearchPlanner.java         # Single-box push/pull path planning
 │   │   ├── ConflictResolver.java         # Joint action conflict checks
 │   │   ├── DeadlockBreaker.java          # Cycle detection + resolution
-│   │   ├── AgentCoordinator.java         # Clear blocking agents
+│   │   ├── AgentCoordinator.java         # Agent yielding, clearing, and priority coordination
+│   │   ├── PathAnalyzer.java             # Parking position search, path planning, corridor analysis
 │   │   └── ...                           # Other helper classes
 │   ├── cbs/
 │   │   ├── CBSStrategy.java     # Conflict-Based Search (two-level)
 │   │   └── SpaceTimeAStar.java  # Low-level (x,y,t) planner for CBS
 │   └── coordination/
 │       ├── ConflictDetector.java
-│       ├── AgentYieldingManager.java
-│       ├── DeadlockResolver.java
-│       └── SafeZoneCalculator.java
+│       └── DeadlockResolver.java
 ```
 
 ## Strategy Selection Flow
