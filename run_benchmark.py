@@ -76,12 +76,29 @@ def run_level(level_path):
         return "Exception", "N/A", "N/A"
 
 def main():
+    # Verify prerequisites
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"Python version: {sys.version}")
+    
+    # Check server.jar exists
+    if not os.path.exists(SERVER_JAR):
+        print(f"ERROR: {SERVER_JAR} not found!")
+        sys.exit(1)
+    
+    # Check target/classes exists (compiled Java code)
+    if not os.path.exists("target/classes"):
+        print("ERROR: target/classes not found! Did Maven compile succeed?")
+        sys.exit(1)
+    
     # Find all .lvl files
     levels = sorted(glob.glob(os.path.join(LEVEL_DIR, "*.lvl")))
     
     if not levels:
         print(f"No levels found in {LEVEL_DIR}")
-        return
+        print(f"Directory exists: {os.path.exists(LEVEL_DIR)}")
+        if os.path.exists(LEVEL_DIR):
+            print(f"Contents: {os.listdir(LEVEL_DIR)}")
+        sys.exit(1)
 
     print(f"Found {len(levels)} levels. Starting benchmark...")
     
@@ -104,13 +121,19 @@ def main():
             success_count += 1
             
     # Write to file
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(f"# Benchmark Results\n")
-        f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"**Score:** {success_count}/{len(levels)}\n\n")
-        f.write("\n".join(results))
+    try:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write(f"# Benchmark Results\n")
+            f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Score:** {success_count}/{len(levels)}\n\n")
+            f.write("\n".join(results))
         
-    print(f"\nBenchmark complete. Results saved to {OUTPUT_FILE}")
+        print(f"\nBenchmark complete. Results saved to {OUTPUT_FILE}")
+        print(f"File exists: {os.path.exists(OUTPUT_FILE)}")
+        print(f"File size: {os.path.getsize(OUTPUT_FILE)} bytes")
+    except Exception as e:
+        print(f"ERROR writing results file: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

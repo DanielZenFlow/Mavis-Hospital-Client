@@ -25,6 +25,11 @@ jobs:
       - name: Build with Maven
         run: mvn clean compile
 
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Verify Server Jar Exists
         run: |
           if [ ! -f server.jar ]; then
@@ -33,11 +38,19 @@ jobs:
           fi
 
       - name: Run Python Benchmark Script
-        run: python run_benchmark.py
+        id: benchmark
+        continue-on-error: true
+        run: |
+          python run_benchmark.py
+          echo "Exit code: $?"
+          ls -la benchmark_results.md || echo "benchmark_results.md not found"
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         if: always()  # Upload even if some tests fail
         with:
           name: benchmark-results
-          path: benchmark_results.md
+          path: |
+            benchmark_results.md
+            *.log
+          if-no-files-found: warn
