@@ -873,6 +873,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * A completed goal is hard-frozen only if some UNSATISFIED goal depends on it
      * (i.e., moving it would violate the dependency invariant).
      * Goals with no pending dependents are soft-frozen (can be temporarily displaced).
+     * 
+     * Cycle-aware degradation: when circular dependencies cause most completed goals
+     * to be hard-frozen (>50%), the dependency graph is unreliable. In push-pull domain,
+     * boxes can always be pulled back, so we degrade to all-soft to unblock BSP search.
      */
     private Set<Position> computeHardFrozenGoals(State state, Level level) {
         if (goalDependsOn.isEmpty()) {
@@ -908,6 +912,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
         }
+        
+        // Cycle-aware degradation: if >50% of completed goals are hard-frozen,
+        // circular dependencies are over-constraining the search. Degrade to all-soft.
+        if (!completedBoxGoals.isEmpty() && hardFrozen.size() > completedBoxGoals.size() / 2) {
+            logNormal("[PP] Hard-frozen ratio too high (" + hardFrozen.size() + "/" 
+                      + completedBoxGoals.size() + "), degrading to all-soft for BSP flexibility.");
+            return Collections.emptySet();
+        }
+        
         return hardFrozen;
     }
     

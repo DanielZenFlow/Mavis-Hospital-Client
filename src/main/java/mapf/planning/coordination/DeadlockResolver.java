@@ -457,7 +457,7 @@ public class DeadlockResolver {
                 if (level.getAgentColor(agentId) == boxColor) {
                     // Check if this agent can reach the box
                     Position agentPos = state.getAgentPosition(agentId);
-                    if (canReachBox(agentPos, boxPos, state, level)) {
+                    if (canReachBox(agentPos, boxPos, state, level, boxColor)) {
                         pushingAgent = agentId;
                         break;
                     }
@@ -483,9 +483,10 @@ public class DeadlockResolver {
 
     /**
      * Checks if an agent can reach a box position.
+     * In push-pull domain, same-color boxes can be pushed/pulled out of the way,
+     * so they are treated as passable. Only different-color boxes block.
      */
-    private boolean canReachBox(Position agentPos, Position boxPos, State state, Level level) {
-        // Simple BFS reachability check
+    private boolean canReachBox(Position agentPos, Position boxPos, State state, Level level, Color agentColor) {
         Queue<Position> queue = new LinkedList<>();
         Set<Position> visited = new HashSet<>();
 
@@ -510,8 +511,7 @@ public class DeadlockResolver {
                 Position next = current.move(dir);
 
                 if (!visited.contains(next) && !level.isWall(next)) {
-                    // Can pass through if not blocked by another agent
-                    // (boxes might move, so we don't consider them as permanent obstacles)
+                    // Agents are temporary obstacles (they can yield)
                     boolean agentBlocking = false;
                     for (int i = 0; i < state.getNumAgents(); i++) {
                         if (state.getAgentPosition(i).equals(next)) {
@@ -519,11 +519,21 @@ public class DeadlockResolver {
                             break;
                         }
                     }
+                    if (agentBlocking) continue;
                     
-                    if (!agentBlocking && !state.getBoxes().containsKey(next)) {
-                        visited.add(next);
-                        queue.add(next);
+                    // Same-color boxes: passable (agent can push/pull them out of the way)
+                    // Different-color boxes: impassable (agent cannot interact with them)
+                    Character boxAtNext = state.getBoxes().get(next);
+                    if (boxAtNext != null) {
+                        Color nextBoxColor = level.getBoxColor(boxAtNext);
+                        if (nextBoxColor != agentColor) {
+                            continue; // Different color = permanent obstacle
+                        }
+                        // Same color = passable (can be pushed/pulled aside)
                     }
+                    
+                    visited.add(next);
+                    queue.add(next);
                 }
             }
         }
