@@ -408,7 +408,7 @@ public class BoxSearchPlanner {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0') {
-                    Position goalPosition = new Position(row, col);
+                    Position goalPosition = Position.of(row, col);
                     char currentBox = initialState.getBoxAt(goalPosition);
                     if (currentBox == goalType) {
                         frozenGoals.add(goalPosition);

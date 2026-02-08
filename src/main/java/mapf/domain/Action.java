@@ -37,6 +37,23 @@ public final class Action {
     /** Pre-created NoOp action instance for reuse */
     public static final Action NOOP = new Action(ActionType.NOOP, null, null);
     
+    // --- Static action cache: all 37 possible actions are pre-created ---
+    // 4 Move + 16 Push + 16 Pull + 1 NoOp = 37 total
+    private static final Action[] MOVE_ACTIONS = new Action[Direction.values().length];
+    private static final Action[][] PUSH_ACTIONS = new Action[Direction.values().length][Direction.values().length];
+    private static final Action[][] PULL_ACTIONS = new Action[Direction.values().length][Direction.values().length];
+    
+    static {
+        Direction[] dirs = Direction.values();
+        for (int i = 0; i < dirs.length; i++) {
+            MOVE_ACTIONS[i] = new Action(ActionType.MOVE, dirs[i], null);
+            for (int j = 0; j < dirs.length; j++) {
+                PUSH_ACTIONS[i][j] = new Action(ActionType.PUSH, dirs[i], dirs[j]);
+                PULL_ACTIONS[i][j] = new Action(ActionType.PULL, dirs[i], dirs[j]);
+            }
+        }
+    }
+    
     /**
      * Private constructor - use factory methods to create actions.
      */
@@ -54,7 +71,7 @@ public final class Action {
      */
     public static Action move(Direction direction) {
         Objects.requireNonNull(direction, "Direction cannot be null for Move action");
-        return new Action(ActionType.MOVE, direction, null);
+        return MOVE_ACTIONS[direction.ordinal()];
     }
     
     /**
@@ -69,7 +86,7 @@ public final class Action {
     public static Action push(Direction agentDir, Direction boxDir) {
         Objects.requireNonNull(agentDir, "Agent direction cannot be null for Push action");
         Objects.requireNonNull(boxDir, "Box direction cannot be null for Push action");
-        return new Action(ActionType.PUSH, agentDir, boxDir);
+        return PUSH_ACTIONS[agentDir.ordinal()][boxDir.ordinal()];
     }
     
     /**
@@ -84,7 +101,7 @@ public final class Action {
     public static Action pull(Direction agentDir, Direction boxDir) {
         Objects.requireNonNull(agentDir, "Agent direction cannot be null for Pull action");
         Objects.requireNonNull(boxDir, "Box direction cannot be null for Pull action");
-        return new Action(ActionType.PULL, agentDir, boxDir);
+        return PULL_ACTIONS[agentDir.ordinal()][boxDir.ordinal()];
     }
     
     /**

@@ -134,7 +134,7 @@ public class LevelParser {
             String gridLine = initialGrid.get(r);
             for (int c = 0; c < cols; c++) {
                 char ch = c < gridLine.length() ? gridLine.charAt(c) : ' ';
-                Position pos = new Position(r, c);
+                Position pos = Position.of(r, c);
                 
                 if (ch == '+') {
                     walls[r][c] = true;

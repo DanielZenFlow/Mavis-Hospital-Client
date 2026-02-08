@@ -57,7 +57,7 @@ public class GoalExtractor {
         // Scan the level for goals
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
-                Position pos = new Position(row, col);
+                Position pos = Position.of(row, col);
                 
                 // Check for box goal
                 char boxType = level.getBoxGoal(row, col);

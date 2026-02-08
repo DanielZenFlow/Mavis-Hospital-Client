@@ -86,7 +86,7 @@ public class ManhattanHeuristic implements Heuristic {
         
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
-                Position pos = new Position(row, col);
+                Position pos = Position.of(row, col);
                 
                 // Check for box goal
                 char boxGoal = level.getBoxGoal(row, col);

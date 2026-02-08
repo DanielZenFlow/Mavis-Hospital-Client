@@ -98,6 +98,9 @@ public class Level {
         this.boxColors = new HashMap<>(boxColors);
         this.agentColors = new HashMap<>(agentColors);
         this.numAgents = agentColors.size();
+        
+        // Initialize Position flyweight cache for this grid size
+        Position.initCache(rows, cols);
     }
     
     /**

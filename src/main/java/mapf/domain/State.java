@@ -27,6 +27,9 @@ public class State {
     private int cachedHashCode = 0;
     private boolean hashCodeComputed = false;
     
+    /** Cached unmodifiable view of boxes map */
+    private Map<Position, Character> unmodifiableBoxes = null;
+    
     /**
      * Creates a new State with the given agent positions and boxes.
      * 
@@ -91,6 +94,7 @@ public class State {
     
     /**
      * Checks if there is an agent at the specified position.
+     * With Position flyweight cache, equals() short-circuits via == on first check.
      * 
      * @param pos the position to check
      * @return true if there is an agent at this position
@@ -106,6 +110,7 @@ public class State {
     
     /**
      * Gets the agent at the specified position, if any.
+     * With Position flyweight cache, equals() short-circuits via == on first check.
      * 
      * @param pos the position to check
      * @return the agent number at this position, or -1 if no agent
@@ -131,10 +136,13 @@ public class State {
     }
     
     /**
-     * @return an unmodifiable view of the boxes map
+     * @return an unmodifiable view of the boxes map (cached)
      */
     public Map<Position, Character> getBoxes() {
-        return Collections.unmodifiableMap(boxes);
+        if (unmodifiableBoxes == null) {
+            unmodifiableBoxes = Collections.unmodifiableMap(boxes);
+        }
+        return unmodifiableBoxes;
     }
     
     /**
@@ -149,7 +157,7 @@ public class State {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0') {
-                    Position pos = new Position(row, col);
+                    Position pos = Position.of(row, col);
                     Character actualBox = boxes.get(pos);
                     if (actualBox == null || actualBox != goalType) {
                         return false;
@@ -158,7 +166,7 @@ public class State {
                 
                 int agentGoal = level.getAgentGoal(row, col);
                 if (agentGoal != -1) {
-                    Position pos = new Position(row, col);
+                    Position pos = Position.of(row, col);
                     Position agentPos = agentPositions[agentGoal];
                     if (agentPos == null || !agentPos.equals(pos)) {
                         return false;
@@ -481,7 +489,7 @@ public class State {
         StringBuilder sb = new StringBuilder();
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
-                Position pos = new Position(row, col);
+                Position pos = Position.of(row, col);
                 
                 if (level.isWall(pos)) {
                     sb.append('+');

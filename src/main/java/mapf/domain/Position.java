@@ -4,6 +4,9 @@ package mapf.domain;
  * Immutable class representing a position (coordinate) on the level grid.
  * Uses row and column indices where (0,0) is the top-left corner.
  * Row increases downward, column increases rightward.
+ * 
+ * Flyweight pattern: Positions within the initialized grid are cached and reused.
+ * This eliminates millions of short-lived Position allocations during A* search.
  */
 public final class Position {
     
@@ -12,6 +15,41 @@ public final class Position {
     
     /** The column index (horizontal position, 0-indexed from left) */
     public final int col;
+    
+    // --- Flyweight cache ---
+    private static Position[][] cache;
+    private static int cachedRows = 0;
+    private static int cachedCols = 0;
+    
+    /**
+     * Initializes the position cache for a grid of the given size.
+     * Must be called once at level load time, before any search begins.
+     * 
+     * @param rows number of rows in the grid
+     * @param cols number of columns in the grid
+     */
+    public static void initCache(int rows, int cols) {
+        if (rows == cachedRows && cols == cachedCols) return; // Already initialized
+        cachedRows = rows;
+        cachedCols = cols;
+        cache = new Position[rows][cols];
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                cache[r][c] = new Position(r, c);
+            }
+        }
+    }
+    
+    /**
+     * Returns a cached Position if within grid bounds, otherwise creates a new one.
+     * Prefer this over `new Position(row, col)` in hot paths.
+     */
+    public static Position of(int row, int col) {
+        if (cache != null && row >= 0 && row < cachedRows && col >= 0 && col < cachedCols) {
+            return cache[row][col];
+        }
+        return new Position(row, col);
+    }
     
     /**
      * Creates a new Position with the specified row and column.
@@ -25,13 +63,14 @@ public final class Position {
     }
     
     /**
-     * Returns a new Position that is adjacent to this position in the given direction.
+     * Returns the Position adjacent to this position in the given direction.
+     * Uses the flyweight cache when available (O(1) lookup, zero allocation).
      * 
      * @param direction the direction to move (N, S, E, W)
-     * @return a new Position in the specified direction
+     * @return the Position in the specified direction
      */
     public Position move(Direction direction) {
-        return new Position(row + direction.dRow, col + direction.dCol);
+        return Position.of(row + direction.dRow, col + direction.dCol);
     }
     
     /**

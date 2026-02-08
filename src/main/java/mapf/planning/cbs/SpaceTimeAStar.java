@@ -171,7 +171,7 @@ public class SpaceTimeAStar {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     return agentPos.equals(goalPos);
                 }
             }

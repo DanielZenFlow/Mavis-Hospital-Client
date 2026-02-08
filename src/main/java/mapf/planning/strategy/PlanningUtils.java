@@ -149,34 +149,33 @@ public class PlanningUtils {
         return false;
     }
     
-    /**
-     * Gets all possible actions.
-     */
-    public static List<Action> getAllActions() {
+    /** Cached immutable list of all 37 possible actions. Built once, reused forever. */
+    private static final List<Action> ALL_ACTIONS;
+    
+    static {
         List<Action> actions = new ArrayList<>();
-        
-        // NoOp
         actions.add(Action.noOp());
-        
-        // Move
         for (Direction dir : Direction.values()) {
             actions.add(Action.move(dir));
         }
-        
-        // Push
         for (Direction agentDir : Direction.values()) {
             for (Direction boxDir : Direction.values()) {
                 actions.add(Action.push(agentDir, boxDir));
             }
         }
-        
-        // Pull
         for (Direction agentDir : Direction.values()) {
             for (Direction boxDir : Direction.values()) {
                 actions.add(Action.pull(agentDir, boxDir));
             }
         }
-        
-        return actions;
+        ALL_ACTIONS = Collections.unmodifiableList(actions);
+    }
+    
+    /**
+     * Gets all possible actions. Returns a cached unmodifiable list.
+     * Safe to iterate without allocation.
+     */
+    public static List<Action> getAllActions() {
+        return ALL_ACTIONS;
     }
 }

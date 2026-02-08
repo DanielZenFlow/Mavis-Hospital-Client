@@ -21,10 +21,10 @@ import java.util.*;
 public class ImmovableBoxDetector {
     
     private Set<Position> immovableBoxPositions = null;
-    private State cachedStateForImmovable = null;
+    private boolean immovableBoxesComputed = false;
     
     private Set<Position> preSatisfiedStaticGoals = null;
-    private State cachedStateForStaticGoals = null;
+    private boolean staticGoalsComputed = false;
     
     // --- Distance cache ---
     // Key: source position of BFS. Value: int[row][col] distance array.
@@ -37,18 +37,22 @@ public class ImmovableBoxDetector {
     private static final int UNREACHABLE = Integer.MAX_VALUE;
     
     /**
-     * Gets immovable box positions (cached per state).
+     * Gets immovable box positions (computed once, cached forever).
+     * 
+     * Immovable boxes are determined solely by color: a box is immovable iff
+     * no agent of matching color exists. Since agent colors are fixed by the Level,
+     * the immovable set is constant for the entire solve — no state-dependent
+     * invalidation needed.
      */
     public Set<Position> getImmovableBoxes(State state, Level level) {
-        if (immovableBoxPositions != null && cachedStateForImmovable == state) {
+        if (immovableBoxesComputed) {
             return immovableBoxPositions;
         }
         
-        cachedStateForImmovable = state;
         immovableBoxPositions = new HashSet<>();
         
         // Find which colors have agents
-        Set<Color> pushableColors = new HashSet<>();
+        Set<Color> pushableColors = EnumSet.noneOf(Color.class);
         for (int i = 0; i < state.getNumAgents(); i++) {
             pushableColors.add(level.getAgentColor(i));
         }
@@ -62,20 +66,20 @@ public class ImmovableBoxDetector {
             }
         }
         
+        immovableBoxesComputed = true;
         return immovableBoxPositions;
     }
     
     /**
-     * Finds pre-satisfied static goals (boxes at goals that cannot be moved).
+     * Finds pre-satisfied static goals (immovable boxes already at their correct goals).
+     * Computed once, cached forever (immovable boxes can't move).
      */
     public Set<Position> findPreSatisfiedStaticGoals(State state, Level level) {
-        if (preSatisfiedStaticGoals != null && cachedStateForStaticGoals == state) {
+        if (staticGoalsComputed) {
             return preSatisfiedStaticGoals;
         }
         
-        cachedStateForStaticGoals = state;
         preSatisfiedStaticGoals = new HashSet<>();
-        
         Set<Position> immovableBoxes = getImmovableBoxes(state, level);
         
         for (int row = 0; row < level.getRows(); row++) {
@@ -83,7 +87,7 @@ public class ImmovableBoxDetector {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType == '\0') continue;
                 
-                Position goalPos = new Position(row, col);
+                Position goalPos = Position.of(row, col);
                 Character actualBox = state.getBoxes().get(goalPos);
                 
                 if (actualBox != null && actualBox == goalType && immovableBoxes.contains(goalPos)) {
@@ -92,6 +96,7 @@ public class ImmovableBoxDetector {
             }
         }
         
+        staticGoalsComputed = true;
         return preSatisfiedStaticGoals;
     }
     
@@ -118,7 +123,7 @@ public class ImmovableBoxDetector {
         int goalCount = 0;
         for (int row = 0; row < cachedRows; row++) {
             for (int col = 0; col < cachedCols; col++) {
-                Position pos = new Position(row, col);
+                Position pos = Position.of(row, col);
                 
                 // Box goals
                 if (level.getBoxGoal(row, col) != '\0' && !distanceMapCache.containsKey(pos)) {
@@ -152,8 +157,8 @@ public class ImmovableBoxDetector {
     public int getDistanceWithImmovableBoxes(Position from, Position to, State state, Level level) {
         if (from.equals(to)) return 0;
         
-        // Ensure immovable boxes are computed (needed for BFS)
-        getImmovableBoxes(state, level);
+        // Immovable boxes are computed once in initializeDistanceCache or first getImmovableBoxes call.
+        // No need to recompute per call since they're constant (determined by color, not position).
         
         // Try cache: BFS from 'from' → lookup to
         int[][] mapFrom = distanceMapCache.get(from);

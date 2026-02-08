@@ -709,7 +709,7 @@ public class LevelAnalyzer {
         for (int r=0; r<level.getRows(); r++) {
             for (int c=0; c<level.getCols(); c++) {
                 if (level.isWall(r, c)) continue;
-                Position p = new Position(r, c);
+                Position p = Position.of(r, c);
                 if (visited.contains(p)) continue;
                 if (immovableBoxes.contains(p)) continue;  // Treat immovable boxes as walls
                 
@@ -923,7 +923,7 @@ public class LevelAnalyzer {
         for (int r = 0; r < level.getRows(); r++) {
             for (int c = 0; c < level.getCols(); c++) {
                 if (level.isWall(r, c)) continue;
-                Position p = new Position(r, c);
+                Position p = Position.of(r, c);
                 if (globalVisited.contains(p)) continue;
                 if (immovableBoxes.contains(p)) continue;
                 
@@ -1166,7 +1166,7 @@ public class LevelAnalyzer {
             for (int c = 0; c < level.getCols(); c++) {
                 if (level.isWall(r, c)) continue;
                 
-                int neighbors = countFreeNeighbors(new Position(r, c), level);
+                int neighbors = countFreeNeighbors(Position.of(r, c), level);
                 if (neighbors <= 2) corridors++;
                 else if (neighbors >= 3) junctions++;
             }
@@ -1189,7 +1189,7 @@ public class LevelAnalyzer {
         for (int r = 0; r < level.getRows(); r++) {
             for (int c = 0; c < level.getCols(); c++) {
                 if (level.getBoxGoal(r, c) != '\0' || level.getAgentGoal(r, c) >= 0) {
-                    goals.add(new Position(r, c));
+                    goals.add(Position.of(r, c));
                 }
             }
         }

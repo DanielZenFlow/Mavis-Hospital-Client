@@ -77,7 +77,7 @@ public class SubgoalManager {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType == '\0') continue;
                 
-                Position goalPos = new Position(row, col);
+                Position goalPos = Position.of(row, col);
                 
                 // Skip pre-satisfied static goals (decorations)
                 if (staticGoals.contains(goalPos)) continue;
@@ -128,7 +128,7 @@ public class SubgoalManager {
                 int agentGoal = level.getAgentGoal(row, col);
                 if (agentGoal >= 0 && agentGoal < state.getNumAgents()) {
                     if (existingAgentGoals.contains(agentGoal)) continue; // Already added
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Position agentPos = state.getAgentPosition(agentGoal);
                     if (!agentPos.equals(goalPos)) {
                         unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentGoal, '\0', goalPos, true));
@@ -440,7 +440,7 @@ public class SubgoalManager {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Character actualBox = state.getBoxes().get(goalPos);
                     
                     // If goal is not satisfied...
@@ -462,7 +462,7 @@ public class SubgoalManager {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    return new Position(row, col);
+                    return Position.of(row, col);
                 }
             }
         }

@@ -67,7 +67,7 @@ public class TrueDistanceHeuristic implements Heuristic {
     private void findGoalPositions() {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
-                Position pos = new Position(row, col);
+                Position pos = Position.of(row, col);
                 
                 // Box goals
                 char boxGoal = level.getBoxGoal(row, col);

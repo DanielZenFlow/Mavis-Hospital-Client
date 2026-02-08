@@ -120,7 +120,7 @@ public class TaskFilter {
                 char goalType = level.getBoxGoal(r, c);
                 if (goalType == '\0') continue;
                 
-                Position goalPos = new Position(r, c);
+                Position goalPos = Position.of(r, c);
                 Character boxAtGoal = state.getBoxAt(goalPos);
                 
                 // Check if goal is already satisfied
@@ -200,7 +200,7 @@ public class TaskFilter {
                 int agentGoal = level.getAgentGoal(r, c);
                 if (agentGoal < 0) continue;
                 
-                Position goalPos = new Position(r, c);
+                Position goalPos = Position.of(r, c);
                 Position agentPos = state.getAgentPosition(agentGoal);
                 
                 if (!goalPos.equals(agentPos)) {

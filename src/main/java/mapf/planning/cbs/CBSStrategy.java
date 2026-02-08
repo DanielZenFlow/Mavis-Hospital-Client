@@ -145,7 +145,7 @@ public class CBSStrategy implements SearchStrategy {
                 char g = level.getBoxGoal(r, c);
                 if (g != '\0') {
                     // Skip if already satisfied
-                    Position p = new Position(r, c);
+                    Position p = Position.of(r, c);
                     if (state.getBoxes().containsKey(p) && state.getBoxes().get(p) == g) continue;
                     goalsByType.computeIfAbsent(g, k -> new ArrayList<>()).add(p);
                 }

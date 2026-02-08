@@ -210,7 +210,7 @@ public class DependencyAnalyzer {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    return new Position(row, col);
+                    return Position.of(row, col);
                 }
             }
         }
@@ -224,7 +224,7 @@ public class DependencyAnalyzer {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getBoxGoal(row, col) == boxType) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Character currentBox = state.getBoxes().get(goalPos);
                     if (currentBox == null || currentBox != boxType) {
                         return goalPos; // This goal is unsatisfied

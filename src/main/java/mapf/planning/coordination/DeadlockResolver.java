@@ -178,10 +178,10 @@ public class DeadlockResolver {
                 if (goalType != '\0') {
                     Color boxColor = level.getBoxColor(goalType);
                     if (boxColor == agentColor) {
-                        char currentBox = state.getBoxAt(new Position(row, col));
+                        char currentBox = state.getBoxAt(Position.of(row, col));
                         if (currentBox != goalType) {
                             // This goal is unsatisfied and this agent can handle it
-                            return new Position(row, col);
+                            return Position.of(row, col);
                         }
                     }
                 }
@@ -192,7 +192,7 @@ public class DeadlockResolver {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     if (!state.getAgentPosition(agentId).equals(goalPos)) {
                         return goalPos;
                     }
@@ -558,7 +558,7 @@ public class DeadlockResolver {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getBoxGoal(row, col) != '\0' || level.getAgentGoal(row, col) >= 0) {
-                    badPositions.add(new Position(row, col));
+                    badPositions.add(Position.of(row, col));
                 }
             }
         }

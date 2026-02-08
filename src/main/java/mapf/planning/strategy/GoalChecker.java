@@ -17,7 +17,7 @@ public class GoalChecker {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0') {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Character actualBox = state.getBoxes().get(goalPos);
                     if (actualBox == null || actualBox != goalType) {
                         return false;
@@ -38,7 +38,7 @@ public class GoalChecker {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Character actualBox = state.getBoxes().get(goalPos);
                     if (actualBox == null || actualBox != goalType) {
                         return false;
@@ -71,7 +71,7 @@ public class GoalChecker {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     return agentPos.equals(goalPos);
                 }
             }
@@ -90,7 +90,7 @@ public class GoalChecker {
             for (int col = 0; col < level.getCols(); col++) {
                 char goalType = level.getBoxGoal(row, col);
                 if (goalType != '\0') {
-                    Position goalPos = new Position(row, col);
+                    Position goalPos = Position.of(row, col);
                     Character actualBox = state.getBoxes().get(goalPos);
                     if (actualBox != null && actualBox == goalType) {
                         satisfied.add(goalPos);
@@ -109,7 +109,7 @@ public class GoalChecker {
         for (int row = 0; row < level.getRows(); row++) {
             for (int col = 0; col < level.getCols(); col++) {
                 if (level.getAgentGoal(row, col) == agentId) {
-                    return new Position(row, col);
+                    return Position.of(row, col);
                 }
             }
         }
