@@ -36,7 +36,8 @@ public class BoxSearchPlanner {
      * 
      * 3-tier fallback:
      * 1. Hard-block hard, penalty soft
-     * 2. Penalty both (all frozen become soft)
+     * 2. Remove soft protection entirely (hard stays hard)
+     * 3. Demote hard→soft (penalty only), remove soft entirely
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
             char boxType, State initialState, Level level, 
@@ -49,11 +50,22 @@ public class BoxSearchPlanner {
                                                        initialState, level, hardFrozenGoals, softFrozenGoals, true);
         if (result != null) return result;
         
-        // Tier 2: penalty-only for ALL frozen goals (hard becomes soft)
-        if (!allFrozen.isEmpty()) {
-            System.err.println("[BSP] Tier 1 failed, retrying with all-soft-freeze for " + boxType + " -> " + goalPos);
+        // Tier 2: Remove soft protection entirely, keep hard as hard-block
+        if (!softFrozenGoals.isEmpty()) {
+            System.err.println("[BSP] Tier 1 failed, retrying with relaxed soft-freeze for " + boxType + " -> " + goalPos);
             result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
-                                              initialState, level, Collections.emptySet(), allFrozen, false);
+                                              initialState, level, hardFrozenGoals, Collections.emptySet(), true);
+            if (result != null) return result;
+        }
+        
+        // Tier 3: Demote hard→soft (penalty only), remove soft entirely
+        // Last resort: allows disturbing hard-frozen goals with heavy penalty (50),
+        // which is better than failing completely. revalidateCompletedGoals() will
+        // detect the disturbance and re-add the goal to the subgoal list.
+        if (!allFrozen.isEmpty()) {
+            System.err.println("[BSP] Tier 2 failed, retrying with hard→soft demotion for " + boxType + " -> " + goalPos);
+            result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
+                                              initialState, level, Collections.emptySet(), hardFrozenGoals, true);
         }
         return result;
     }
@@ -124,9 +136,10 @@ public class BoxSearchPlanner {
             }
         }
 
-        System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "tier1" : "tier2") + "): box=" + boxType + " " + boxStart + " -> " + goalPos 
-            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
-            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
+        // Debug log removed to reduce noise
+        // System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "tier1" : "tier2") + "): box=" + boxType + " " + boxStart + " -> " + goalPos 
+        //    + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
+        //    + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
     }
 
@@ -221,9 +234,9 @@ public class BoxSearchPlanner {
             }
         }
 
-        System.err.println("[BSP-DEBUG] ST-A* FAILED: box=" + boxType + " " + boxStart + " -> " + goalPos 
-            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
-            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
+//        System.err.println("[BSP-DEBUG] ST-A* FAILED: box=" + boxType + " " + boxStart + " -> " + goalPos 
+//            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
+//            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
     }
 
