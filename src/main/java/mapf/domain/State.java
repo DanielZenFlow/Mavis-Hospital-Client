@@ -240,23 +240,24 @@ public class State {
      * @return the new state after applying the action
      */
     public State apply(Action action, int agentId) {
-        Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
-        Map<Position, Character> newBoxes = new HashMap<>(boxes);
-        
         Position agentPos = agentPositions[agentId];
         
         switch (action.type) {
             case NOOP:
-                // No change
-                break;
+                return this; // No change — return same immutable state
                 
             case MOVE: {
+                // MOVE only changes agent position, boxes are untouched.
+                // Share the box map (safe: State is immutable, no one modifies boxes after construction).
                 Position newPos = agentPos.move(action.agentDir);
+                Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
                 newAgentPositions[agentId] = newPos;
-                break;
+                return new State(newAgentPositions, boxes, true);
             }
             
             case PUSH: {
+                Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
+                Map<Position, Character> newBoxes = new HashMap<>(boxes);
                 Position boxPos = agentPos.move(action.agentDir);
                 Position newBoxPos = boxPos.move(action.boxDir);
                 
@@ -266,10 +267,12 @@ public class State {
                 // Move box
                 char boxType = newBoxes.remove(boxPos);
                 newBoxes.put(newBoxPos, boxType);
-                break;
+                return new State(newAgentPositions, newBoxes, true);
             }
             
             case PULL: {
+                Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
+                Map<Position, Character> newBoxes = new HashMap<>(boxes);
                 Position newAgentPos = agentPos.move(action.agentDir);
                 Position boxPos = agentPos.move(action.boxDir.opposite());
                 
@@ -279,11 +282,12 @@ public class State {
                 // Move box to agent's old position
                 char boxType = newBoxes.remove(boxPos);
                 newBoxes.put(agentPos, boxType);
-                break;
+                return new State(newAgentPositions, newBoxes, true);
             }
+            
+            default:
+                return this;
         }
-        
-        return new State(newAgentPositions, newBoxes, true);
     }
     
     /**

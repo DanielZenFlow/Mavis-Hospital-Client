@@ -31,6 +31,9 @@ public class PortfolioController implements SearchStrategy {
     // Cached heuristic - expensive to compute, reuse across strategies
     private Heuristic cachedHeuristic;
     
+    // Cached SubgoalManager - shares ImmovableBoxDetector distance cache across PP retries
+    private mapf.planning.strategy.SubgoalManager cachedSubgoalManager;
+    
     // Track attempts for debugging
     private final List<AttemptRecord> attempts = new ArrayList<>();
     
@@ -189,7 +192,11 @@ public class PortfolioController implements SearchStrategy {
             case GREEDY_WITH_RETRY:
             default:
                 // All use PriorityPlanningStrategy with different ordering modes
-                PriorityPlanningStrategy priorityPlanning = new PriorityPlanningStrategy(heuristic, strategyConfig);
+                // Share SubgoalManager across retries to reuse BFS distance cache
+                if (cachedSubgoalManager == null) {
+                    cachedSubgoalManager = new mapf.planning.strategy.SubgoalManager(heuristic);
+                }
+                PriorityPlanningStrategy priorityPlanning = new PriorityPlanningStrategy(heuristic, strategyConfig, cachedSubgoalManager);
                 // Pass execution order from analysis
                 if (features != null && features.executionOrder != null) {
                     priorityPlanning.setGoalExecutionOrder(features.executionOrder);

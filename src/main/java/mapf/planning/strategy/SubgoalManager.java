@@ -20,6 +20,24 @@ public class SubgoalManager {
     }
     
     /**
+     * Constructor with shared ImmovableBoxDetector for cross-strategy cache reuse.
+     * Follows Dependency Inversion Principle: caller controls detector lifecycle.
+     */
+    public SubgoalManager(Heuristic heuristic, ImmovableBoxDetector sharedDetector) {
+        this.heuristic = heuristic;
+        this.immovableDetector = sharedDetector;
+    }
+    
+    /**
+     * Initializes precomputed BFS distance cache for all goal positions.
+     * Must be called once before the main planning loop for O(1) distance lookups.
+     * Safe to call multiple times (idempotent).
+     */
+    public void initDistanceCache(State state, Level level) {
+        immovableDetector.initializeDistanceCache(state, level);
+    }
+    
+    /**
      * Gets all unsatisfied subgoals in priority order.
      * Phase 1: Box goals (excluding already completed ones)
      * Phase 2: Agent goals for agents whose own-color box tasks are done

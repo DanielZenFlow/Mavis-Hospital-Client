@@ -95,12 +95,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
 
     public PriorityPlanningStrategy(Heuristic heuristic, SearchConfig config) {
+        this(heuristic, config, new SubgoalManager(heuristic));
+    }
+
+    /**
+     * Constructor with shared SubgoalManager for cross-strategy cache reuse.
+     * Follows Dependency Inversion: Portfolio injects shared instance.
+     */
+    public PriorityPlanningStrategy(Heuristic heuristic, SearchConfig config, SubgoalManager sharedSubgoalManager) {
         this.heuristic = heuristic;
         this.config = config;
         this.timeoutMs = config.getTimeoutMs();
         this.maxStates = config.getMaxStates();
         
-        this.subgoalManager = new SubgoalManager(heuristic);
+        this.subgoalManager = sharedSubgoalManager;
         this.conflictResolver = new ConflictResolver();
         this.boxSearchPlanner = new BoxSearchPlanner(heuristic);
         this.greedyPlanner = new GreedyPlanner();
@@ -157,6 +165,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                  setImmovableBoxes(features.taskFilter.immovableBoxes);
              }
         }
+
+        // Precompute BFS distance maps for all goals (O(G×N) once, then O(1) per query)
+        subgoalManager.initDistanceCache(initialState, level);
 
         // Reset for new search
         displacementHistory.clear();
