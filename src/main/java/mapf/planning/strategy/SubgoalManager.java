@@ -72,13 +72,11 @@ public class SubgoalManager {
     
     private void addBoxGoals(List<PriorityPlanningStrategy.Subgoal> unsatisfied, 
                             State state, Level level, Set<Position> staticGoals, Set<Position> completedBoxGoals) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType == '\0') continue;
-                
-                Position goalPos = Position.of(row, col);
-                
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            Color boxColor = level.getBoxColor(goalType);
+            
+            for (Position goalPos : entry.getValue()) {
                 // Skip pre-satisfied static goals (decorations)
                 if (staticGoals.contains(goalPos)) continue;
                 
@@ -87,7 +85,6 @@ public class SubgoalManager {
                 
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
-                    Color boxColor = level.getBoxColor(goalType);
                     // MAPF FIX: Choose NEAREST agent instead of first available (index-based)
                     int agentId = findNearestAgentForColor(boxColor, goalPos, level, state);
                     if (agentId != -1) {
@@ -123,17 +120,14 @@ public class SubgoalManager {
             }
         }
         
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                int agentGoal = level.getAgentGoal(row, col);
-                if (agentGoal >= 0 && agentGoal < state.getNumAgents()) {
-                    if (existingAgentGoals.contains(agentGoal)) continue; // Already added
-                    Position goalPos = Position.of(row, col);
-                    Position agentPos = state.getAgentPosition(agentGoal);
-                    if (!agentPos.equals(goalPos)) {
-                        unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentGoal, '\0', goalPos, true));
-                    }
-                }
+        for (Map.Entry<Integer, Position> entry : level.getAgentGoalPositionMap().entrySet()) {
+            int agentGoal = entry.getKey();
+            if (agentGoal >= state.getNumAgents()) continue;
+            if (existingAgentGoals.contains(agentGoal)) continue; // Already added
+            Position goalPos = entry.getValue();
+            Position agentPos = state.getAgentPosition(agentGoal);
+            if (!agentPos.equals(goalPos)) {
+                unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentGoal, '\0', goalPos, true));
             }
         }
     }
@@ -222,11 +216,6 @@ public class SubgoalManager {
             // Task-Aware Allocation: Check if using this box leaves other goals solvable
             if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
                 return candidate.pos;
-            } else {
-                if (mapf.planning.SearchConfig.isVerbose()) {
-                    System.err.println("[SubgoalManager] Allocation rejected: Box " + candidate.pos 
-                        + " for " + subgoal.goalPos + " would block other " + subgoal.boxType + " goals.");
-                }
             }
         }
 
@@ -234,7 +223,7 @@ public class SubgoalManager {
         // return NULL to indicate this goal cannot be safely served yet.
         // This allows PriorityPlanningStrategy to skip this goal and try others (Dynamic Reordering).
         if (!candidates.isEmpty()) {
-            if (mapf.planning.SearchConfig.isNormal()) {
+            if (mapf.planning.SearchConfig.isVerbose()) {
                 System.err.println("[SubgoalManager] All " + candidates.size() + " candidates for " + subgoal.goalPos 
                     + " rejected by global feasibility check. Deferring goal.");
             }
@@ -436,21 +425,19 @@ public class SubgoalManager {
         Color agentColor = level.getAgentColor(agentId);
         Position agentPos = state.getAgentPosition(agentId);
 
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position goalPos = Position.of(row, col);
-                    Character actualBox = state.getBoxes().get(goalPos);
-                    
-                    // If goal is not satisfied...
-                    if (actualBox == null || actualBox != goalType) {
-                        // FIX: Only consider it "my task" if I can actually reach the goal area.
-                        // If the goal is in a disconnected component (e.g. locked room), 
-                        // I shouldn't wait for it.
-                        if (immovableDetector.getDistanceWithImmovableBoxes(agentPos, goalPos, state, level) != Integer.MAX_VALUE) {
-                            return false; // Found a reachable, unsatisfied goal of my color
-                        }
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            if (level.getBoxColor(goalType) != agentColor) continue;
+            for (Position goalPos : entry.getValue()) {
+                Character actualBox = state.getBoxes().get(goalPos);
+                
+                // If goal is not satisfied...
+                if (actualBox == null || actualBox != goalType) {
+                    // FIX: Only consider it "my task" if I can actually reach the goal area.
+                    // If the goal is in a disconnected component (e.g. locked room), 
+                    // I shouldn't wait for it.
+                    if (immovableDetector.getDistanceWithImmovableBoxes(agentPos, goalPos, state, level) != Integer.MAX_VALUE) {
+                        return false; // Found a reachable, unsatisfied goal of my color
                     }
                 }
             }
@@ -459,13 +446,6 @@ public class SubgoalManager {
     }
     
     private Position findAgentGoalPosition(int agentId, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    return Position.of(row, col);
-                }
-            }
-        }
-        return null;
+        return level.getAgentGoalPositionMap().get(agentId);
     }
 }

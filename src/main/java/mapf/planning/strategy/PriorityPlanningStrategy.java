@@ -403,8 +403,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // In push-pull domain, no filled goal is truly permanent — boxes can be pulled away.
         // Graceful degradation: return ALL unsatisfied goals, sorted by fewest unmet deps first.
         if (!allUnsatisfied.isEmpty()) {
-            logVerbose("[PP] Cycle fallback: " + allUnsatisfied.size() 
-                      + " goals with unmet deps, relaxing enforcement");
             allUnsatisfied.sort((a, b) -> {
                 int unmetA = countUnmetDependencies(a.goalPos, level);
                 int unmetB = countUnmetDependencies(b.goalPos, level);
@@ -616,9 +614,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
         }
-        if (skippedByDeps > 0) {
-            logVerbose("[PP] Skipped " + skippedByDeps + "/" + subgoals.size() + " subgoals (unmet dependencies)");
-        }
         return false;
     }
     
@@ -773,8 +768,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 List<Position> path = pathAnalyzer.findPathIgnoringDynamicObstacles(
                         otherAgentPos, sg.goalPos, level);
                 if (path != null && path.contains(agentPos)) {
-                    logVerbose("[PP] Agent " + agentId + " at " + agentPos 
-                            + " is on critical path for Agent " + sg.agentId + " goal " + sg.goalPos);
                     return true;
                 }
             } else {
@@ -788,15 +781,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (boxPath != null) {
                     for (Position p : boxPath) {
                         if (p.equals(agentPos)) {
-                            logVerbose("[PP] Agent " + agentId + " at " + agentPos 
-                                    + " is on box-to-goal path for Box " + sg.boxType + " -> " + sg.goalPos);
                             return true;
                         }
-                        // Also check adjacent cells (agent needs to stand next to box to push)
                         for (Direction dir : Direction.values()) {
                             if (p.move(dir).equals(agentPos)) {
-                                logVerbose("[PP] Agent " + agentId + " at " + agentPos 
-                                        + " is adjacent to box path for Box " + sg.boxType + " -> " + sg.goalPos);
                                 return true;
                             }
                         }
@@ -808,8 +796,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 List<Position> agentToBox = pathAnalyzer.findPathIgnoringDynamicObstacles(
                         sgAgentPos, boxPos, level);
                 if (agentToBox != null && agentToBox.contains(agentPos)) {
-                    logVerbose("[PP] Agent " + agentId + " at " + agentPos 
-                            + " is on agent-to-box path for Agent " + sg.agentId + " -> Box " + sg.boxType);
                     return true;
                 }
             }
@@ -1027,7 +1013,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             deadlockResolver.analyzeBlocking(currentState, level, subgoals, immovableBoxes);
         
         if (!blockingInfos.isEmpty()) {
-            logVerbose("[PP] " + blockingInfos.size() + " blocking infos detected");
 
             DeadlockResolver.DisplacementPlan displacement = 
                 deadlockResolver.createDisplacementPlan(blockingInfos, currentState, level, displacementHistory);
@@ -1039,12 +1024,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (isAgentMove) {
                     displacePath = boxSearchPlanner.searchForAgentGoal(
                         displacement.agentId, displacement.tempPosition, currentState, level);
-                    logVerbose("[PP] Displacing Agent " + displacement.agentId + " to " + displacement.tempPosition);
                 } else {
                     displacePath = boxSearchPlanner.planBoxDisplacement(
                         displacement.agentId, displacement.boxPosition,
                         displacement.tempPosition, displacement.boxType, currentState, level);
-                    logVerbose("[PP] Displacing Box " + displacement.boxType);
                 }
                 
                 if (displacePath != null && !displacePath.isEmpty()) {
@@ -1084,7 +1067,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (!sg.isAgentGoal) {
                         completedBoxGoals.add(sg.goalPos);
                     }
-                    logVerbose("[PP] Succeeded with reordered goal");
                     return true;
                 }
             }

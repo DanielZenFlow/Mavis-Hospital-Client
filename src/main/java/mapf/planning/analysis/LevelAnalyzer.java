@@ -1,6 +1,7 @@
 package mapf.planning.analysis;
 
 import mapf.domain.*;
+import mapf.planning.SearchConfig;
 import java.util.*;
 
 /**
@@ -331,9 +332,6 @@ public class LevelAnalyzer {
                      if (!hasDependency(goalI, goalJ, dependsOn)) {
                          dependsOn.get(goalJ).add(goalI);
                          startDepCount++;
-                         System.err.println("[DEBUG-INIT] " + goalJ + " blocked by start pos of " + goalI + " (all " + blockerPositions.size() + " boxes block) (Added Dependency)");
-                     } else {
-                         System.err.println("[DEBUG-INIT] " + goalJ + " blocked by start pos of " + goalI + " BUT Cycle detected - Skipping Dependency (Requires Displacement)");
                      }
                  }
              }
@@ -361,19 +359,21 @@ public class LevelAnalyzer {
             e.printStackTrace();
         }
 
-        // Debug: Log dependency graph
-        System.err.println("[LevelAnalyzer] Dependency graph (A depends on B means B executes first):");
-        for (Position goal : goals) {
-            Set<Position> deps = dependsOn.get(goal);
-            if (deps != null && !deps.isEmpty()) {
-                char goalChar = level.getBoxGoal(goal.row, goal.col);
-                StringBuilder sb = new StringBuilder();
-                sb.append("[LevelAnalyzer] Dep: ").append(goal).append("(").append(goalChar).append(") depends on: ");
-                for (Position dep : deps) {
-                    char depChar = level.getBoxGoal(dep.row, dep.col);
-                    sb.append(dep).append("(").append(depChar).append(") ");
+        // Debug: Log dependency graph (verbose only)
+        if (SearchConfig.isVerbose()) {
+            System.err.println("[LevelAnalyzer] Dependency graph (A depends on B means B executes first):");
+            for (Position goal : goals) {
+                Set<Position> deps = dependsOn.get(goal);
+                if (deps != null && !deps.isEmpty()) {
+                    char goalChar = level.getBoxGoal(goal.row, goal.col);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("[LevelAnalyzer] Dep: ").append(goal).append("(").append(goalChar).append(") depends on: ");
+                    for (Position dep : deps) {
+                        char depChar = level.getBoxGoal(dep.row, dep.col);
+                        sb.append(dep).append("(").append(depChar).append(") ");
+                    }
+                    System.err.println(sb.toString());
                 }
-                System.err.println(sb.toString());
             }
         }
         
@@ -1290,14 +1290,16 @@ public class LevelAnalyzer {
                                corridors, corridors * 100.0 / freeSpaces, junctions));
         sb.append(String.format("Max dependency depth: %d, Has cycle: %s\n", maxDepth, hasCycle));
         
-        // Show dependencies if any
+        // Show dependencies summary
         int depCount = dependsOn.values().stream().mapToInt(Set::size).sum();
         if (depCount > 0) {
-            sb.append("\nGoal dependencies (").append(depCount).append(" total):\n");
-            for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
-                if (!entry.getValue().isEmpty()) {
-                    sb.append("  ").append(entry.getKey()).append(" depends on: ");
-                    sb.append(entry.getValue()).append("\n");
+            sb.append("\nGoal dependencies: ").append(depCount).append(" total\n");
+            if (SearchConfig.isVerbose()) {
+                for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
+                    if (!entry.getValue().isEmpty()) {
+                        sb.append("  ").append(entry.getKey()).append(" depends on: ");
+                        sb.append(entry.getValue()).append("\n");
+                    }
                 }
             }
         }

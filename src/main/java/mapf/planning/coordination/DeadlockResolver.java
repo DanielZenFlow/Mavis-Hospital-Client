@@ -172,32 +172,23 @@ public class DeadlockResolver {
         Color agentColor = level.getAgentColor(agentId);
 
         // First, check for unsatisfied box goals this agent can handle
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Color boxColor = level.getBoxColor(goalType);
-                    if (boxColor == agentColor) {
-                        char currentBox = state.getBoxAt(Position.of(row, col));
-                        if (currentBox != goalType) {
-                            // This goal is unsatisfied and this agent can handle it
-                            return Position.of(row, col);
-                        }
-                    }
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            Color boxColor = level.getBoxColor(goalType);
+            if (boxColor != agentColor) continue;
+            for (Position goalPos : entry.getValue()) {
+                char currentBox = state.getBoxAt(goalPos);
+                if (currentBox != goalType) {
+                    // This goal is unsatisfied and this agent can handle it
+                    return goalPos;
                 }
             }
         }
 
         // Then check agent goal
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = Position.of(row, col);
-                    if (!state.getAgentPosition(agentId).equals(goalPos)) {
-                        return goalPos;
-                    }
-                }
-            }
+        Position goalPos = level.getAgentGoalPositionMap().get(agentId);
+        if (goalPos != null && !state.getAgentPosition(agentId).equals(goalPos)) {
+            return goalPos;
         }
 
         return null;
@@ -445,7 +436,6 @@ public class DeadlockResolver {
             // Skip if already tried this displacement
             String historyKey = boxType + "@" + boxPos;
             if (displacementHistory.contains(historyKey)) {
-                log("[DEADLOCK] Skipping already-attempted displacement: " + historyKey);
                 continue;
             }
 
@@ -465,7 +455,6 @@ public class DeadlockResolver {
             }
 
             if (pushingAgent == -1) {
-                log("[DEADLOCK] No agent can reach blocking box " + boxType + " at " + boxPos);
                 continue;
             }
 
@@ -555,12 +544,9 @@ public class DeadlockResolver {
         Set<Position> badPositions = new HashSet<>();
         
         // All goal positions are bad
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getBoxGoal(row, col) != '\0' || level.getAgentGoal(row, col) >= 0) {
-                    badPositions.add(Position.of(row, col));
-                }
-            }
+        badPositions.addAll(level.getAllBoxGoalPositions());
+        for (Position agentGoalPos : level.getAgentGoalPositionMap().values()) {
+            badPositions.add(agentGoalPos);
         }
 
         // BFS from box position to find good parking spots

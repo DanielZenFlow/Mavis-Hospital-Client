@@ -13,16 +13,11 @@ public class GoalChecker {
      * Checks if all box goals are satisfied.
      */
     public static boolean allBoxGoalsSatisfied(State state, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position goalPos = Position.of(row, col);
-                    Character actualBox = state.getBoxes().get(goalPos);
-                    if (actualBox == null || actualBox != goalType) {
-                        return false;
-                    }
-                }
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            Character actualBox = state.getBoxes().get(goalPos);
+            if (actualBox == null || actualBox != goalType) {
+                return false;
             }
         }
         return true;
@@ -34,15 +29,13 @@ public class GoalChecker {
     public static boolean hasCompletedBoxTasks(int agentId, State state, Level level) {
         Color agentColor = level.getAgentColor(agentId);
         
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0' && level.getBoxColor(goalType) == agentColor) {
-                    Position goalPos = Position.of(row, col);
-                    Character actualBox = state.getBoxes().get(goalPos);
-                    if (actualBox == null || actualBox != goalType) {
-                        return false;
-                    }
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            if (level.getBoxColor(goalType) != agentColor) continue;
+            for (Position goalPos : entry.getValue()) {
+                Character actualBox = state.getBoxes().get(goalPos);
+                if (actualBox == null || actualBox != goalType) {
+                    return false;
                 }
             }
         }
@@ -68,13 +61,9 @@ public class GoalChecker {
     public static boolean isAgentGoalSatisfied(int agentId, State state, Level level) {
         Position agentPos = state.getAgentPosition(agentId);
         
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = Position.of(row, col);
-                    return agentPos.equals(goalPos);
-                }
-            }
+        Position goalPos = level.getAgentGoalPositionMap().get(agentId);
+        if (goalPos != null) {
+            return agentPos.equals(goalPos);
         }
         
         return true; // No agent goal defined
@@ -86,16 +75,11 @@ public class GoalChecker {
     public static Set<Position> computeSatisfiedGoalPositions(State state, Level level) {
         Set<Position> satisfied = new HashSet<>();
         
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position goalPos = Position.of(row, col);
-                    Character actualBox = state.getBoxes().get(goalPos);
-                    if (actualBox != null && actualBox == goalType) {
-                        satisfied.add(goalPos);
-                    }
-                }
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            Character actualBox = state.getBoxes().get(goalPos);
+            if (actualBox != null && actualBox == goalType) {
+                satisfied.add(goalPos);
             }
         }
         
@@ -106,14 +90,7 @@ public class GoalChecker {
      * Finds the goal position for an agent.
      */
     public static Position findAgentGoalPosition(int agentId, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    return Position.of(row, col);
-                }
-            }
-        }
-        return null;
+        return level.getAgentGoalPositionMap().get(agentId);
     }
     
     /**

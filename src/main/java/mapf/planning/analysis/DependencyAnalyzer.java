@@ -207,29 +207,19 @@ public class DependencyAnalyzer {
      * Finds the goal position for an agent, if any.
      */
     private static Position findAgentGoal(int agentId, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    return Position.of(row, col);
-                }
-            }
-        }
-        return null;
+        return level.getAgentGoalPositionMap().get(agentId);
     }
     
     /**
      * Finds an unsatisfied goal position for a box type.
      */
     private static Position findUnsatisfiedBoxGoal(char boxType, State state, Level level) {
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getBoxGoal(row, col) == boxType) {
-                    Position goalPos = Position.of(row, col);
-                    Character currentBox = state.getBoxes().get(goalPos);
-                    if (currentBox == null || currentBox != boxType) {
-                        return goalPos; // This goal is unsatisfied
-                    }
-                }
+        List<Position> goals = level.getBoxGoalsByType().get(boxType);
+        if (goals == null) return null;
+        for (Position goalPos : goals) {
+            Character currentBox = state.getBoxes().get(goalPos);
+            if (currentBox == null || currentBox != boxType) {
+                return goalPos; // This goal is unsatisfied
             }
         }
         return null;

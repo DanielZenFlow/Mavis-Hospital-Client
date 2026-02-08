@@ -167,14 +167,10 @@ public class SpaceTimeAStar {
         // 2. Fallback: Check Agent Position Goal
         Position agentPos = state.getAgentPosition(agentId);
         
-        // Scan for this agent's goal position
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                if (level.getAgentGoal(row, col) == agentId) {
-                    Position goalPos = Position.of(row, col);
-                    return agentPos.equals(goalPos);
-                }
-            }
+        // O(1) lookup via precomputed agent goal map
+        Position goalPos = level.getAgentGoalPositionMap().get(agentId);
+        if (goalPos != null) {
+            return agentPos.equals(goalPos);
         }
         
         // No goals at all for this agent -> assumed done at start

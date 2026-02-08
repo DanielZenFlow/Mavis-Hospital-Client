@@ -1,7 +1,9 @@
 package mapf.domain;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -57,6 +59,15 @@ public class Level {
     /** Number of agents in this level */
     private final int numAgents;
     
+    /** Precomputed box goal positions grouped by box type (A-Z). Immutable. */
+    private final Map<Character, List<Position>> boxGoalsByType;
+    
+    /** All box goal positions in a flat list for iteration. Immutable. */
+    private final List<Position> allBoxGoalPositions;
+    
+    /** Agent goal positions keyed by agent ID (0-9). Immutable. */
+    private final Map<Integer, Position> agentGoalPositionMap;
+    
     /**
      * Creates a new Level with the specified parameters.
      * 
@@ -101,6 +112,36 @@ public class Level {
         
         // Initialize Position flyweight cache for this grid size
         Position.initCache(rows, cols);
+        
+        // Precompute goal position lookups (must be after Position.initCache)
+        Map<Character, List<Position>> tempBoxGoals = new HashMap<>();
+        List<Position> tempAllBoxGoals = new ArrayList<>();
+        Map<Integer, Position> tempAgentGoals = new HashMap<>();
+        
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                char boxGoalType = this.boxGoals[r][c];
+                if (boxGoalType != '\0') {
+                    Position pos = Position.of(r, c);
+                    tempBoxGoals.computeIfAbsent(boxGoalType, k -> new ArrayList<>()).add(pos);
+                    tempAllBoxGoals.add(pos);
+                }
+                
+                int agentGoalId = this.agentGoals[r][c];
+                if (agentGoalId >= 0) {
+                    tempAgentGoals.put(agentGoalId, Position.of(r, c));
+                }
+            }
+        }
+        
+        // Wrap inner lists as unmodifiable
+        Map<Character, List<Position>> immutableBoxGoals = new HashMap<>();
+        for (Map.Entry<Character, List<Position>> e : tempBoxGoals.entrySet()) {
+            immutableBoxGoals.put(e.getKey(), Collections.unmodifiableList(e.getValue()));
+        }
+        this.boxGoalsByType = Collections.unmodifiableMap(immutableBoxGoals);
+        this.allBoxGoalPositions = Collections.unmodifiableList(tempAllBoxGoals);
+        this.agentGoalPositionMap = Collections.unmodifiableMap(tempAgentGoals);
     }
     
     /**
@@ -289,6 +330,38 @@ public class Level {
      */
     public Map<Integer, Color> getAgentColors() {
         return Collections.unmodifiableMap(agentColors);
+    }
+    
+    /**
+     * Returns box goal positions grouped by box type (A-Z).
+     * Each list is unmodifiable. The map itself is unmodifiable.
+     * Precomputed once at construction time — O(1) lookup.
+     *
+     * @return box goal positions by type
+     */
+    public Map<Character, List<Position>> getBoxGoalsByType() {
+        return boxGoalsByType;
+    }
+    
+    /**
+     * Returns all box goal positions as a flat unmodifiable list.
+     * Use this when iterating over ALL box goals regardless of type.
+     * Precomputed once at construction time — O(1) access.
+     *
+     * @return all box goal positions
+     */
+    public List<Position> getAllBoxGoalPositions() {
+        return allBoxGoalPositions;
+    }
+    
+    /**
+     * Returns agent goal positions keyed by agent ID.
+     * Precomputed once at construction time — O(1) lookup per agent.
+     *
+     * @return agent goal positions by agent ID
+     */
+    public Map<Integer, Position> getAgentGoalPositionMap() {
+        return agentGoalPositionMap;
     }
     
     @Override

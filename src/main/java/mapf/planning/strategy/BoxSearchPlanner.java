@@ -62,9 +62,6 @@ public class BoxSearchPlanner {
         // which is better than failing completely. revalidateCompletedGoals() will
         // detect the disturbance and re-add the goal to the subgoal list.
         if (!allFrozen.isEmpty()) {
-            if (SearchConfig.isNormal()) {
-                System.err.println("[BSP] Tier 1-2 failed for " + boxType + " -> " + goalPos + ", trying hard→soft demotion");
-            }
             result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
                                               initialState, level, Collections.emptySet(), hardFrozenGoals, true);
         }
@@ -404,16 +401,11 @@ public class BoxSearchPlanner {
 
         // Less strict goal protection
         Set<Position> frozenGoals = new HashSet<>();
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType != '\0') {
-                    Position goalPosition = Position.of(row, col);
-                    char currentBox = initialState.getBoxAt(goalPosition);
-                    if (currentBox == goalType) {
-                        frozenGoals.add(goalPosition);
-                    }
-                }
+        for (Position goalPosition : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPosition);
+            char currentBox = initialState.getBoxAt(goalPosition);
+            if (currentBox == goalType) {
+                frozenGoals.add(goalPosition);
             }
         }
         

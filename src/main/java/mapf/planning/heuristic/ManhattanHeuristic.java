@@ -81,26 +81,8 @@ public class ManhattanHeuristic implements Heuristic {
      * @param level the level to extract goals from
      */
     private void cacheGoalPositions(Level level) {
-        boxGoalPositions = new HashMap<>();
-        agentGoalPositions = new HashMap<>();
-        
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                Position pos = Position.of(row, col);
-                
-                // Check for box goal
-                char boxGoal = level.getBoxGoal(row, col);
-                if (boxGoal != '\0') {
-                    boxGoalPositions.computeIfAbsent(boxGoal, k -> new ArrayList<>()).add(pos);
-                }
-                
-                // Check for agent goal
-                int agentGoal = level.getAgentGoal(row, col);
-                if (agentGoal != -1) {
-                    agentGoalPositions.put(agentGoal, pos);
-                }
-            }
-        }
+        boxGoalPositions = new HashMap<>(level.getBoxGoalsByType());
+        agentGoalPositions = new HashMap<>(level.getAgentGoalPositionMap());
     }
     
     /**

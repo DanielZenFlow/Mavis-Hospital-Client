@@ -87,7 +87,7 @@ public class SearchConfig {
      * 2 = NORMAL (+ iteration progress, warnings)
      * 3 = VERBOSE (+ detailed debug info)
      */
-    public static final int LOG_LEVEL = 3;
+    public static final int LOG_LEVEL = 2;
     
     /** Helper method to check if verbose logging is enabled */
     public static boolean isVerbose() { return LOG_LEVEL >= 3; }

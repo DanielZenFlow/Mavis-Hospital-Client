@@ -140,15 +140,16 @@ public class CBSStrategy implements SearchStrategy {
         
         // Find all box goals
         Map<Character, List<Position>> goalsByType = new HashMap<>();
-        for (int r = 0; r < level.getRows(); r++) {
-            for (int c = 0; c < level.getCols(); c++) {
-                char g = level.getBoxGoal(r, c);
-                if (g != '\0') {
-                    // Skip if already satisfied
-                    Position p = Position.of(r, c);
-                    if (state.getBoxes().containsKey(p) && state.getBoxes().get(p) == g) continue;
-                    goalsByType.computeIfAbsent(g, k -> new ArrayList<>()).add(p);
-                }
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char g = entry.getKey();
+            List<Position> filteredGoals = new ArrayList<>();
+            for (Position p : entry.getValue()) {
+                // Skip if already satisfied
+                if (state.getBoxes().containsKey(p) && state.getBoxes().get(p) == g) continue;
+                filteredGoals.add(p);
+            }
+            if (!filteredGoals.isEmpty()) {
+                goalsByType.put(g, filteredGoals);
             }
         }
         

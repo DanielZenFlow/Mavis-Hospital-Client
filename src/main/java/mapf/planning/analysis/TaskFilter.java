@@ -115,63 +115,58 @@ public class TaskFilter {
         }
         
         // Step 6: Categorize box goals
-        for (int r = 0; r < level.getRows(); r++) {
-            for (int c = 0; c < level.getCols(); c++) {
-                char goalType = level.getBoxGoal(r, c);
-                if (goalType == '\0') continue;
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            Character boxAtGoal = state.getBoxAt(goalPos);
                 
-                Position goalPos = Position.of(r, c);
-                Character boxAtGoal = state.getBoxAt(goalPos);
-                
-                // Check if goal is already satisfied
-                if (boxAtGoal != null && boxAtGoal == goalType) {
-                    satisfiedGoals.add(goalPos);
-                    continue;
-                }
-                
-                // Check if any movable box of this type exists
-                Color goalColor = level.getBoxColor(goalType);
-                if (!availableColors.contains(goalColor)) {
-                    // No agent can move boxes to this goal - treat as satisfied (skip)
-                    satisfiedGoals.add(goalPos);
-                    continue;
-                }
-                
-                // Check if goal is reachable by matching agents
-                Set<Position> reachable = colorReachableAreas.get(goalColor);
-                if (reachable == null || !reachable.contains(goalPos)) {
-                    // Goal position is unreachable - skip
-                    satisfiedGoals.add(goalPos);
-                    continue;
-                }
-                
-                // Check if any reachable box of this type exists IN THE SAME REACHABLE AREA
-                boolean hasReachableBox = false;
-                for (Map.Entry<Position, Character> boxEntry : state.getBoxes().entrySet()) {
-                    Position boxPos = boxEntry.getKey();
-                    if (boxEntry.getValue() != goalType) continue;
-                    if (immovableBoxes.contains(boxPos)) continue;
-                    
-                    // Box must be adjacent to a position in the same reachable area
-                    for (Direction dir : Direction.values()) {
-                        Position adjacent = boxPos.move(dir);
-                        if (reachable.contains(adjacent)) {
-                            hasReachableBox = true;
-                            break;
-                        }
-                    }
-                    if (hasReachableBox) break;
-                }
-                
-                if (!hasReachableBox) {
-                    // No reachable box for this goal (box and goal in different areas)
-                    satisfiedGoals.add(goalPos);
-                    continue;
-                }
-                
-                // This is an active goal
-                activeGoals.add(goalPos);
+            // Check if goal is already satisfied
+            if (boxAtGoal != null && boxAtGoal == goalType) {
+                satisfiedGoals.add(goalPos);
+                continue;
             }
+                
+            // Check if any movable box of this type exists
+            Color goalColor = level.getBoxColor(goalType);
+            if (!availableColors.contains(goalColor)) {
+                // No agent can move boxes to this goal - treat as satisfied (skip)
+                satisfiedGoals.add(goalPos);
+                continue;
+            }
+                
+            // Check if goal is reachable by matching agents
+            Set<Position> reachable = colorReachableAreas.get(goalColor);
+            if (reachable == null || !reachable.contains(goalPos)) {
+                // Goal position is unreachable - skip
+                satisfiedGoals.add(goalPos);
+                continue;
+            }
+                
+            // Check if any reachable box of this type exists IN THE SAME REACHABLE AREA
+            boolean hasReachableBox = false;
+            for (Map.Entry<Position, Character> boxEntry : state.getBoxes().entrySet()) {
+                Position boxPos = boxEntry.getKey();
+                if (boxEntry.getValue() != goalType) continue;
+                if (immovableBoxes.contains(boxPos)) continue;
+                    
+                // Box must be adjacent to a position in the same reachable area
+                for (Direction dir : Direction.values()) {
+                    Position adjacent = boxPos.move(dir);
+                    if (reachable.contains(adjacent)) {
+                        hasReachableBox = true;
+                        break;
+                    }
+                }
+                if (hasReachableBox) break;
+            }
+                
+            if (!hasReachableBox) {
+                // No reachable box for this goal (box and goal in different areas)
+                satisfiedGoals.add(goalPos);
+                continue;
+            }
+                
+            // This is an active goal
+            activeGoals.add(goalPos);
         }
         
         // Step 7: Identify active boxes (boxes that need to move)
@@ -195,20 +190,16 @@ public class TaskFilter {
         }
         
         // Step 8: Handle agent goals (always active if not satisfied and reachable)
-        for (int r = 0; r < level.getRows(); r++) {
-            for (int c = 0; c < level.getCols(); c++) {
-                int agentGoal = level.getAgentGoal(r, c);
-                if (agentGoal < 0) continue;
+        for (Map.Entry<Integer, Position> entry : level.getAgentGoalPositionMap().entrySet()) {
+            int agentGoal = entry.getKey();
+            Position goalPos = entry.getValue();
+            Position agentPos = state.getAgentPosition(agentGoal);
                 
-                Position goalPos = Position.of(r, c);
-                Position agentPos = state.getAgentPosition(agentGoal);
-                
-                if (!goalPos.equals(agentPos)) {
-                    // Check if agent can reach its goal
-                    Set<Position> reachable = agentReachableAreas.get(agentGoal);
-                    if (reachable != null && reachable.contains(goalPos)) {
-                        activeGoals.add(goalPos);
-                    }
+            if (!goalPos.equals(agentPos)) {
+                // Check if agent can reach its goal
+                Set<Position> reachable = agentReachableAreas.get(agentGoal);
+                if (reachable != null && reachable.contains(goalPos)) {
+                    activeGoals.add(goalPos);
                 }
             }
         }

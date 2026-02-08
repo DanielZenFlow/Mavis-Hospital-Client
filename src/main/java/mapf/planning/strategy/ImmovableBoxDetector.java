@@ -82,17 +82,12 @@ public class ImmovableBoxDetector {
         preSatisfiedStaticGoals = new HashSet<>();
         Set<Position> immovableBoxes = getImmovableBoxes(state, level);
         
-        for (int row = 0; row < level.getRows(); row++) {
-            for (int col = 0; col < level.getCols(); col++) {
-                char goalType = level.getBoxGoal(row, col);
-                if (goalType == '\0') continue;
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            Character actualBox = state.getBoxes().get(goalPos);
                 
-                Position goalPos = Position.of(row, col);
-                Character actualBox = state.getBoxes().get(goalPos);
-                
-                if (actualBox != null && actualBox == goalType && immovableBoxes.contains(goalPos)) {
-                    preSatisfiedStaticGoals.add(goalPos);
-                }
+            if (actualBox != null && actualBox == goalType && immovableBoxes.contains(goalPos)) {
+                preSatisfiedStaticGoals.add(goalPos);
             }
         }
         
@@ -121,21 +116,16 @@ public class ImmovableBoxDetector {
         
         // Precompute BFS from all goal positions (box goals + agent goals)
         int goalCount = 0;
-        for (int row = 0; row < cachedRows; row++) {
-            for (int col = 0; col < cachedCols; col++) {
-                Position pos = Position.of(row, col);
-                
-                // Box goals
-                if (level.getBoxGoal(row, col) != '\0' && !distanceMapCache.containsKey(pos)) {
-                    distanceMapCache.put(pos, computeFullBFS(pos, level));
-                    goalCount++;
-                }
-                
-                // Agent goals
-                if (level.getAgentGoal(row, col) >= 0 && !distanceMapCache.containsKey(pos)) {
-                    distanceMapCache.put(pos, computeFullBFS(pos, level));
-                    goalCount++;
-                }
+        for (Position pos : level.getAllBoxGoalPositions()) {
+            if (!distanceMapCache.containsKey(pos)) {
+                distanceMapCache.put(pos, computeFullBFS(pos, level));
+                goalCount++;
+            }
+        }
+        for (Position pos : level.getAgentGoalPositionMap().values()) {
+            if (!distanceMapCache.containsKey(pos)) {
+                distanceMapCache.put(pos, computeFullBFS(pos, level));
+                goalCount++;
             }
         }
         
