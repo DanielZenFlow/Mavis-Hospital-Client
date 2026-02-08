@@ -52,7 +52,6 @@ public class BoxSearchPlanner {
         
         // Tier 2: Remove soft protection entirely, keep hard as hard-block
         if (!softFrozenGoals.isEmpty()) {
-            System.err.println("[BSP] Tier 1 failed, retrying with relaxed soft-freeze for " + boxType + " -> " + goalPos);
             result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
                                               initialState, level, hardFrozenGoals, Collections.emptySet(), true);
             if (result != null) return result;
@@ -63,7 +62,9 @@ public class BoxSearchPlanner {
         // which is better than failing completely. revalidateCompletedGoals() will
         // detect the disturbance and re-add the goal to the subgoal list.
         if (!allFrozen.isEmpty()) {
-            System.err.println("[BSP] Tier 2 failed, retrying with hard→soft demotion for " + boxType + " -> " + goalPos);
+            if (SearchConfig.isNormal()) {
+                System.err.println("[BSP] Tier 1-2 failed for " + boxType + " -> " + goalPos + ", trying hard→soft demotion");
+            }
             result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
                                               initialState, level, Collections.emptySet(), hardFrozenGoals, true);
         }

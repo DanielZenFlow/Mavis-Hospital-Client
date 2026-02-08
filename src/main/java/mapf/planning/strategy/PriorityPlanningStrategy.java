@@ -212,11 +212,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // MAPF FIX: Use cached order, only filter out completed goals
             List<Subgoal> unsatisfied = getOrComputeSubgoalOrder(currentState, level);
             if (unsatisfied.isEmpty()) break;
-            
-            // Log goal order once at start
-            if (fullPlan.isEmpty() && SearchConfig.isNormal() && !unsatisfied.isEmpty()) {
-                logGoalOrder(unsatisfied);
-            }
 
             // Try to execute highest priority subgoal
             boolean madeProgress = tryExecuteSubgoals(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
@@ -348,7 +343,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Fail-safe: If ran out of goals but not at goal state, refresh!
         // This handles the transition from Box Goals (Phase 1) to Agent Goals (Phase 2)
         if (remaining.isEmpty() && !currentState.isGoalState(level)) {
-            logNormal("[PP] No subgoals remaining, but not at goal state. Refreshing subgoal list (Phase switch?)");
+            logVerbose("[PP] Phase switch: refreshing subgoal list");
             computeAndCacheSubgoals(currentState, level);
             remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState, level);
         }
@@ -359,10 +354,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private void computeAndCacheSubgoals(State state, Level level) {
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
         sortSubgoals(cachedSubgoalOrder, state, level);
-        logNormal("[PP] Subgoal order computed: " + cachedSubgoalOrder.size() + " subgoals");
-        if (SearchConfig.isNormal()) {
-            logGoalOrder(cachedSubgoalOrder);
-        }
+        logGoalOrder(cachedSubgoalOrder);
     }
     
     private List<Subgoal> filterUnsatisfiedSubgoals(List<Subgoal> source, State currentState, Level level) {
@@ -400,8 +392,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // In push-pull domain, no filled goal is truly permanent — boxes can be pulled away.
         // Graceful degradation: return ALL unsatisfied goals, sorted by fewest unmet deps first.
         if (!allUnsatisfied.isEmpty()) {
-            logNormal("[PP] Cycle detected: all " + allUnsatisfied.size() 
-                      + " goals have unmet deps. Relaxing dependency enforcement.");
+            logVerbose("[PP] Cycle fallback: " + allUnsatisfied.size() 
+                      + " goals with unmet deps, relaxing enforcement");
             allUnsatisfied.sort((a, b) -> {
                 int unmetA = countUnmetDependencies(a.goalPos, level);
                 int unmetB = countUnmetDependencies(b.goalPos, level);
@@ -493,27 +485,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         orderMap.put(precomputedGoalOrder.get(i), i);
                     }
                     
-                    if (SearchConfig.isNormal()) {
-                        System.err.println("[PP] Sorting " + subgoals.size() + " subgoals with precomputed order:");
-                        for (Subgoal sg : subgoals) {
-                            int order = orderMap.getOrDefault(sg.goalPos, Integer.MAX_VALUE);
-                            System.err.println("  " + sg.goalPos + " (Box " + sg.boxType + ") -> order " + order);
-                        }
-                    }
-                    
                     subgoals.sort((a, b) -> {
                         int orderA = orderMap.getOrDefault(a.goalPos, Integer.MAX_VALUE);
                         int orderB = orderMap.getOrDefault(b.goalPos, Integer.MAX_VALUE);
                         return Integer.compare(orderA, orderB);
                     });
-                    
-                    if (SearchConfig.isNormal()) {
-                        System.err.println("[PP] After sorting:");
-                        for (int i = 0; i < subgoals.size(); i++) {
-                            Subgoal sg = subgoals.get(i);
-                            System.err.println("  " + (i+1) + ". " + sg.goalPos + " (Box " + sg.boxType + ")");
-                        }
-                    }
                 } else {
                     sortByDifficulty(subgoals, state, level);
                 }
@@ -532,13 +508,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         });
     }
     
-    /** Log the goal execution order for debugging. */
+    /** Log the goal execution order. Always printed at MINIMAL level — the canonical task plan output. */
     private void logGoalOrder(List<Subgoal> subgoals) {
-        System.err.println("[PP] Current Task Plan (" + subgoals.size() + " subgoals):");
+        if (!SearchConfig.isMinimal()) return;
+        System.err.println("[PP] Task Plan (" + subgoals.size() + " subgoals):");
         for (int i = 0; i < subgoals.size(); i++) {
             Subgoal sg = subgoals.get(i);
             String taskType = sg.isAgentGoal ? "AgentGoal" : ("Box " + sg.boxType);
-            System.err.println("  " + (i+1) + ". " + taskType + " -> " + sg.goalPos + " [Assigned: Agent " + sg.agentId + "]");
+            System.err.println("  " + (i+1) + ". " + taskType + " -> " + sg.goalPos + " [Agent " + sg.agentId + "]");
         }
     }
 
@@ -546,6 +523,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private boolean tryExecuteSubgoals(List<Subgoal> subgoals, List<Action[]> fullPlan, 
             State currentState, Level level, int numAgents, State initialState) {
         
+        int skippedByDeps = 0;
         for (Subgoal subgoal : subgoals) {
             // MAPF FIX: Strictly enforce goal dependencies.
             // Even if a lower-priority goal is locally executable, we must not execute it
@@ -554,18 +532,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 boolean depMet = true;
                 for (Position dep : goalDependsOn.get(subgoal.goalPos)) {
                     boolean isBoxG = level.getBoxGoal(dep.row, dep.col) != '\0';
-                    // Check if dependency is completed
                     if (isBoxG && !completedBoxGoals.contains(dep)) {
                         depMet = false;
-                        if (SearchConfig.isVerbose()) System.err.println("[PP] Skipping " + subgoal.goalPos + " (dep " + dep + " unsatisfied)");
                         break;
                     } else if (!isBoxG && !completedAgentGoals.contains(dep)) {
-                        depMet = false; // Agent goal dependency
-                         if (SearchConfig.isVerbose()) System.err.println("[PP] Skipping " + subgoal.goalPos + " (dep " + dep + " unsatisfied)");
+                        depMet = false;
                         break;
                     }
                 }
-                if (!depMet) continue;
+                if (!depMet) { skippedByDeps++; continue; }
             }
 
             // Task-Aware: Pass the full list of subgoals for global allocation checking
@@ -630,6 +605,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
         }
+        if (skippedByDeps > 0) {
+            logVerbose("[PP] Skipped " + skippedByDeps + "/" + subgoals.size() + " subgoals (unmet dependencies)");
+        }
         return false;
     }
     
@@ -676,7 +654,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return state; // Already in a safe parking spot
         }
         
-        logNormal("[PP] Yielding agent " + agentId + " from " + agentPos
+        logVerbose("[PP] Yielding agent " + agentId + " from " + agentPos
                 + " (onBoxGoal=" + onBoxGoal + ", onAgentGoal=" + onAgentGoal 
                 + ", inCorridor=" + inCorridor + ", onCriticalPath=" + onCriticalPath + ")");
         
@@ -749,7 +727,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             globalTimeStep++;
         }
         
-        logNormal("[PP] Parked agent " + agentId + " at " + tempState.getAgentPosition(agentId)
+        logVerbose("[PP] Parked agent " + agentId + " at " + tempState.getAgentPosition(agentId)
                 + " (was " + agentPos + ")");
         return tempState;
     }
@@ -916,8 +894,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Cycle-aware degradation: if >50% of completed goals are hard-frozen,
         // circular dependencies are over-constraining the search. Degrade to all-soft.
         if (!completedBoxGoals.isEmpty() && hardFrozen.size() > completedBoxGoals.size() / 2) {
-            logNormal("[PP] Hard-frozen ratio too high (" + hardFrozen.size() + "/" 
-                      + completedBoxGoals.size() + "), degrading to all-soft for BSP flexibility.");
+            logVerbose("[PP] Hard-frozen ratio " + hardFrozen.size() + "/" 
+                      + completedBoxGoals.size() + ", degrading to all-soft");
             return Collections.emptySet();
         }
         
@@ -945,7 +923,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
             Character actualBox = state.getBoxes().get(goalPos);
             if (actualBox == null || actualBox != goalType) {
-                logNormal("[PP] Previously completed goal at " + goalPos + " was disturbed, removing from frozen set");
+                logVerbose("[PP] Goal at " + goalPos + " disturbed, removing from frozen set");
                 it.remove();
                 // Also force subgoal list refresh so this goal gets re-added
                 cachedSubgoalOrder = null;
@@ -1038,14 +1016,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             deadlockResolver.analyzeBlocking(currentState, level, subgoals, immovableBoxes);
         
         if (!blockingInfos.isEmpty()) {
-            if (SearchConfig.isVerbose()) {
-                System.err.println("[PP] Found " + blockingInfos.size() + " blocking infos:");
-                for (DeadlockResolver.BlockingInfo info : blockingInfos) {
-                    System.err.println("  Agent " + info.blockedAgentId + " blocked by " + 
-                        (info.isBlockedByBox ? ("Box " + info.blockingBoxType) : ("Agent " + info.blockingAgentId)) +
-                        " at " + info.blockingPosition);
-                }
-            }
+            logVerbose("[PP] " + blockingInfos.size() + " blocking infos detected");
 
             DeadlockResolver.DisplacementPlan displacement = 
                 deadlockResolver.createDisplacementPlan(blockingInfos, currentState, level, displacementHistory);
