@@ -98,7 +98,7 @@ public class GreedyPlanner {
         if (primaryAgent != -1 && primaryAction != null) {
             boolean isAgentGoalPhase = GoalChecker.allBoxGoalsSatisfied(state, level);
             Action[] jointAction = planMerger.createJointActionWithMerging(
-                    primaryAgent, primaryAction, state, level, numAgents, isAgentGoalPhase);
+                    primaryAgent, primaryAction, state, level, numAgents, isAgentGoalPhase, null);
             jointAction = conflictResolver.resolveConflicts(jointAction, state, level);
             plan.add(jointAction);
             return true;

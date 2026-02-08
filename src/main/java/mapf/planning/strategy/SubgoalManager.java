@@ -128,13 +128,13 @@ public class SubgoalManager {
         return false;
     }
     
-    public int estimateSubgoalDifficulty(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level) {
+    public int estimateSubgoalDifficulty(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, Set<Position> completedBoxGoals) {
         if (subgoal.isAgentGoal) {
             Position agentPos = state.getAgentPosition(subgoal.agentId);
             return immovableDetector.getDistanceWithImmovableBoxes(agentPos, subgoal.goalPos, state, level);
         }
         
-        Position closestBox = findBestBoxForGoal(subgoal, state, level);
+        Position closestBox = findBestBoxForGoal(subgoal, state, level, completedBoxGoals);
         if (closestBox == null) return Integer.MAX_VALUE;
         
         int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(closestBox, subgoal.goalPos, state, level);
@@ -148,15 +148,15 @@ public class SubgoalManager {
         return boxToGoal + agentToBox;
     }
     
-    public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level) {
-        return findBestBoxForGoal(subgoal, state, level, Collections.emptyList());
+    public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, Set<Position> completedBoxGoals) {
+        return findBestBoxForGoal(subgoal, state, level, Collections.emptyList(), completedBoxGoals);
     }
 
     /**
      * Finds the best box for a goal, ensuring that the assignment doesn't leave other goals unsolvable.
      * Uses Bipartite Matching to verify feasibility (Global Allocation Check).
      */
-    public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals) {
+    public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals, Set<Position> completedBoxGoals) {
         Position bestBox = null;
         int bestTotalDist = Integer.MAX_VALUE;
         Position agentPos = state.getAgentPosition(subgoal.agentId);
@@ -172,8 +172,13 @@ public class SubgoalManager {
             Position boxPos = entry.getKey();
             
             // Skip if box already at satisfied goal
+            // FIX: Be stricter - if it's on ANY goal of the correct type, avoid it
+            // unless we are absolutely forced to use it (handled by fallback logic if needed)
             if (level.getBoxGoal(boxPos) == subgoal.boxType) continue;
             
+            // Skip if box is on a COMPLETED goal (meaning it's frozen/permanent)
+            if (subgoal.boxType == level.getBoxGoal(boxPos) && completedBoxGoals.contains(boxPos)) continue;
+
             // Skip if box is immovable
             if (immovableBoxes.contains(boxPos)) continue;
             

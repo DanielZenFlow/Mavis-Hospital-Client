@@ -104,14 +104,14 @@ public class PlanMerger {
      * Creates a joint action with plan merging from other agents.
      */
     public Action[] createJointActionWithMerging(int primaryAgent, Action primaryAction,
-            State state, Level level, int numAgents, boolean isAgentGoalPhase) {
+            State state, Level level, int numAgents, boolean isAgentGoalPhase, Set<Position> completedBoxGoals) {
         
         Action[] jointAction = new Action[numAgents];
         Arrays.fill(jointAction, Action.noOp());
         jointAction[primaryAgent] = primaryAction;
 
         if (numAgents > 1) {
-            addOtherAgentMoves(jointAction, primaryAgent, state, level, numAgents, isAgentGoalPhase);
+            addOtherAgentMoves(jointAction, primaryAgent, state, level, numAgents, isAgentGoalPhase, completedBoxGoals);
         }
 
         return jointAction;
@@ -121,7 +121,7 @@ public class PlanMerger {
      * Adds moves from other agents to the joint action.
      */
     public void addOtherAgentMoves(Action[] jointAction, int primaryAgent, State state,
-            Level level, int numAgents, boolean isAgentGoalPhase) {
+            Level level, int numAgents, boolean isAgentGoalPhase, Set<Position> completedBoxGoals) {
         
         Set<Position> reservedPositions = new HashSet<>();
         Set<Position> reservedBoxPositions = new HashSet<>();
@@ -152,7 +152,7 @@ public class PlanMerger {
                 continue;
 
             Action storedAction = getNextActionIfApplicable(agentId, state, level,
-                    reservedPositions, reservedBoxPositions, satisfiedGoalPositions, isAgentGoalPhase);
+                    reservedPositions, reservedBoxPositions, satisfiedGoalPositions, isAgentGoalPhase, completedBoxGoals);
 
             if (storedAction != null) {
                 jointAction[agentId] = storedAction;
@@ -163,7 +163,7 @@ public class PlanMerger {
 
     private Action getNextActionIfApplicable(int agentId, State state, Level level,
             Set<Position> reservedPositions, Set<Position> reservedBoxPositions,
-            Set<Position> satisfiedGoalPositions, boolean isAgentGoalPhase) {
+            Set<Position> satisfiedGoalPositions, boolean isAgentGoalPhase, Set<Position> completedBoxGoals) {
         
         List<Action> plan = storedPlans.get(agentId);
         int index = planIndexes.getOrDefault(agentId, 0);
@@ -195,6 +195,9 @@ public class PlanMerger {
             if (!isAgentGoalPhase && satisfiedGoalPositions.contains(boxPos)) {
                 return null;
             }
+            if (completedBoxGoals != null && completedBoxGoals.contains(newBoxPos)) {
+                return null;
+            }
         } else if (action.type == Action.ActionType.PULL) {
             Position boxPos = agentPos.move(action.boxDir.opposite());
             Position newAgentPos = agentPos.move(action.agentDir);
@@ -202,6 +205,9 @@ public class PlanMerger {
                 return null;
             }
             if (!isAgentGoalPhase && satisfiedGoalPositions.contains(boxPos)) {
+                return null;
+            }
+            if (completedBoxGoals != null && completedBoxGoals.contains(agentPos)) {
                 return null;
             }
         }

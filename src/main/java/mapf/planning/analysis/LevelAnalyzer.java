@@ -182,7 +182,6 @@ public class LevelAnalyzer {
         if (goals.isEmpty()) return dependsOn;
         
         // Find root position representing "Main Open Space" (agent accessible area)
-        // CRITICAL FIX: Treat immovable boxes as walls when finding open space root
         Position root = findOpenSpaceRoot(level, goals, immovableBoxes);
         if (root == null) {
             System.err.println("[LevelAnalyzer] Warning: No open space root found");
@@ -192,42 +191,25 @@ public class LevelAnalyzer {
         System.err.println("[LevelAnalyzer] Reachability-based dependency analysis");
         System.err.println("[LevelAnalyzer] Open space root: " + root);
         System.err.println("[LevelAnalyzer] Testing " + goals.size() + " goals...");
-        System.err.println("[LevelAnalyzer] Immovable boxes (treated as walls): " + immovableBoxes.size());
         
         // COLOR-AWARE FIX: Pre-compute per-color effective impassable box sets.
-        // An agent of color X can only push boxes of color X.
-        // Boxes of OTHER colors are impassable obstacles for that agent.
-        // This prevents false dependencies (e.g., blue agent assumed to push through orange boxes).
         Map<Color, Set<Position>> effectiveImpassableByColor = new HashMap<>();
-        for (Map.Entry<Position, Character> boxEntry : state.getBoxes().entrySet()) {
-            Position boxPos = boxEntry.getKey();
-            if (immovableBoxes.contains(boxPos)) continue; // Already globally impassable
-            Color boxColor = level.getBoxColor(boxEntry.getValue());
-            // This box is impassable for agents of EVERY OTHER color
-            for (Color agentColor : Color.values()) {
-                if (agentColor != boxColor) {
-                    effectiveImpassableByColor
-                        .computeIfAbsent(agentColor, k -> new HashSet<>(immovableBoxes))
-                        .add(boxPos);
-                }
-            }
-        }
-        // Ensure every color has at least the base immovable set
         for (Color c : Color.values()) {
             effectiveImpassableByColor.putIfAbsent(c, new HashSet<>(immovableBoxes));
         }
         
-        // Build dependency graph using hypothetical reachability testing
-        // For each pair (Gi, Gj): if blocking Gi makes Gj unreachable, then Gi depends on Gj
-        // 
-        // KEY INSIGHT: We need to check if a BOX can be PUSHED into Gj, not just agent reachability.
-        // A box can be pushed into Gj if agent can reach a position adjacent to Gj 
-        // (to push from) AND there's a path for the box.
-        // COLOR-AWARE: The agent servicing goalJ can only push same-color boxes.
-        // LOCAL ROOT: Each goal uses a root within its own connected component (under color
-        // constraints), avoiding false dependencies when cross-color boxes split the map.
-        
         int dependencyCount = 0;
+
+        // =========================================================================================
+        // PHASE 1: Goal-to-Goal Dependencies (Hard Blocking)
+        // If blocking Gi (Goal I) makes Gj (Goal J) unreachable, then Gi depends on Gj.
+        // Gi must complete AFTER Gj (Gj blocks Gi). Wait...
+        // Original logic: "if blocking Gi makes Gj unreachable, then Gi depends on Gj"
+        // -> Means Gi is the blocker (filled goal). Gj is the one trying to reach.
+        // -> If filled Gi blocks Gj, then Gi CANNOT be filled before Gj is done.
+        // -> So Gi depends on Gj. (Gi waits for Gj). Correct.
+        // =========================================================================================
+
         for (Position goalJ : goals) {
             // Determine the color of the agent that services goalJ
             Color servicingColor = getGoalServicingColor(goalJ, level);
@@ -235,53 +217,129 @@ public class LevelAnalyzer {
                 ? effectiveImpassableByColor.get(servicingColor) 
                 : immovableBoxes;
             
-            // Determine if goalJ is an agent goal vs box goal
-            boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0) 
-                                  && (level.getBoxGoal(goalJ.row, goalJ.col) == '\0');
-            
-            // COLOR-AWARE ROOT: Use a root within goalJ's own connected component.
-            // When cross-color boxes split the map into multiple areas, the global colorRoot
-            // may be in a different component than goalJ. We need a root reachable from goalJ
-            // within the effective impassable constraints.
+            boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0);
             Position localRoot = findLocalRoot(goalJ, level, effectiveImpassable);
-            if (localRoot == null) {
-                // goalJ is completely walled off (on an impassable cell itself) - skip
-                System.err.println("[LevelAnalyzer] Goal " + goalJ + " is on an impassable cell. Skipping.");
-                continue;
-            }
+            if (localRoot == null) continue;
             
             for (Position goalI : goals) {
                 if (goalI.equals(goalJ)) continue;
                 
                 boolean canReachGoalJ;
                 if (isAgentGoal) {
-                    // Agent goal: agent just needs to WALK to goalJ (no push required)
                     canReachGoalJ = isReachableWithHypotheticalBlock(
                         localRoot, goalJ, level, goalI, Collections.emptySet(), effectiveImpassable);
                 } else {
-                    // Box goal: agent needs to PUSH a box into goalJ
-                    // MAJOR FIX: Pass candidate boxes to check if ANY box is reachable from agent AND can reach goal
                     List<Position> candidateBoxes = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
                     canReachGoalJ = canPushBoxToGoalWithBlock(goalJ, goalI, level, Collections.emptySet(), 
                                                               effectiveImpassable, localRoot, candidateBoxes);
                 }
                 
                 if (!canReachGoalJ) {
-                    // Cannot reach goalJ when goalI is blocked
-                    // Therefore: goalJ must be completed BEFORE goalI
-                    // In dependency terms: goalI depends on goalJ
+                    // Filled Goal I blocks Goal J.
+                    // Goal I must wait for Goal J.
                     dependsOn.get(goalI).add(goalJ);
                     dependencyCount++;
-                    
-                    char charI = level.getBoxGoal(goalI.row, goalI.col);
-                    char charJ = level.getBoxGoal(goalJ.row, goalJ.col);
-                    String typeJ = isAgentGoal ? "agent-walk" : "box-push";
-                    System.err.println("[DEBUG] " + goalI + "(" + charI + ") depends on " + 
-                                       goalJ + "(" + charJ + ") - blocking " + goalI + " makes " + goalJ + " unreachable for " + typeJ);
                 }
             }
         }
-        System.err.println("[LevelAnalyzer] Found " + dependencyCount + " dependencies");
+        System.err.println("[LevelAnalyzer] Found " + dependencyCount + " Hard Goal-to-Goal dependencies");
+
+        // =========================================================================================
+        // PHASE 2: Start-to-Goal Dependencies (Soft Blocking / Initial Layout)
+        // Check if the CURRENT position of Box I blocks Goal J.
+        // If Box I is at Pos P, and Pos P blocks Goal J, then Goal J depends on Goal I.
+        // (Goal J needs Box I to MOVE out of the way -> potentially to Goal I).
+        // =========================================================================================
+        
+        // 1. Map Goal -> ALL current box positions of its type (excluding immovable boxes)
+        // FIX: Previously used candidates.get(0) which ignored other boxes of the same type.
+        // Now we collect ALL same-type box positions and test each as a potential blocker.
+        Map<Position, List<Position>> goalToBoxPositions = new HashMap<>();
+        Map<Character, List<Position>> boxesByType = new HashMap<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            // Filter out immovable boxes: they are treated as walls already in Phase 1
+            if (!immovableBoxes.contains(entry.getKey())) {
+                boxesByType.computeIfAbsent(entry.getValue(), k -> new ArrayList<>()).add(entry.getKey());
+            }
+        }
+
+        for (Position goal : goals) {
+             char type = level.getBoxGoal(goal.row, goal.col);
+             if (type != '\0') {
+                 List<Position> candidates = boxesByType.get(type);
+                 if (candidates != null && !candidates.isEmpty()) {
+                     goalToBoxPositions.put(goal, new ArrayList<>(candidates));
+                 }
+             }
+        }
+
+        int startDepCount = 0;
+        for (Position goalJ : goals) { 
+             Color servicingColor = getGoalServicingColor(goalJ, level);
+             Set<Position> effectiveImpassable = (servicingColor != null) 
+                ? effectiveImpassableByColor.get(servicingColor) 
+                : immovableBoxes;
+             
+             Position localRoot = findLocalRoot(goalJ, level, effectiveImpassable);
+             if (localRoot == null) continue;
+             
+             boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0);
+
+             for (Position goalI : goals) {
+                 if (goalI.equals(goalJ)) continue;
+                 
+                 List<Position> blockerPositions = goalToBoxPositions.get(goalI);
+                 if (blockerPositions == null || blockerPositions.isEmpty()) continue;
+
+                 // FIX: Test ALL box positions of goalI's type as potential blockers.
+                 // Dependency exists only if EVERY candidate box blocks goalJ.
+                 // (If any one box does NOT block, the planner can choose that one.)
+                 boolean allBlock = true;
+                 Position worstBlocker = null;
+                 for (Position blockerPos : blockerPositions) {
+                     Set<Position> tempWalls = new HashSet<>(effectiveImpassable);
+                     tempWalls.add(blockerPos);
+                     
+                     boolean canReachGoalJ;
+                     if (isAgentGoal) {
+                          canReachGoalJ = isReachableWithHypotheticalBlock(
+                            localRoot, goalJ, level, null, tempWalls, effectiveImpassable);
+                     } else {
+                          List<Position> candidateBoxes = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
+                          canReachGoalJ = canPushBoxToGoalWithBlock(goalJ, null, level, tempWalls, 
+                                                                  effectiveImpassable, localRoot, candidateBoxes);
+                     }
+                     
+                     if (canReachGoalJ) {
+                         allBlock = false;
+                         break; // At least one box position doesn't block -> no dependency
+                     }
+                     worstBlocker = blockerPos;
+                 }
+                 
+                 if (allBlock && worstBlocker != null) {
+                     // ALL boxes of goalI's type block Goal J at their start positions.
+                     // Goal J depends on Goal I (I must move first).
+                     
+                     // CYCLE CHECK:
+                     // Does I already depend on J? (I -> ... -> J)
+                     // If so, adding J -> I creates a loop (I -> ... -> J -> I).
+                     // Start-Blocking is "soft" (we can move Box I somewhere else, not necessarily to Goal I).
+                     // Goal-Blocking is "hard" (Goal I is a fixed location).
+                     // So we respect Hard dependencies and ignore Soft ones if they conflict.
+                     
+                     if (!hasDependency(goalI, goalJ, dependsOn)) {
+                         dependsOn.get(goalJ).add(goalI);
+                         startDepCount++;
+                         System.err.println("[DEBUG-INIT] " + goalJ + " blocked by start pos of " + goalI + " (all " + blockerPositions.size() + " boxes block) (Added Dependency)");
+                     } else {
+                         System.err.println("[DEBUG-INIT] " + goalJ + " blocked by start pos of " + goalI + " BUT Cycle detected - Skipping Dependency (Requires Displacement)");
+                     }
+                 }
+             }
+        }
+        System.err.println("[LevelAnalyzer] Found " + startDepCount + " Start-to-Goal dependencies");
+        dependencyCount += startDepCount;
         
         try (java.io.PrintWriter debugWriter = new java.io.PrintWriter(new java.io.FileWriter("debug_dependencies.txt"))) {
             debugWriter.println("[LevelAnalyzer] Reachability-based dependency analysis for " + goals.size() + " goals");
@@ -320,6 +378,32 @@ public class LevelAnalyzer {
         }
         
         return dependsOn;
+    }
+
+    /**
+     * Checks if 'from' transitively depends on 'to' in the dependency graph.
+     */
+    private static boolean hasDependency(Position from, Position to, Map<Position, Set<Position>> dependsOn) {
+        if (from.equals(to)) return true;
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(from);
+        visited.add(from);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            Set<Position> deps = dependsOn.get(current);
+            if (deps != null) {
+                for (Position next : deps) {
+                    if (next.equals(to)) return true;
+                    if (!visited.contains(next)) {
+                        visited.add(next);
+                        queue.add(next);
+                    }
+                }
+            }
+        }
+        return false;
     }
     
     /**
@@ -416,9 +500,9 @@ public class LevelAnalyzer {
             
             if (!agentCanReachBox) continue;
 
-            // CHECK B: Can Box reach the Goal? (Simple connectivity check)
-            // (Treating box as an agent that can move anywhere except walls/blockers)
-            boolean boxCanReachGoal = isReachableWithHypotheticalBlock(
+            // CHECK B: Can Box reach the Goal? (Constraint-aware check)
+            // Use existsPushPath to check if box can actually be PUSHED (agent needs space behind)
+             boolean boxCanReachGoal = existsPushPath(
                 boxPos, goalPos, level, blockedPos, movableBoxPositions, immovableBoxes);
             
             if (!boxCanReachGoal) continue;
@@ -524,7 +608,7 @@ public class LevelAnalyzer {
         
         q.add(start);
         visited.add(start);
-        visited.add(blockedPos);  // Treat hypothetically blocked position as impassable
+        if (blockedPos != null) visited.add(blockedPos);  // Treat hypothetically blocked position as impassable
         visited.addAll(immovableBoxes);  // Treat all immovable boxes as walls
         
         while (!q.isEmpty()) {
@@ -540,6 +624,71 @@ public class LevelAnalyzer {
                     visited.add(next);
                     q.add(next);
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks if a box can be moved from start to target using Push OR Pull mechanics.
+     * 
+     * Push: Agent at current.opposite(dir) pushes box from current → next.
+     *       Requires: agent position (behind box) is free.
+     * Pull: Agent at next pulls box from current → next (agent was at next, moves to next.move(dir),
+     *       pulling box into next). Requires: a free cell beyond next for agent to step into.
+     * 
+     * In push-pull domain, Pull dramatically increases box mobility (no dead corners).
+     */
+    private static boolean existsPushPath(Position start, Position target, 
+            Level level, Position blockedPos, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (target.equals(blockedPos)) return false;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        Set<Position> obstacles = new HashSet<>(immovableBoxes);
+        if (blockedPos != null) obstacles.add(blockedPos);
+        
+        // Also add movableBoxPositions to obstacles, because if we are testing a specific box path,
+        // other boxes are obstacles unless we recursively solve them (too complex).
+        // Since this is for dependency analysis, assuming other boxes are obstacles is safer.
+        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        
+        // Start position cannot be an obstacle (it's where the box is)
+        obstacles.remove(start); 
+
+        q.add(start);
+        visited.add(start);
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                
+                // 1. Next position must be valid for Box
+                if (level.isWall(next) || obstacles.contains(next) || visited.contains(next)) {
+                    continue;
+                }
+                
+                // Option 1: PUSH — Agent at current.opposite(dir) pushes box current→next
+                Position pushAgentPos = current.move(dir.opposite());
+                boolean canPush = !level.isWall(pushAgentPos) && !obstacles.contains(pushAgentPos);
+                
+                // Option 2: PULL — Agent stands at next, moves to next.move(dir),
+                //           pulling box from current into next.
+                //           Requires: next.move(dir) is free for agent to step into.
+                Position pullAgentDest = next.move(dir);
+                boolean canPull = !level.isWall(pullAgentDest) && !obstacles.contains(pullAgentDest)
+                                  && !level.isWall(next) && !obstacles.contains(next);
+                
+                if (!canPush && !canPull) {
+                    continue; // Neither push nor pull can move box this direction
+                }
+                
+                visited.add(next);
+                q.add(next);
             }
         }
         return false;
