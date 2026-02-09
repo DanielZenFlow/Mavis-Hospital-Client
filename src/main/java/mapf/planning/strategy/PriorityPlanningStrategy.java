@@ -363,6 +363,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     private void computeAndCacheSubgoals(State state, Level level) {
+        // Hungarian optimal box-to-goal assignment: only when NO serialization dependencies.
+        // When goalDependsOn is non-empty, goals must be filled in strict topological order
+        // (e.g., dead-end corridors: inner-first). Hungarian's static global assignment
+        // conflicts with this dynamic sequential execution — it assumes all goals are
+        // simultaneously accessible, which is false in dead-end topologies.
+        // In dependency-free levels, Hungarian minimizes total transport distance.
+        if (goalDependsOn.isEmpty()) {
+            subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
+        } else {
+            subgoalManager.invalidateHungarianCache();
+            logNormal("[PP] Goal dependencies detected (" + goalDependsOn.size() 
+                    + " deps) — using greedy per-step assignment (Hungarian disabled)");
+        }
+        
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
         sortSubgoals(cachedSubgoalOrder, state, level);
         logGoalOrder(cachedSubgoalOrder);
@@ -579,6 +593,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
+                        // Invalidate Hungarian cache — world state changed, assignment may be stale
+                        subgoalManager.invalidateHungarianCache();
                     }
                     
                     // Check if any previously completed goals were disturbed (soft-unlock)
@@ -1066,6 +1082,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (verifyGoalReached(sg, tempState, level)) {
                     if (!sg.isAgentGoal) {
                         completedBoxGoals.add(sg.goalPos);
+                        subgoalManager.invalidateHungarianCache();
                     }
                     return true;
                 }

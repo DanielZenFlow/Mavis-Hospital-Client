@@ -14,6 +14,9 @@ public class SubgoalManager {
     private final Heuristic heuristic;
     private final ImmovableBoxDetector immovableDetector;
     
+    /** Cached Hungarian optimal assignments: boxType → (goalPos → boxPos). */
+    private Map<Character, HungarianBoxAssigner.AssignmentResult> hungarianCache = null;
+    
     public SubgoalManager(Heuristic heuristic) {
         this.heuristic = heuristic;
         this.immovableDetector = new ImmovableBoxDetector();
@@ -35,6 +38,32 @@ public class SubgoalManager {
      */
     public void initDistanceCache(State state, Level level) {
         immovableDetector.initializeDistanceCache(state, level);
+    }
+    
+    /**
+     * Computes (or recomputes) the Hungarian optimal box-to-goal assignment cache.
+     * Should be called once at the start of each planning episode (when subgoal list is first built).
+     * Invalidates automatically when state changes require re-planning.
+     */
+    public void computeHungarianAssignment(State state, Level level, Set<Position> completedBoxGoals) {
+        hungarianCache = HungarianBoxAssigner.computeAllAssignments(
+                state, level, completedBoxGoals, immovableDetector);
+        if (mapf.planning.SearchConfig.isVerbose()) {
+            int totalAssigned = 0;
+            for (HungarianBoxAssigner.AssignmentResult r : hungarianCache.values()) {
+                totalAssigned += r.getGoalToBoxMap().size();
+            }
+            System.err.println("[SubgoalManager] Hungarian pre-assignment: " 
+                    + totalAssigned + " goals across " + hungarianCache.size() + " types");
+        }
+    }
+    
+    /**
+     * Invalidates the Hungarian cache, forcing recomputation on next access.
+     * Call when the world state has changed significantly (e.g., after completing a subgoal).
+     */
+    public void invalidateHungarianCache() {
+        hungarianCache = null;
     }
     
     /**
@@ -166,16 +195,29 @@ public class SubgoalManager {
 
     /**
      * Finds the best box for a goal, ensuring that the assignment doesn't leave other goals unsolvable.
-     * Uses Bipartite Matching to verify feasibility (Global Allocation Check).
+     * 
+     * Strategy (layered):
+     * 1. Consult Hungarian pre-computed optimal assignment (if available and box still valid)
+     * 2. Fall back to greedy distance sort + bipartite feasibility check
      */
     public Position findBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals, Set<Position> completedBoxGoals) {
-        Position bestBox = null;
-        int bestTotalDist = Integer.MAX_VALUE;
         Position agentPos = state.getAgentPosition(subgoal.agentId);
-        
         Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
-        
-        // Collect all valid candidates first
+
+        // --- Layer 1: Hungarian pre-assignment ---
+        Position hungarianBox = getHungarianCandidate(subgoal, state, level, immovableBoxes, agentPos);
+        if (hungarianBox != null) {
+            // Validate: the Hungarian pick must pass the same feasibility check
+            if (isAllocationFeasible(hungarianBox, subgoal, state, level, allPendingSubgoals)) {
+                if (mapf.planning.SearchConfig.isVerbose()) {
+                    System.err.println("[SubgoalManager] Using Hungarian assignment for " 
+                            + subgoal.boxType + " -> " + subgoal.goalPos + ": box at " + hungarianBox);
+                }
+                return hungarianBox;
+            }
+        }
+
+        // --- Layer 2: Greedy fallback with feasibility check ---
         List<BoxCandidate> candidates = new ArrayList<>();
 
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
@@ -184,8 +226,6 @@ public class SubgoalManager {
             Position boxPos = entry.getKey();
             
             // Skip if box already at satisfied goal
-            // FIX: Be stricter - if it's on ANY goal of the correct type, avoid it
-            // unless we are absolutely forced to use it (handled by fallback logic if needed)
             if (level.getBoxGoal(boxPos) == subgoal.boxType) continue;
             
             // Skip if box is on a COMPLETED goal (meaning it's frozen/permanent)
@@ -213,7 +253,6 @@ public class SubgoalManager {
 
         // Iterate candidates and check feasibility
         for (BoxCandidate candidate : candidates) {
-            // Task-Aware Allocation: Check if using this box leaves other goals solvable
             if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
                 return candidate.pos;
             }
@@ -221,7 +260,6 @@ public class SubgoalManager {
 
         // Fallback: If strict feasibility check fails for ALL (e.g. tight spacing), 
         // return NULL to indicate this goal cannot be safely served yet.
-        // This allows PriorityPlanningStrategy to skip this goal and try others (Dynamic Reordering).
         if (!candidates.isEmpty()) {
             if (mapf.planning.SearchConfig.isVerbose()) {
                 System.err.println("[SubgoalManager] All " + candidates.size() + " candidates for " + subgoal.goalPos 
@@ -231,6 +269,38 @@ public class SubgoalManager {
         }
         
         return null;
+    }
+
+    /**
+     * Retrieves the Hungarian-assigned box for a subgoal, if the assignment is still valid.
+     * Returns null if no Hungarian cache exists, the box type has no assignment,
+     * or the assigned box is no longer available (moved, immovable, unreachable).
+     */
+    private Position getHungarianCandidate(PriorityPlanningStrategy.Subgoal subgoal, 
+                                            State state, Level level,
+                                            Set<Position> immovableBoxes, Position agentPos) {
+        if (hungarianCache == null) return null;
+        
+        HungarianBoxAssigner.AssignmentResult result = hungarianCache.get(subgoal.boxType);
+        if (result == null) return null;
+        
+        Position assignedBox = result.getAssignedBox(subgoal.goalPos);
+        if (assignedBox == null) return null;
+        
+        // Validate the assigned box is still valid in the current state
+        Character boxAtPos = state.getBoxes().get(assignedBox);
+        if (boxAtPos == null || boxAtPos != subgoal.boxType) return null; // Box moved away
+        if (immovableBoxes.contains(assignedBox)) return null;           // Box became immovable
+        if (level.getBoxGoal(assignedBox) == subgoal.boxType) return null; // Box already at a goal
+        if (!isBoxMovable(assignedBox, state, level)) return null;        // Box stuck
+        
+        // Check reachability
+        int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, assignedBox, state, level);
+        if (agentToBox == Integer.MAX_VALUE) return null;
+        int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(assignedBox, subgoal.goalPos, state, level);
+        if (boxToGoal == Integer.MAX_VALUE) return null;
+        
+        return assignedBox;
     }
 
     private static class BoxCandidate {
