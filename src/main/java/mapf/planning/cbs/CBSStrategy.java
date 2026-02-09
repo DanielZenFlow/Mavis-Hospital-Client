@@ -138,6 +138,13 @@ public class CBSStrategy implements SearchStrategy {
         Map<Integer, Task> assignments = new HashMap<>();
         Set<Integer> assignedAgents = new HashSet<>();
         
+        // CONNECTED-COMPONENT FIX: Precompute per-agent reachable areas (BFS, immovable boxes = walls)
+        Set<Position> immovableBoxes = computeImmovableBoxes(state, level);
+        Map<Integer, Set<Position>> agentReachable = new HashMap<>();
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            agentReachable.put(i, bfsReachable(state.getAgentPosition(i), level, immovableBoxes));
+        }
+        
         // Find all box goals
         Map<Character, List<Position>> goalsByType = new HashMap<>();
         for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
@@ -153,22 +160,24 @@ public class CBSStrategy implements SearchStrategy {
             }
         }
         
-        // Naive Greedy Assignment: Iterate goals, find nearest box, nearest agent OF MATCHING COLOR
+        // Greedy Assignment with BFS reachability instead of Manhattan distance.
+        // Ensures agent, box, and goal are in the same connected component.
         for (Map.Entry<Character, List<Position>> entry : goalsByType.entrySet()) {
             char type = entry.getKey();
             for (Position goalVal : entry.getValue()) {
-                // Find nearest box of this type
+                // Find nearest box of this type using BFS distance
                 Position bestBox = null;
                 int minBoxDist = Integer.MAX_VALUE;
                 for (Map.Entry<Position, Character> box : state.getBoxes().entrySet()) {
                     if (box.getValue() == type) {
-                        int d = box.getKey().manhattanDistance(goalVal);
+                        if (immovableBoxes.contains(box.getKey())) continue; // skip immovable
+                        int d = bfsDistance(box.getKey(), goalVal, level, immovableBoxes);
                         if (d < minBoxDist) { minBoxDist = d; bestBox = box.getKey(); }
                     }
                 }
                 
                 if (bestBox != null) {
-                    // Find nearest agent THAT CAN MANIPULATE THIS BOX TYPE (color match)
+                    // Find nearest agent OF MATCHING COLOR that can REACH the box
                     int bestAgent = -1;
                     int minAgentDist = Integer.MAX_VALUE;
                     for (int i = 0; i < state.getNumAgents(); i++) {
@@ -176,7 +185,10 @@ public class CBSStrategy implements SearchStrategy {
                         if (level.getAgentColor(i) != level.getBoxColor(type)) continue;  // COLOR CONSTRAINT
                         Position aPos = state.getAgentPosition(i);
                         if (aPos == null) continue;
-                        int d = aPos.manhattanDistance(bestBox);
+                        // FIX: Use BFS distance; unreachable agents get MAX_VALUE and are skipped
+                        Set<Position> reachable = agentReachable.get(i);
+                        if (!isAdjacentToReachable(bestBox, reachable)) continue; // box not in agent's component
+                        int d = bfsDistance(aPos, bestBox, level, immovableBoxes);
                         if (d < minAgentDist) { minAgentDist = d; bestAgent = i; }
                     }
                     
@@ -189,6 +201,83 @@ public class CBSStrategy implements SearchStrategy {
             }
         }
         return assignments;
+    }
+    
+    // ==================== Connected-Component Helpers ====================
+    
+    /**
+     * BFS reachability from a start position, treating immovable boxes as walls.
+     */
+    private static Set<Position> bfsReachable(Position start, Level level, Set<Position> immovableBoxes) {
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(start);
+        visited.add(start);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (immovableBoxes.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return visited;
+    }
+    
+    /**
+     * BFS single-pair distance. Returns Integer.MAX_VALUE if unreachable.
+     */
+    private static int bfsDistance(Position from, Position to, Level level, Set<Position> immovableBoxes) {
+        if (from.equals(to)) return 0;
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Integer> dist = new HashMap<>();
+        queue.add(from);
+        dist.put(from, 0);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            int d = dist.get(current);
+            if (current.equals(to)) return d;
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (dist.containsKey(next)) continue;
+                if (level.isWall(next)) continue;
+                if (immovableBoxes.contains(next)) continue;
+                dist.put(next, d + 1);
+                queue.add(next);
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+    
+    /**
+     * Checks if a position is adjacent to any cell in the reachable set.
+     */
+    private static boolean isAdjacentToReachable(Position pos, Set<Position> reachable) {
+        for (Direction dir : Direction.values()) {
+            if (reachable.contains(pos.move(dir))) return true;
+        }
+        return false;
+    }
+    
+    /**
+     * Computes immovable box positions (no agent of matching color exists).
+     */
+    private static Set<Position> computeImmovableBoxes(State state, Level level) {
+        Set<Color> pushableColors = EnumSet.noneOf(Color.class);
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            pushableColors.add(level.getAgentColor(i));
+        }
+        Set<Position> immovable = new HashSet<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            Color boxColor = level.getBoxColor(entry.getValue());
+            if (!pushableColors.contains(boxColor)) {
+                immovable.add(entry.getKey());
+            }
+        }
+        return immovable;
     }
     
     /**
