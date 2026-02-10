@@ -51,41 +51,30 @@ public class StrategySelector {
     public SearchStrategy selectStrategy(Level level, State initialState) {
         int numAgents = initialState.getNumAgents();
         
-        System.err.println("StrategySelector: " + numAgents + " agents detected");
-        
         // Analyze level
         LevelFeatures features = LevelAnalyzer.analyze(level, initialState);
-        System.err.println("StrategySelector: Analysis - " + features.analysisReport);
-        System.err.println("StrategySelector: Recommended Strategy - " + features.recommendedStrategy);
 
         // Option to use new simplified strategy for testing
         if (USE_SIMPLE_STRATEGY && numAgents > 1) {
-            System.err.println("StrategySelector: Using SimplePriorityStrategy (REFACTORED)");
             return new SimplePriorityStrategy();
         }
 
         // Use Recommendation
         switch (features.recommendedStrategy) {
             case SINGLE_AGENT:
-                System.err.println("StrategySelector: Using SingleAgentStrategy");
                 return new SingleAgentStrategy(heuristic, config);
             case CBS:
-                System.err.println("StrategySelector: Using CBSStrategy (Recommended)");
                 return new CBSStrategy(heuristic, config);
             case JOINT_SEARCH:
-                // Only use Joint Search if explicitly recommended and extremely small, otherwise fallback to CBS
                 if (numAgents <= 3 && features.couplingDegree > 0.8) {
-                     System.err.println("StrategySelector: Using JointAStarStrategy (High Coupling)");
                      return new JointAStarStrategy(heuristic, config);
                 } else {
-                     System.err.println("StrategySelector: Using CBSStrategy (Replacing Joint Search)");
                      return new CBSStrategy(heuristic, config);
                 }
             case STRICT_ORDER:
             case GREEDY_WITH_RETRY:
             case CYCLE_BREAKER:
             default:
-                System.err.println("StrategySelector: Using PriorityPlanningStrategy (Multi-Agent Default)");
                 return new PriorityPlanningStrategy(heuristic, config);
         }
     }
@@ -97,7 +86,6 @@ public class StrategySelector {
      * @return CBS strategy instance
      */
     public CBSStrategy createCBSStrategy() {
-        System.err.println("StrategySelector: Creating CBS strategy for cyclic dependency resolution");
         return new CBSStrategy(heuristic, config);
     }
     

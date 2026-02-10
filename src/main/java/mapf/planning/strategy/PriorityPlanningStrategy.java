@@ -238,7 +238,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     displacementAttempts = 0;
                 } else {
                     stuckCount++;
-                    logVerbose(getName() + ": Phantom progress (re-solved agent goal), stuckCount=" + stuckCount);
                 }
             } else {
                 stuckCount++;
@@ -531,9 +530,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         });
     }
     
-    /** Log the goal execution order. Always printed at MINIMAL level — the canonical task plan output. */
+    /** Log the goal execution order. Internal planning detail, verbose only. */
     private void logGoalOrder(List<Subgoal> subgoals) {
-        if (!SearchConfig.isMinimal()) return;
+        if (!SearchConfig.isVerbose()) return;
         System.err.println("[PP] Task Plan (" + subgoals.size() + " subgoals):");
         for (int i = 0; i < subgoals.size(); i++) {
             Subgoal sg = subgoals.get(i);
@@ -647,10 +646,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         lastProgressWasPhantom = false;
                     }
                     
-                    logMinimal(getName() + ": [OK] " + 
-                        (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) +
-                        " -> " + subgoal.goalPos + " (" + path.size() + " steps)" +
-                        (lastProgressWasPhantom ? " [PHANTOM]" : ""));
+                    // PHANTOM = re-solving completed agent goal (debug info, verbose only)
+                    if (lastProgressWasPhantom) {
+                        logVerbose(getName() + ": [OK] " + 
+                            (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) +
+                            " -> " + subgoal.goalPos + " (" + path.size() + " steps) [PHANTOM]");
+                    } else {
+                        logMinimal(getName() + ": [OK] " + 
+                            (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) +
+                            " -> " + subgoal.goalPos + " (" + path.size() + " steps)");
+                    }
                     return true;
                 }
             }
@@ -992,7 +997,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     Set<Position> relaxedFrozen = new HashSet<>(frozen);
                     relaxedFrozen.removeAll(selfBlockers);
                     
-                    logNormal("[PP] Targeted unlock: " + selfBlockers.size() 
+                    logVerbose("[PP] Targeted unlock: " + selfBlockers.size() 
                             + " self-blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
                     
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
@@ -1008,7 +1013,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             
             // Round 3: No frozen at all (desperate — allows disturbing any completed goal)
             if (!frozen.isEmpty()) {
-                logNormal("[PP] Last resort: no frozen for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                logVerbose("[PP] Last resort: no frozen for " + subgoal.boxType + " -> " + subgoal.goalPos);
                 path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                         subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
             }

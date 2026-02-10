@@ -139,11 +139,7 @@ public class Client {
         // Step 2: Read and parse level
         parseLevel();
 
-        debugOut.println("Level: " + level.getName());
-        debugOut.println("Dimensions: " + level.getRows() + "x" + level.getCols());
-        debugOut.println("Agents: " + level.getNumAgents());
-        debugOut.println("Initial state:");
-        debugOut.println(currentState.toGridString(level));
+        debugOut.println("Level: " + level.getName() + " | " + level.getRows() + "x" + level.getCols() + " | " + level.getNumAgents() + " agents");
 
         // Step 3: Plan and execute
         planAndExecute();
@@ -162,7 +158,6 @@ public class Client {
      */
     private void sendClientName() {
         serverOut.println(CLIENT_NAME);
-        debugOut.println("Sent client name: " + CLIENT_NAME);
     }
 
     /**
@@ -171,15 +166,11 @@ public class Client {
      * @throws IOException if reading fails
      */
     private void parseLevel() throws IOException {
-        debugOut.println("Parsing level...");
-
         LevelParser parser = new LevelParser();
         LevelParser.ParseResult result = parser.parse(serverIn);
 
         this.level = result.level;
         this.currentState = result.initialState;
-
-        debugOut.println("Level parsed successfully");
     }
 
     /**
@@ -191,7 +182,6 @@ public class Client {
      */
     private void planAndExecute() throws IOException {
         int numAgents = currentState.getNumAgents();
-        debugOut.println("Number of agents: " + numAgents);
 
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
@@ -355,7 +345,6 @@ public class Client {
 
         String actionString = sb.toString();
         serverOut.println(actionString);
-        debugOut.println("Sent: " + actionString);
     }
 
     /**
@@ -366,7 +355,6 @@ public class Client {
      */
     private boolean[] readResponse() throws IOException {
         String response = serverIn.readLine();
-        debugOut.println("Received: " + response);
 
         if (response == null) {
             throw new IOException("Server closed connection");

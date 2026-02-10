@@ -189,9 +189,9 @@ public class LevelAnalyzer {
             return dependsOn;
         }
         
-        System.err.println("[LevelAnalyzer] Reachability-based dependency analysis");
-        System.err.println("[LevelAnalyzer] Open space root: " + root);
-        System.err.println("[LevelAnalyzer] Testing " + goals.size() + " goals...");
+        if (SearchConfig.isVerbose()) {
+            System.err.println("[LevelAnalyzer] Reachability analysis: root=" + root + ", goals=" + goals.size());
+        }
         
         // COLOR-AWARE FIX: Pre-compute per-color effective impassable box sets.
         Map<Color, Set<Position>> effectiveImpassableByColor = new HashMap<>();
@@ -336,28 +336,7 @@ public class LevelAnalyzer {
                  }
              }
         }
-        System.err.println("[LevelAnalyzer] Found " + startDepCount + " Start-to-Goal dependencies");
         dependencyCount += startDepCount;
-        
-        try (java.io.PrintWriter debugWriter = new java.io.PrintWriter(new java.io.FileWriter("debug_dependencies.txt"))) {
-            debugWriter.println("[LevelAnalyzer] Reachability-based dependency analysis for " + goals.size() + " goals");
-            debugWriter.println("[LevelAnalyzer] Found " + dependencyCount + " dependencies");
-            for (Position goal : goals) {
-                Set<Position> deps = dependsOn.get(goal);
-                if (deps != null && !deps.isEmpty()) {
-                    char goalChar = level.getBoxGoal(goal.row, goal.col);
-                    StringBuilder sb = new StringBuilder();
-                    sb.append(goal).append("(").append(goalChar).append(") depends on: ");
-                    for (Position dep : deps) {
-                        char depChar = level.getBoxGoal(dep.row, dep.col);
-                        sb.append(dep).append("(").append(depChar).append(") ");
-                    }
-                    debugWriter.println(sb.toString());
-                }
-            }
-        } catch (java.io.IOException e) {
-            e.printStackTrace();
-        }
 
         // Debug: Log dependency graph (verbose only)
         if (SearchConfig.isVerbose()) {
@@ -871,14 +850,6 @@ public class LevelAnalyzer {
         // Now do topological DFS - dependencies visited before dependents
         for (Position goal : sortedGoals) {
             topologicalDFS(goal, dependsOn, visited, result);
-        }
-        
-        // DEBUG: Log topological sort result
-        System.err.println("[LevelAnalyzer] Topological sort result:");
-        for (int i = 0; i < result.size(); i++) {
-            Position p = result.get(i);
-            int dist = distances.getOrDefault(p, -1);
-            System.err.println("[LevelAnalyzer] Topo: " + (i+1) + ". " + p + " (Dist: " + dist + ")");
         }
         
         return result;

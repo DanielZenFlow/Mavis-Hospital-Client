@@ -105,7 +105,7 @@ public class CBSStrategy implements SearchStrategy {
             CTNode current = openList.poll();
             highLevelNodesExpanded++;
             
-            if (highLevelNodesExpanded % 100 == 0) {
+            if (highLevelNodesExpanded % 100 == 0 && SearchConfig.isVerbose()) {
                 System.err.println(getName() + ": Expanded " + highLevelNodesExpanded + 
                     " CT nodes, cost=" + current.cost + ", open=" + openList.size());
             }
@@ -195,7 +195,9 @@ public class CBSStrategy implements SearchStrategy {
                     if (bestAgent != -1) {
                         assignments.put(bestAgent, new Task(goalVal, type));
                         assignedAgents.add(bestAgent);
-                        System.err.println("CBS: Assigned Agent " + bestAgent + " to Box " + type + " at " + bestBox + " for Goal " + goalVal);
+                        if (SearchConfig.isVerbose()) {
+                            System.err.println("CBS: Assigned Agent " + bestAgent + " to Box " + type + " at " + bestBox + " for Goal " + goalVal);
+                        }
                     }
                 }
             }
