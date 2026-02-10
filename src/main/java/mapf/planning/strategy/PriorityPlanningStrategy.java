@@ -589,6 +589,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     globalTimeStep++;
                 }
                 
+                // POST-PLAN REGRESSION GUARD: Check if executing this path disturbed
+                // any previously completed box goals. If so, rollback — the cure is worse
+                // than the disease. This is the primary defense against push-then-pull cycles.
+                // Only applies when we had completed goals to protect (Round 2b/3 may have
+                // relaxed frozen protections, allowing BSP to disturb them).
+                if (!completedBoxGoals.isEmpty()) {
+                    List<Position> regressedGoals = detectRegressedGoals(tempState, level);
+                    if (!regressedGoals.isEmpty()) {
+                        logNormal(getName() + ": [REGRESS] Path for " 
+                                + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                                + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
+                                + " completed goal(s): " + regressedGoals + " — rollback");
+                        // Rollback: remove the executed actions from fullPlan
+                        while (fullPlan.size() > planSizeBefore) {
+                            fullPlan.remove(fullPlan.size() - 1);
+                            globalTimeStep--;
+                        }
+                        continue; // try next subgoal in priority order
+                    }
+                }
+                
                 // Verify goal was reached
                 boolean reached = verifyGoalReached(subgoal, tempState, level);
                 if (reached) {
@@ -1201,6 +1222,34 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 cachedSubgoalOrder = null;
             }
         }
+    }
+    
+    /**
+     * Detects which completed box goals were regressed (disturbed) in the given state.
+     * 
+     * This is a READ-ONLY check — it does not modify completedBoxGoals.
+     * Used as a pre-commit validation: if a planned path caused regression,
+     * the caller should rollback rather than accept the regression.
+     * 
+     * Difference from revalidateCompletedGoals: that method is a post-hoc cleanup
+     * that accepts regressions and removes them from the frozen set. This method
+     * is a pre-commit guard that PREVENTS regressions from being accepted.
+     * 
+     * @param state The state to check (typically after executing a candidate path)
+     * @param level Level definition
+     * @return List of goal positions that were completed but are now unsatisfied
+     */
+    private List<Position> detectRegressedGoals(State state, Level level) {
+        List<Position> regressed = new ArrayList<>();
+        for (Position goalPos : completedBoxGoals) {
+            char goalType = level.getBoxGoal(goalPos.row, goalPos.col);
+            if (goalType == '\0') continue;
+            Character actualBox = state.getBoxes().get(goalPos);
+            if (actualBox == null || actualBox != goalType) {
+                regressed.add(goalPos);
+            }
+        }
+        return regressed;
     }
 
     /** Try CBS fallback when stuck with cyclic dependencies. */
