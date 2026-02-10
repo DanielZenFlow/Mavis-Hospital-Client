@@ -986,19 +986,45 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
             if (path != null) return path;
             
-            // Round 2: Self-blocking recovery — find specific frozen goals that block
-            // the agent's path to the target box and unlock only those.
+            // Round 2a: Same-color self-blocking recovery — find frozen goals of the
+            // same color that block the agent's path to the target box.
             if (!frozen.isEmpty()) {
                 Color agentColor = level.getAgentColor(subgoal.agentId);
-                Set<Position> selfBlockers = findSameColorBlockers(
-                        subgoal.agentId, boxPos, state, level, frozen, agentColor);
+                Set<Position> selfBlockers = findPathBlockers(
+                        subgoal.agentId, boxPos, state, level, frozen, agentColor, true);
                 
                 if (!selfBlockers.isEmpty()) {
                     Set<Position> relaxedFrozen = new HashSet<>(frozen);
                     relaxedFrozen.removeAll(selfBlockers);
                     
-                    logVerbose("[PP] Targeted unlock: " + selfBlockers.size() 
-                            + " self-blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    logVerbose("[PP] Targeted unlock (same-color): " + selfBlockers.size() 
+                            + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
+                            reservationTable, globalTimeStep);
+                    if (path == null) {
+                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
+                    }
+                    if (path != null) return path;
+                }
+            }
+            
+            // Round 2b: Cross-color blocking recovery — find ANY frozen goal (regardless
+            // of color) that blocks the path. This handles multi-agent scenarios where
+            // e.g. a blue box on its goal blocks a red agent's path (MADS-level pattern).
+            // More permissive than Round 2a but still targeted (not blanket removal).
+            if (!frozen.isEmpty()) {
+                Set<Position> crossColorBlockers = findPathBlockers(
+                        subgoal.agentId, boxPos, state, level, frozen, null, false);
+                
+                if (!crossColorBlockers.isEmpty()) {
+                    Set<Position> relaxedFrozen = new HashSet<>(frozen);
+                    relaxedFrozen.removeAll(crossColorBlockers);
+                    
+                    logVerbose("[PP] Targeted unlock (cross-color): " + crossColorBlockers.size() 
+                            + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
                     
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
@@ -1023,17 +1049,32 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     /**
-     * Finds hard-frozen goals of the same color that block the agent's path to the target box.
-     * These are "self-blockers": the same-color agent filled them and now needs to pass through.
+     * Finds frozen goals that block the agent's path to the target box.
      * 
-     * Algorithm: BFS from agent position, treating walls + boxes (except pathable ones) as obstacles.
-     * If the target box is unreachable, check which hard-frozen goals lie on the boundary between
-     * reachable and unreachable regions.
+     * Two modes:
+     * - sameColorOnly=true: Only considers frozen goals whose box color matches agentColor.
+     *   These are "self-blockers" — the agent filled them and now can't pass through.
+     * - sameColorOnly=false: Considers ALL frozen goals regardless of color.
+     *   Handles cross-color blocking (e.g., blue box on its goal blocks red agent's path).
+     *   This targeted approach avoids falling through to Round 3's blanket frozen removal.
+     * 
+     * Algorithm: BFS from agent position to find reachable cells. If target box is
+     * unreachable, identify frozen goals on the boundary between reachable and unreachable
+     * regions. Verify that removing candidates actually unblocks the path.
+     * 
+     * @param agentId       The agent that needs to reach the target box
+     * @param targetBox     Position of the box to be moved
+     * @param state         Current world state
+     * @param level         Level definition
+     * @param hardFrozen    Set of positions treated as frozen (wall-like)
+     * @param agentColor    Color of the agent (used when sameColorOnly=true; nullable when false)
+     * @param sameColorOnly If true, only return blockers matching agentColor
+     * @return Set of frozen positions whose unlock would unblock the agent's path
      */
-    private Set<Position> findSameColorBlockers(int agentId, Position targetBox, State state,
-            Level level, Set<Position> hardFrozen, Color agentColor) {
+    private Set<Position> findPathBlockers(int agentId, Position targetBox, State state,
+            Level level, Set<Position> hardFrozen, Color agentColor, boolean sameColorOnly) {
         Set<Position> blockers = new HashSet<>();
-        if (agentColor == null) return blockers;
+        if (sameColorOnly && agentColor == null) return blockers;
         
         Position agentPos = state.getAgentPosition(agentId);
         
@@ -1064,19 +1105,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         
-        if (canReachBox) return blockers; // agent CAN reach box, no self-blocking
+        if (canReachBox) return blockers; // agent CAN reach box, no blocking
         
-        // Agent can't reach box. Find hard-frozen goals on the boundary of reachable region
-        // that are the same color and might be blocking the path.
+        // Agent can't reach box. Find frozen goals on the boundary of reachable region.
         Set<Position> candidates = new HashSet<>();
         for (Position frozen : hardFrozen) {
             char frozenBoxType = level.getBoxGoal(frozen.row, frozen.col);
             if (frozenBoxType == '\0') continue;
-            Color frozenColor = level.getBoxColor(frozenBoxType);
-            if (!agentColor.equals(frozenColor)) continue; // different color, skip
             
-            // Check if this frozen goal is adjacent to the reachable region
-            // (i.e., the frozen box at this position is on the boundary)
+            // Color filter: in same-color mode, skip different-color frozen goals
+            if (sameColorOnly) {
+                Color frozenColor = level.getBoxColor(frozenBoxType);
+                if (!agentColor.equals(frozenColor)) continue;
+            }
+            
+            // Check if this frozen goal has a box and is adjacent to the reachable region
             Character boxAtFrozen = state.getBoxes().get(frozen);
             if (boxAtFrozen == null) continue; // no box here, not blocking
             
