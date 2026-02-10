@@ -41,8 +41,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private int displacementAttempts = 0;
     private static final int MAX_DISPLACEMENT_ATTEMPTS = 3;
     
+    /** 
+     * Goal-level cycle detection: tracks how many times each goal position has been
+     * completed. If a goal is completed > MAX_GOAL_COMPLETIONS times, PP is cycling
+     * (push to goal → pull off → push back → ...). This supplements displacementHistory
+     * which only tracks box-level displacement events and misses goal-level cycles.
+     */
+    private Map<Position, Integer> goalCompletionCount = new HashMap<>();
+    private static final int MAX_GOAL_COMPLETIONS = 2;
+    
     /** Tracks agent goals that have been completed at least once, to detect phantom progress. */
-    private Set<Position> completedAgentGoals = new HashSet<>();
+    private Set<Position> completedAgentGoals = new HashSet<>();;
     
     /** Pre-computed goal execution order from LevelAnalyzer (optional). */
     private List<Position> precomputedGoalOrder = null;
@@ -174,6 +183,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         displacementAttempts = 0;
         completedBoxGoals.clear();
         completedAgentGoals.clear();
+        goalCompletionCount.clear();
         reservationTable.clear();
         globalTimeStep = 0;
         lastComputedState = null;
@@ -565,6 +575,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (!depMet) { skippedByDeps++; continue; }
             }
 
+            // Goal-level cycle detection: skip goals that have been completed too many times.
+            // This breaks push-pull cycles where a box is pushed to goal, pulled off by
+            // another agent's recovery, then pushed back again indefinitely.
+            if (!subgoal.isAgentGoal) {
+                int completions = goalCompletionCount.getOrDefault(subgoal.goalPos, 0);
+                if (completions >= MAX_GOAL_COMPLETIONS) {
+                    logNormal("[PP] [CYCLE-SKIP] Goal " + subgoal.goalPos + " (box " + subgoal.boxType
+                            + ") already completed " + completions + " times — skipping to break cycle");
+                    continue;
+                }
+            }
+
             // Task-Aware: Pass the full list of subgoals for global allocation checking
             List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);
             
@@ -632,6 +654,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
+                        
+                        // Goal-level cycle detection: track completion count
+                        int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
+                        goalCompletionCount.put(subgoal.goalPos, count);
+                        if (count > MAX_GOAL_COMPLETIONS) {
+                            logNormal("[PP] CYCLE DETECTED: goal " + subgoal.goalPos 
+                                    + " completed " + count + " times (box " + subgoal.boxType + ")");
+                        }
+                        
                         // Invalidate Hungarian cache — world state changed, assignment may be stale
                         subgoalManager.invalidateHungarianCache();
                         // Force subgoal list refresh: completing a box goal may make new agent 
@@ -1369,7 +1400,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         fullPlan.add(jointAction);
                         tempState = applyJointAction(jointAction, tempState, level, numAgents);
                     }
-                    return true;
+                    
+                    // Regression guard for displacement: check if displacement disturbed completed goals
+                    if (!completedBoxGoals.isEmpty()) {
+                        List<Position> regressedGoals = detectRegressedGoals(tempState, level);
+                        if (!regressedGoals.isEmpty()) {
+                            logNormal("[PP] [REGRESS] Displacement disturbed " + regressedGoals.size()
+                                    + " completed goal(s): " + regressedGoals + " — rollback");
+                            while (fullPlan.size() > planSizeBefore) {
+                                fullPlan.remove(fullPlan.size() - 1);
+                            }
+                            // Fall through to Strategy 3
+                        } else {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
                 }
             }
         }
