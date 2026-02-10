@@ -30,49 +30,17 @@ public class BoxSearchPlanner {
      * A* search to move a specific box to a goal position.
      * Uses optimized StateKey that only tracks agent and target box positions.
      * 
-     * Smart frozen mechanism:
-     * - hardFrozenGoals: goals with pending dependents, MUST NOT be disturbed
-     * - softFrozenGoals: goals with no pending dependents, can be displaced with penalty
-     * 
-     * 3-tier fallback:
-     * 1. Hard-block hard, penalty soft
-     * 2. Remove soft protection entirely (hard stays hard)
-     * 3. Demote hard→soft (penalty only), remove soft entirely
+     * Frozen goals are treated as WALLS — push/pull actions that would disturb
+     * a frozen goal are completely blocked. No penalty-based soft freeze.
+     * The caller manages retry with progressively relaxed frozen sets:
+     *   1. All completedBoxGoals frozen (wall semantics)
+     *   2. Self-blockers removed (targeted unlock)
+     *   3. No frozen (desperate last resort)
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
-            char boxType, State initialState, Level level, 
-            Set<Position> hardFrozenGoals, Set<Position> softFrozenGoals) {
-        
-        // Tier 1: hard-block hardFrozen, penalty softFrozen
-        Set<Position> allFrozen = new HashSet<>(hardFrozenGoals);
-        allFrozen.addAll(softFrozenGoals);
-        List<Action> result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType, 
-                                                       initialState, level, hardFrozenGoals, softFrozenGoals, true);
-        if (result != null) return result;
-        
-        // Tier 2: Remove soft protection entirely, keep hard as hard-block
-        if (!softFrozenGoals.isEmpty()) {
-            result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
-                                              initialState, level, hardFrozenGoals, Collections.emptySet(), true);
-            if (result != null) return result;
-        }
-        
-        // Tier 3: Demote hard→soft (penalty only), remove soft entirely
-        // Last resort: allows disturbing hard-frozen goals with heavy penalty (50),
-        // which is better than failing completely. revalidateCompletedGoals() will
-        // detect the disturbance and re-add the goal to the subgoal list.
-        if (!allFrozen.isEmpty()) {
-            result = searchForSubgoalInternal(agentId, boxStart, goalPos, boxType,
-                                              initialState, level, Collections.emptySet(), hardFrozenGoals, true);
-        }
-        return result;
-    }
-    
-    /** Legacy overload: treats all frozen as hard. */
-    public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
             char boxType, State initialState, Level level, Set<Position> frozenGoals) {
-        return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, 
-                               frozenGoals, Collections.emptySet());
+        return searchForSubgoalInternal(agentId, boxStart, goalPos, boxType, 
+                                         initialState, level, frozenGoals, Collections.emptySet(), true);
     }
     
     private List<Action> searchForSubgoalInternal(int agentId, Position boxStart, Position goalPos,
@@ -144,16 +112,15 @@ public class BoxSearchPlanner {
     /**
      * Space-Time A* search for subgoal with reservation table.
      * Avoids positions reserved by higher-priority agents.
-     * Uses smart frozen: hard-frozen goals are blocked, soft-frozen get penalty.
+     * Frozen goals are treated as walls (completely blocked).
      */
     public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
             char boxType, State initialState, Level level, 
-            Set<Position> hardFrozenGoals, Set<Position> softFrozenGoals,
+            Set<Position> frozenGoals,
             ReservationTable reservations, int startTime) {
         
         if (reservations == null) {
-            return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, 
-                                   hardFrozenGoals, softFrozenGoals);
+            return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level, frozenGoals);
         }
         
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
@@ -193,8 +160,8 @@ public class BoxSearchPlanner {
                     if (!current.state.isApplicable(action, agentId, level)) {
                         continue;
                     }
-                    // Hard-frozen: block completely
-                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, hardFrozenGoals)) {
+                    // Frozen goals = walls: block any push/pull that disturbs them
+                    if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
                         continue;
                     }
                     newState = current.state.apply(action, agentId);
@@ -215,9 +182,7 @@ public class BoxSearchPlanner {
                 }
 
                 StateKeyWithTime newKey = new StateKeyWithTime(newState, agentId, newBoxPos, nextTime, boxType);
-                // Soft-frozen: penalty-based
-                int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
-                int newG = current.g + 1 + penalty;
+                int newG = current.g + 1;
 
                 Integer existingG = bestG.get(newKey);
                 if (existingG != null && existingG <= newG) {
@@ -232,39 +197,30 @@ public class BoxSearchPlanner {
             }
         }
 
-//        System.err.println("[BSP-DEBUG] ST-A* FAILED: box=" + boxType + " " + boxStart + " -> " + goalPos 
-//            + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
-//            + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
-    }
-
-    /** Legacy ST-A* overload: treats all frozen as hard. */
-    public List<Action> searchForSubgoal(int agentId, Position boxStart, Position goalPos,
-            char boxType, State initialState, Level level, Set<Position> frozenGoals,
-            ReservationTable reservations, int startTime) {
-        return searchForSubgoal(agentId, boxStart, goalPos, boxType, initialState, level,
-                               frozenGoals, Collections.emptySet(), reservations, startTime);
     }
 
     /**
      * A* search to move an agent to its goal position.
      * Uses all action types (Move/Push/Pull) so the agent can push/pull
      * same-color boxes out of the way if they block the path.
+     * 
+     * Frozen goals are treated as walls: push/pull actions that would
+     * disturb a frozen goal are blocked. This prevents agent goal search
+     * from pushing completed box goals off their positions.
      */
     public List<Action> searchForAgentGoal(int agentId, Position goalPos,
-            State initialState, Level level) {
+            State initialState, Level level, Set<Position> frozenGoals) {
         Position startPos = initialState.getAgentPosition(agentId);
         if (startPos.equals(goalPos)) {
             return Collections.emptyList();
         }
 
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
-        // Use StateKey tracking agent position + all box positions for full-state dedup
         Map<StateKey, Integer> bestG = new HashMap<>();
 
         int h = getDistance(startPos, goalPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, null);
-        // Use a key that captures agent pos (boxes may change if pushed)
         StateKey startKey = new AgentGoalStateKey(initialState, agentId);
         openList.add(startNode);
         bestG.put(startKey, 0);
@@ -280,13 +236,17 @@ public class BoxSearchPlanner {
                 return reconstructPath(current);
             }
 
-            // Try all actions: Move, Push, Pull (agent can push/pull same-color boxes blocking path)
             for (Action action : PlanningUtils.getAllActions()) {
                 if (action.type == Action.ActionType.NOOP) {
                     continue;
                 }
 
                 if (!current.state.isApplicable(action, agentId, level)) {
+                    continue;
+                }
+
+                // Frozen goals = walls: block push/pull that would disturb completed goals
+                if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) {
                     continue;
                 }
 
@@ -309,6 +269,12 @@ public class BoxSearchPlanner {
         }
 
         return null;
+    }
+
+    /** Backward-compatible overload without frozen (allows all push/pull). */
+    public List<Action> searchForAgentGoal(int agentId, Position goalPos,
+            State initialState, Level level) {
+        return searchForAgentGoal(agentId, goalPos, initialState, level, Collections.emptySet());
     }
 
     /**

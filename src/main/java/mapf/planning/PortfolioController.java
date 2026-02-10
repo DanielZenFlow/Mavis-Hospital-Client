@@ -78,7 +78,9 @@ public class PortfolioController implements SearchStrategy {
                     (s.orderingMode != null ? "(" + s.orderingMode + ")" : "")).toList());
         }
         
-        // Step 3: Try strategies in sequence
+        // Step 3: Try strategies in sequence, keeping the best result
+        List<Action[]> bestPartialPlan = null;
+        
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
                 System.err.println("[Portfolio] Timeout - no more time for attempts");
@@ -109,24 +111,64 @@ public class PortfolioController implements SearchStrategy {
                                           result != null && !result.isEmpty()));
             
             if (result != null && !result.isEmpty()) {
-                if (SearchConfig.isMinimal()) {
-                    System.err.println("[Portfolio] SUCCESS with " + strategyConfig.type + 
-                        " (" + result.size() + " actions, " + attemptDuration + "ms)");
+                // Verify this is a full solution (goal state reached)
+                // by checking the plan length vs. a trivially detected partial plan.
+                // Full solutions come from PP's isGoalState() check path.
+                // Partial plans come from PP's fallback path and are logged as [PARTIAL].
+                // Keep best partial as fallback, but only return immediately for full solutions.
+                State finalState = replayPlan(result, initialState, level);
+                if (finalState != null && finalState.isGoalState(level)) {
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] SUCCESS with " + strategyConfig.type + 
+                            " (" + result.size() + " actions, " + attemptDuration + "ms)");
+                    }
+                    return result;
                 }
-                return result;
+                // Partial plan — save if best so far, continue trying
+                if (bestPartialPlan == null || result.size() > bestPartialPlan.size()) {
+                    bestPartialPlan = result;
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] Partial plan from " + strategyConfig.type + 
+                            " (" + result.size() + " steps, saved as best so far)");
+                    }
+                }
             }
             
             if (SearchConfig.isMinimal()) {
-                System.err.println("[Portfolio] " + strategyConfig.type + " failed after " + attemptDuration + "ms");
+                System.err.println("[Portfolio] " + strategyConfig.type + " " +
+                    (result != null && !result.isEmpty() ? "partial" : "failed") + " after " + attemptDuration + "ms");
             }
             
             // Update remaining time
             remainingTime = timeoutMs - (System.currentTimeMillis() - startTime);
         }
         
+        if (bestPartialPlan != null) {
+            System.err.println("[Portfolio] No full solution found. Returning best partial plan (" 
+                + bestPartialPlan.size() + " steps)");
+            printAttemptSummary();
+            return bestPartialPlan;
+        }
+        
         System.err.println("[Portfolio] All strategies failed");
         printAttemptSummary();
         return null;
+    }
+    
+    /**
+     * Replay a plan from initial state to get the final state.
+     * Used to verify if a returned plan actually solves the level.
+     */
+    private State replayPlan(List<Action[]> plan, State initialState, Level level) {
+        State state = initialState;
+        for (Action[] jointAction : plan) {
+            try {
+                state = state.applyJointAction(jointAction, level);
+            } catch (Exception e) {
+                return state; // Return whatever state we reached
+            }
+        }
+        return state;
     }
     
     /**

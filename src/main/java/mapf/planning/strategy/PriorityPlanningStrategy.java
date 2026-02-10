@@ -260,9 +260,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
             return fullPlan.isEmpty() ? null : fullPlan;
         }
-        // Return partial plan for debugging even when goal is not fully reached
+        // Goal not fully reached — return partial plan for use as fallback
         if (!fullPlan.isEmpty()) {
-            logMinimal(getName() + ": [PARTIAL] Returning partial plan (" + fullPlan.size() + " steps) for debugging");
+            logMinimal(getName() + ": [PARTIAL] Partial plan (" + fullPlan.size() + " steps) — goal not reached");
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
             return fullPlan.isEmpty() ? null : fullPlan;
         }
@@ -571,6 +571,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             
             if (path != null && !path.isEmpty()) {
                 
+                // Snapshot plan size for potential rollback (agent-trap detection)
+                int planSizeBefore = fullPlan.size();
+                
                 // Record agent path in reservation table for space-time collision avoidance
                 List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
                 boolean permanentEnd = subgoal.isAgentGoal;
@@ -590,11 +593,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Verify goal was reached
                 boolean reached = verifyGoalReached(subgoal, tempState, level);
                 if (reached) {
+                    // Pukoban agent-trap detection: after filling a box goal, check if the 
+                    // agent is trapped in a dead-end disconnected from remaining tasks.
+                    // This is a POST-PLAN validation (not static analysis) because it depends
+                    // on the actual agent position and world state after execution.
+                    if (!subgoal.isAgentGoal && wouldTrapAgent(subgoal, tempState, level, subgoals)) {
+                        // Agent would be trapped — skip this subgoal, let PP try alternatives
+                        logNormal(getName() + ": [TRAP] Skipping " + subgoal.boxType + " -> " + subgoal.goalPos
+                                + " — agent " + subgoal.agentId + " would be trapped after filling");
+                        // Rollback: remove the executed actions from fullPlan
+                        while (fullPlan.size() > planSizeBefore) {
+                            fullPlan.remove(fullPlan.size() - 1);
+                            globalTimeStep--;
+                        }
+                        continue; // try next subgoal in priority order
+                    }
+                    
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
                         // Invalidate Hungarian cache — world state changed, assignment may be stale
                         subgoalManager.invalidateHungarianCache();
+                        // Force subgoal list refresh: completing a box goal may make new agent 
+                        // goals eligible (agents whose same-color box tasks are now all done).
+                        // Without this, filterUnsatisfiedSubgoals can only REMOVE completed goals 
+                        // from the cache — it cannot ADD newly-eligible agent goals that were 
+                        // excluded during initial cache computation.
+                        cachedSubgoalOrder = null;
                     }
                     
                     // Check if any previously completed goals were disturbed (soft-unlock)
@@ -631,6 +656,87 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return false;
+    }
+    
+    /**
+     * Pukoban agent-trap detection: checks if committing to this subgoal would trap the agent.
+     * 
+     * After filling goalPos, the agent ends up at some position. We BFS from that position
+     * to check if the agent can still reach any candidate box for its remaining same-color tasks.
+     * If not, the agent would be stranded in a dead-end — a classic Pukoban failure mode.
+     * 
+     * This is the correct architectural location for this check (post-plan, not static analysis)
+     * because it operates on the actual state after execution, avoiding false positives from
+     * pre-existing room disconnections that static pairwise analysis cannot distinguish.
+     */
+    private boolean wouldTrapAgent(Subgoal completedSubgoal, State stateAfterExecution, Level level, List<Subgoal> allSubgoals) {
+        int agentId = completedSubgoal.agentId;
+        Position agentPos = stateAfterExecution.getAgentPosition(agentId);
+        Color agentColor = level.getAgentColor(agentId);
+        
+        // Collect remaining same-color box subgoals (excluding the one just completed)
+        List<Subgoal> remainingSameColor = new ArrayList<>();
+        for (Subgoal sg : allSubgoals) {
+            if (sg == completedSubgoal) continue;
+            if (sg.isAgentGoal) continue;
+            if (completedBoxGoals.contains(sg.goalPos)) continue;
+            // Same color check: this agent's tasks only
+            Color sgColor = level.getBoxColor(sg.boxType);
+            if (agentColor != null && agentColor.equals(sgColor)) {
+                remainingSameColor.add(sg);
+            }
+        }
+        
+        // No remaining same-color tasks → agent has nothing left to do → not trapped
+        if (remainingSameColor.isEmpty()) return false;
+        
+        // BFS from agent's final position to find reachable cells
+        // Obstacles: walls + all boxes in current state (agent navigates around them)
+        Set<Position> reachable = agentReachabilityBFS(agentPos, stateAfterExecution, level);
+        
+        // Check if agent can reach ANY candidate box for its remaining tasks
+        for (Subgoal sg : remainingSameColor) {
+            for (Map.Entry<Position, Character> entry : stateAfterExecution.getBoxes().entrySet()) {
+                if (entry.getValue() == sg.boxType) {
+                    // Agent needs to reach a neighbor of the box (to push/pull it)
+                    Position boxPos = entry.getKey();
+                    for (Direction dir : Direction.values()) {
+                        Position neighbor = boxPos.move(dir);
+                        if (reachable.contains(neighbor)) {
+                            return false; // Can reach at least one box → not trapped
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Agent cannot reach any box for remaining tasks → trapped
+        return true;
+    }
+    
+    /**
+     * BFS from a position to find all cells reachable by the agent.
+     * Agent can walk through empty cells but not walls or boxes.
+     */
+    private Set<Position> agentReachabilityBFS(Position start, State state, Level level) {
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> boxPositions = state.getBoxes().keySet();
+        
+        visited.add(start);
+        queue.add(start);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!visited.contains(next) && !level.isWall(next) && !boxPositions.contains(next)) {
+                    visited.add(next);
+                    queue.add(next);
+                }
+            }
+        }
+        return visited;
     }
     
     /** Extract agent position path from action sequence. */
@@ -829,10 +935,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
     
-    /** Plan path for a single subgoal. Uses Space-Time A* by default for MAPF compliance. */
+    /**
+     * Plan path for a single subgoal.
+     * 
+     * Frozen = wall semantics: completedBoxGoals are treated as impassable walls.
+     * Caller-managed retry sequence with progressive relaxation:
+     *   Round 1: All completedBoxGoals frozen (wall) — ST-A* then 2D A*
+     *   Round 2: Self-blockers unlocked (targeted) — ST-A* then 2D A*
+     *   Round 3: No frozen at all (desperate last resort) — 2D A*
+     * 
+     * For agent goals: same wall semantics, 2-round retry.
+     */
     private List<Action> planSubgoal(Subgoal subgoal, State state, Level level, List<Subgoal> allSubgoals) {
+        // Frozen = all completed box goals treated as walls
+        Set<Position> frozen = new HashSet<>(completedBoxGoals);
+        
         if (subgoal.isAgentGoal) {
-            return boxSearchPlanner.searchForAgentGoal(subgoal.agentId, subgoal.goalPos, state, level);
+            // Round 1: Agent goal with frozen protection (don't push completed goals)
+            List<Action> path = boxSearchPlanner.searchForAgentGoal(
+                    subgoal.agentId, subgoal.goalPos, state, level, frozen);
+            if (path != null) return path;
+            
+            // Round 2: Without frozen (allow pushing if path is blocked by completed goals)
+            if (!frozen.isEmpty()) {
+                path = boxSearchPlanner.searchForAgentGoal(
+                        subgoal.agentId, subgoal.goalPos, state, level, Collections.emptySet());
+            }
+            return path;
         } else {
             // Task-Aware Allocation: Pass all remaining subgoals to ensure global feasibility
             Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
@@ -840,79 +969,161 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 return null;
             }
             
-            // Smart frozen: split completedBoxGoals into hard (has pending dependents) vs soft
-            Set<Position> hardFrozen = computeHardFrozenGoals(state, level);
-            Set<Position> softFrozen = new HashSet<>(completedBoxGoals);
-            softFrozen.removeAll(hardFrozen);
-            
-            // MAPF FIX: Use Space-Time A* by default for multi-agent coordination
+            // Round 1: ST-A* with all frozen as walls
             List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, hardFrozen, softFrozen,
+                    subgoal.goalPos, subgoal.boxType, state, level, frozen,
                     reservationTable, globalTimeStep);
             
-            // Fallback to 2D A* if space-time fails
+            // Round 1b: 2D A* with all frozen as walls
             if (path == null) {
                 path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                        subgoal.goalPos, subgoal.boxType, state, level, hardFrozen, softFrozen);
+                        subgoal.goalPos, subgoal.boxType, state, level, frozen);
             }
+            if (path != null) return path;
+            
+            // Round 2: Self-blocking recovery — find specific frozen goals that block
+            // the agent's path to the target box and unlock only those.
+            if (!frozen.isEmpty()) {
+                Color agentColor = level.getAgentColor(subgoal.agentId);
+                Set<Position> selfBlockers = findSameColorBlockers(
+                        subgoal.agentId, boxPos, state, level, frozen, agentColor);
+                
+                if (!selfBlockers.isEmpty()) {
+                    Set<Position> relaxedFrozen = new HashSet<>(frozen);
+                    relaxedFrozen.removeAll(selfBlockers);
+                    
+                    logNormal("[PP] Targeted unlock: " + selfBlockers.size() 
+                            + " self-blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
+                            reservationTable, globalTimeStep);
+                    if (path == null) {
+                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
+                    }
+                    if (path != null) return path;
+                }
+            }
+            
+            // Round 3: No frozen at all (desperate — allows disturbing any completed goal)
+            if (!frozen.isEmpty()) {
+                logNormal("[PP] Last resort: no frozen for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                        subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
+            }
+            
             return path;
         }
     }
     
     /**
-     * Computes the set of completed box goals that MUST remain frozen (hard-frozen).
-     * A completed goal is hard-frozen only if some UNSATISFIED goal depends on it
-     * (i.e., moving it would violate the dependency invariant).
-     * Goals with no pending dependents are soft-frozen (can be temporarily displaced).
+     * Finds hard-frozen goals of the same color that block the agent's path to the target box.
+     * These are "self-blockers": the same-color agent filled them and now needs to pass through.
      * 
-     * Cycle-aware degradation: when circular dependencies cause most completed goals
-     * to be hard-frozen (>50%), the dependency graph is unreliable. In push-pull domain,
-     * boxes can always be pulled back, so we degrade to all-soft to unblock BSP search.
+     * Algorithm: BFS from agent position, treating walls + boxes (except pathable ones) as obstacles.
+     * If the target box is unreachable, check which hard-frozen goals lie on the boundary between
+     * reachable and unreachable regions.
      */
-    private Set<Position> computeHardFrozenGoals(State state, Level level) {
-        if (goalDependsOn.isEmpty()) {
-            // No dependency info: conservative, treat all as hard-frozen
-            return new HashSet<>(completedBoxGoals);
-        }
+    private Set<Position> findSameColorBlockers(int agentId, Position targetBox, State state,
+            Level level, Set<Position> hardFrozen, Color agentColor) {
+        Set<Position> blockers = new HashSet<>();
+        if (agentColor == null) return blockers;
         
-        // Build reverse map: goal → set of goals that depend on it
-        // dependedBy(G) = { X : X depends on G }
-        Map<Position, Set<Position>> dependedBy = new HashMap<>();
-        for (Map.Entry<Position, Set<Position>> entry : goalDependsOn.entrySet()) {
-            for (Position dep : entry.getValue()) {
-                dependedBy.computeIfAbsent(dep, k -> new HashSet<>()).add(entry.getKey());
+        Position agentPos = state.getAgentPosition(agentId);
+        
+        // BFS from agent position to find reachable cells (agent walk, ignoring box pushability)
+        Set<Position> reachable = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        reachable.add(agentPos);
+        queue.add(agentPos);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (reachable.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (state.getBoxes().containsKey(next)) continue; // boxes block walking
+                reachable.add(next);
+                queue.add(next);
             }
         }
         
-        Set<Position> hardFrozen = new HashSet<>();
-        for (Position completedGoal : completedBoxGoals) {
-            Set<Position> dependents = dependedBy.get(completedGoal);
-            if (dependents == null) continue; // no one depends on this goal
+        // Check if agent can reach any neighbor of the target box (to push/pull)
+        boolean canReachBox = false;
+        for (Direction dir : Direction.values()) {
+            if (reachable.contains(targetBox.move(dir))) {
+                canReachBox = true;
+                break;
+            }
+        }
+        
+        if (canReachBox) return blockers; // agent CAN reach box, no self-blocking
+        
+        // Agent can't reach box. Find hard-frozen goals on the boundary of reachable region
+        // that are the same color and might be blocking the path.
+        Set<Position> candidates = new HashSet<>();
+        for (Position frozen : hardFrozen) {
+            char frozenBoxType = level.getBoxGoal(frozen.row, frozen.col);
+            if (frozenBoxType == '\0') continue;
+            Color frozenColor = level.getBoxColor(frozenBoxType);
+            if (!agentColor.equals(frozenColor)) continue; // different color, skip
             
-            // Check if any dependent is still unsatisfied
-            for (Position dependent : dependents) {
-                if (completedBoxGoals.contains(dependent)) continue; // already done
-                // Check current state: is this dependent satisfied?
-                char goalType = level.getBoxGoal(dependent.row, dependent.col);
-                if (goalType == '\0') continue;
-                Character boxAtGoal = state.getBoxes().get(dependent);
-                if (boxAtGoal == null || boxAtGoal != goalType) {
-                    // This dependent is unsatisfied → completedGoal must stay frozen
-                    hardFrozen.add(completedGoal);
+            // Check if this frozen goal is adjacent to the reachable region
+            // (i.e., the frozen box at this position is on the boundary)
+            Character boxAtFrozen = state.getBoxes().get(frozen);
+            if (boxAtFrozen == null) continue; // no box here, not blocking
+            
+            boolean isOnBoundary = false;
+            for (Direction dir : Direction.values()) {
+                if (reachable.contains(frozen.move(dir))) {
+                    isOnBoundary = true;
                     break;
                 }
             }
+            if (isOnBoundary) {
+                candidates.add(frozen);
+            }
         }
         
-        // Cycle-aware degradation: if >50% of completed goals are hard-frozen,
-        // circular dependencies are over-constraining the search. Degrade to all-soft.
-        if (!completedBoxGoals.isEmpty() && hardFrozen.size() > completedBoxGoals.size() / 2) {
-            logVerbose("[PP] Hard-frozen ratio " + hardFrozen.size() + "/" 
-                      + completedBoxGoals.size() + ", degrading to all-soft");
-            return Collections.emptySet();
+        if (candidates.isEmpty()) return blockers;
+        
+        // VERIFICATION: re-run BFS excluding candidate blockers to confirm
+        // that removing them actually makes the target box reachable.
+        // This prevents false positives where other obstacles are the real cause.
+        Set<Position> verifyReachable = new HashSet<>();
+        Queue<Position> verifyQueue = new LinkedList<>();
+        verifyReachable.add(agentPos);
+        verifyQueue.add(agentPos);
+        
+        while (!verifyQueue.isEmpty()) {
+            Position current = verifyQueue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (verifyReachable.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                // Allow walking through candidate blocker positions
+                if (state.getBoxes().containsKey(next) && !candidates.contains(next)) continue;
+                verifyReachable.add(next);
+                verifyQueue.add(next);
+            }
         }
         
-        return hardFrozen;
+        boolean canReachAfterRelax = false;
+        for (Direction dir : Direction.values()) {
+            if (verifyReachable.contains(targetBox.move(dir))) {
+                canReachAfterRelax = true;
+                break;
+            }
+        }
+        
+        // Only return blockers if removing them actually unblocks the path
+        if (canReachAfterRelax) {
+            blockers.addAll(candidates);
+        }
+        
+        return blockers;
     }
     
     /** Verify that a subgoal was actually reached. */
@@ -936,9 +1147,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
             Character actualBox = state.getBoxes().get(goalPos);
             if (actualBox == null || actualBox != goalType) {
-                logVerbose("[PP] Goal at " + goalPos + " disturbed, removing from frozen set");
+                logVerbose("[PP] Goal at " + goalPos + " disturbed (type " + goalType + "), removing from frozen set");
                 it.remove();
-                // Also force subgoal list refresh so this goal gets re-added
+                // Force subgoal list refresh so this disturbed goal gets re-added
                 cachedSubgoalOrder = null;
             }
         }
