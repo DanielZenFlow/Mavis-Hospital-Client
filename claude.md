@@ -223,8 +223,18 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 - Reverse/Pull search (pure Sokoban technique, not in requirements)
 - Pattern Database heuristics (overkill for max 50×50)
 - K-robust conflicts (synchronous model only)
-- Hungarian algorithm for task assignment (≤10 agents, greedy sufficient)
 - Symmetry breaking (small scale)
+
+### Design Decisions Log
+
+**Hungarian algorithm: always-on (2026-02-11)**
+Previously, `computeAndCacheSubgoals()` disabled Hungarian assignment entirely when
+`goalDependsOn` was non-empty (any goal dependency existed). This was overly conservative:
+Hungarian assigns boxes-to-goals (transport optimization), NOT execution order.
+Execution order is independently enforced by `filterUnsatisfiedSubgoals()` + `sortSubgoals()`.
+Hungarian results are validated at runtime by `getHungarianCandidate()` (reachability check)
+and `isAllocationFeasible()` (bipartite matching). If validation fails, greedy fallback
+kicks in automatically. Therefore, Hungarian is now always computed regardless of dependencies.
 
 ## File Conventions
 

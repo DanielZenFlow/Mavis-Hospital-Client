@@ -386,18 +386,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     private void computeAndCacheSubgoals(State state, Level level) {
-        // Hungarian optimal box-to-goal assignment: only when NO serialization dependencies.
-        // When goalDependsOn is non-empty, goals must be filled in strict topological order
-        // (e.g., dead-end corridors: inner-first). Hungarian's static global assignment
-        // conflicts with this dynamic sequential execution — it assumes all goals are
-        // simultaneously accessible, which is false in dead-end topologies.
-        // In dependency-free levels, Hungarian minimizes total transport distance.
-        if (goalDependsOn.isEmpty()) {
-            subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
-        } else {
-            subgoalManager.invalidateHungarianCache();
+        // Hungarian optimal box-to-goal assignment: ALWAYS compute, even with dependencies.
+        //
+        // Previous logic disabled Hungarian entirely when goalDependsOn was non-empty,
+        // which was overly conservative. Hungarian assigns BOXES to GOALS (minimizing total
+        // transport distance) — it does NOT control execution ORDER. Execution order is
+        // handled independently by sortSubgoals() + filterUnsatisfiedSubgoals().
+        //
+        // Safety guarantees:
+        // 1. getHungarianCandidate() validates reachability before using the cached assignment
+        // 2. isAllocationFeasible() checks bipartite matching for remaining goals
+        // 3. If Hungarian pick fails either check, greedy fallback kicks in automatically
+        //
+        // This means a Hungarian assignment is safe even with dependencies: if it assigns
+        // box B to inner goal G_inner, but G_inner's dependency isn't met yet, the
+        // assignment simply isn't used until the dependency IS met (at which point the
+        // assignment is still valid since BFS distances don't change for static walls).
+        subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
+        if (!goalDependsOn.isEmpty()) {
             logNormal("[PP] Goal dependencies detected (" + goalDependsOn.size() 
-                    + " deps) — using greedy per-step assignment (Hungarian disabled)");
+                    + " deps) — Hungarian assignment computed (execution order enforced separately)");
         }
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
