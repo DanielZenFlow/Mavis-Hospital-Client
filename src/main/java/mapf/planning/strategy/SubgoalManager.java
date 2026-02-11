@@ -208,7 +208,7 @@ public class SubgoalManager {
         Position hungarianBox = getHungarianCandidate(subgoal, state, level, immovableBoxes, agentPos);
         if (hungarianBox != null) {
             // Validate: the Hungarian pick must pass the same feasibility check
-            if (isAllocationFeasible(hungarianBox, subgoal, state, level, allPendingSubgoals)) {
+            if (isAllocationFeasible(hungarianBox, subgoal, state, level, allPendingSubgoals, completedBoxGoals)) {
                 if (mapf.planning.SearchConfig.isVerbose()) {
                     System.err.println("[SubgoalManager] Using Hungarian assignment for " 
                             + subgoal.boxType + " -> " + subgoal.goalPos + ": box at " + hungarianBox);
@@ -237,6 +237,11 @@ public class SubgoalManager {
             // Pukoban fix: check box has at least one direction where push or pull is possible
             if (!isBoxMovable(boxPos, state, level)) continue;
             
+            // Physical accessibility: agent must be able to walk to a cell adjacent
+            // to the box in the CURRENT state (treating all boxes as obstacles).
+            // Without this, greedy selects boxes separated by other movable boxes.
+            if (!isAgentPhysicallyAdjacentReachable(agentPos, boxPos, state, level)) continue;
+            
             // Check if agent can reach box
             int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
             if (agentToBox == Integer.MAX_VALUE) continue;
@@ -253,7 +258,7 @@ public class SubgoalManager {
 
         // Iterate candidates and check feasibility
         for (BoxCandidate candidate : candidates) {
-            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
+            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals, completedBoxGoals)) {
                 return candidate.pos;
             }
         }
@@ -272,29 +277,32 @@ public class SubgoalManager {
     }
     
     /**
-     * Like findBestBoxForGoal, but excludes a specific box position.
-     * Used for BSP-failure retry: when the initial box pick fails all BSP rounds,
-     * retry with the next best candidate (skipping the failed box entirely).
+     * Like findBestBoxForGoal, but excludes a SET of box positions.
+     * Used for BSP-failure retry: when box picks fail all BSP rounds,
+     * retry with the next best candidate (skipping all failed boxes).
      * Skips Hungarian Layer 1 (since its pick was already tried and failed) and
      * goes directly to greedy Layer 2.
      */
     public Position findBestBoxForGoalExcluding(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level,
             List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals, Set<Position> completedBoxGoals,
-            Position excludeBox) {
+            Set<Position> excludeBoxes) {
         Position agentPos = state.getAgentPosition(subgoal.agentId);
         Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
         
-        // Skip Hungarian (Layer 1) — go directly to greedy, excluding the failed box
+        // Skip Hungarian (Layer 1) — go directly to greedy, excluding failed boxes
         List<BoxCandidate> candidates = new ArrayList<>();
 
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
             if (entry.getValue() != subgoal.boxType) continue;
             Position boxPos = entry.getKey();
-            if (boxPos.equals(excludeBox)) continue; // Skip the failed box
+            if (excludeBoxes.contains(boxPos)) continue; // Skip all failed boxes
             if (level.getBoxGoal(boxPos) == subgoal.boxType) continue;
             if (subgoal.boxType == level.getBoxGoal(boxPos) && completedBoxGoals.contains(boxPos)) continue;
             if (immovableBoxes.contains(boxPos)) continue;
             if (!isBoxMovable(boxPos, state, level)) continue;
+            
+            // Physical accessibility: same filter as main greedy path
+            if (!isAgentPhysicallyAdjacentReachable(agentPos, boxPos, state, level)) continue;
             
             int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
             if (agentToBox == Integer.MAX_VALUE) continue;
@@ -306,7 +314,7 @@ public class SubgoalManager {
 
         candidates.sort(Comparator.comparingInt(c -> c.dist));
         for (BoxCandidate candidate : candidates) {
-            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
+            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals, completedBoxGoals)) {
                 return candidate.pos;
             }
         }
@@ -408,9 +416,12 @@ public class SubgoalManager {
     /**
      * Checks if assigning candidateBox to currentSubgoal leaves a valid assignment for all 
      * other pending subgoals of the SAME type.
+     * 
+     * @param completedBoxGoals goals already completed (frozen obstacles in reachability check)
      */
     private boolean isAllocationFeasible(Position candidateBox, PriorityPlanningStrategy.Subgoal currentSubgoal, 
-                                         State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals) {
+                                         State state, Level level, List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals,
+                                         Set<Position> completedBoxGoals) {
         if (allPendingSubgoals == null || allPendingSubgoals.isEmpty()) return true;
 
         // 1. Identify remaining goals of same type
@@ -451,6 +462,12 @@ public class SubgoalManager {
         
         Set<Position> obstacles = new HashSet<>(immovableDetector.getImmovableBoxes(state, level));
         obstacles.add(currentSubgoal.goalPos); // The goal we are filling becomes an obstacle
+        // Completed box goals are frozen (permanent obstacles) — boxes on them won't move.
+        // Without this, the BFS happily paths through frozen positions, making the
+        // feasibility check too permissive in congested areas.
+        if (completedBoxGoals != null) {
+            obstacles.addAll(completedBoxGoals);
+        }
 
         // Adjacency: goals -> reachable boxes
         Map<Position, List<Position>> adj = new HashMap<>();
@@ -525,31 +542,10 @@ public class SubgoalManager {
     
     /**
      * Checks if a box can be pushed or pulled in at least one direction.
-     * Push: requires agent-side free AND push-direction free (opposite neighbors along an axis)
-     * Pull: requires agent adjacent AND agent has somewhere to move while pulling
-     * Returns true if box is not stuck.
+     * Delegates to HungarianBoxAssigner's canonical implementation (DRY).
      */
     private boolean isBoxMovable(Position boxPos, State state, Level level) {
-        int freeNeighborCount = 0;
-        boolean hasPushAxis = false;
-        
-        Direction[] dirs = Direction.values();
-        for (Direction dir : dirs) {
-            Position neighbor = boxPos.move(dir);
-            if (!level.isWall(neighbor) && !state.hasBoxAt(neighbor)) {
-                freeNeighborCount++;
-                // Check opposite direction for push possibility
-                Position opposite = boxPos.move(dir.opposite());
-                if (!level.isWall(opposite) && !state.hasBoxAt(opposite)) {
-                    hasPushAxis = true; // Can push along this axis
-                }
-            }
-        }
-        
-        // Pull only needs 1 free neighbor (agent stands adjacent, pulls box toward itself)
-        // Push needs 2 opposite free neighbors
-        // Either is sufficient to move the box
-        return hasPushAxis || freeNeighborCount >= 1;
+        return HungarianBoxAssigner.isBoxMovable(boxPos, state, level);
     }
     
     /**

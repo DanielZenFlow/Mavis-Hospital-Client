@@ -248,8 +248,31 @@ Three fixes applied:
    treating ALL boxes as obstacles. If agent can't walk to any cell adjacent to the
    Hungarian-assigned box, reject it → greedy fallback activates.
 3. **BSP-failure retry** (`PriorityPlanningStrategy.planSubgoal`): If all BSP rounds fail
-   with the initial box, call `findBestBoxForGoalExcluding(failedBox)` to get the next-best
-   candidate (greedy, skipping Hungarian and the failed box) and retry BSP.
+   with the initial box, call `findBestBoxForGoalExcluding(failedBoxes)` to get the next-best
+   candidate (greedy, skipping Hungarian and failed boxes) and retry BSP.
+
+**Hungarian deep fix: 7-point improvement pass (2026-02-11)**
+Systematic analysis comparing our Hungarian implementation to standard Pull-Sokoban practices
+identified 7 issues. All fixed in this session:
+1. **Cost matrix = agent→box + box→goal** (`HungarianBoxAssigner.computeAssignment`): Previously
+   only `BFS(box→goal)`. Now computes `min_agent(BFS(agent, box)) + BFS(box, goal)` to reflect
+   true transport cost. Prevents assigning box close to goal but far from all agents.
+2. **Greedy fallback physical reachability filter** (`SubgoalManager.findBestBoxForGoal`): Added
+   `isAgentPhysicallyAdjacentReachable` check to greedy candidates. Previously only L2 (Hungarian
+   path) had this protection; greedy fallback could select physically blocked boxes.
+3. **isBoxMovable Pull retreat check** (`HungarianBoxAssigner.isBoxMovable`): Pull requires agent
+   to stand adjacent AND have a retreat cell. Old code only checked "1 free neighbor". Now checks
+   `neighbor free + neighbor.move(dir) free` for pull, and opposite-side free for push.
+4. **isBoxMovable DRY unification**: Eliminated duplicate implementation in SubgoalManager.
+   SubgoalManager now delegates to `HungarianBoxAssigner.isBoxMovable()`.
+5. **Round 4 multi-box retry loop** (`PriorityPlanningStrategy.planSubgoal`): Changed from single
+   retry to a loop excluding up to 3 failed boxes via `Set<Position>`.
+6. **isAllocationFeasible includes completedBoxGoals** (`SubgoalManager`): BFS reachability check
+   now treats completed box goals as obstacles. Previously they were invisible, making the feasibility
+   check too permissive in congested areas where frozen boxes physically block paths.
+7. **tryRecovery cache invalidation** (`PriorityPlanningStrategy`): After successful recovery,
+   both `hungarianCache` and `cachedSubgoalOrder` are now invalidated. Previously, recovery could
+   displace boxes without refreshing the stale assignment/ordering caches.
 
 ## File Conventions
 

@@ -112,9 +112,19 @@ public final class HungarianBoxAssigner {
             //    Hungarian requires rows ≤ columns
             if (availableBoxes.isEmpty()) continue;
 
-            // 4. Compute assignment
+            // 4. Collect same-color agent positions for agent→box distance
+            Color boxColor = level.getBoxColor(boxType);
+            List<Position> sameColorAgentPositions = new ArrayList<>();
+            for (int a = 0; a < state.getNumAgents(); a++) {
+                if (boxColor != null && boxColor.equals(level.getAgentColor(a))) {
+                    sameColorAgentPositions.add(state.getAgentPosition(a));
+                }
+            }
+
+            // 5. Compute assignment with full transport cost (agent→box + box→goal)
             AssignmentResult result = computeAssignment(
-                    unsatisfiedGoals, availableBoxes, state, level, immovableDetector);
+                    unsatisfiedGoals, availableBoxes, sameColorAgentPositions,
+                    state, level, immovableDetector);
             if (result != null) {
                 results.put(boxType, result);
             }
@@ -128,13 +138,14 @@ public final class HungarianBoxAssigner {
      *
      * @param goals            unsatisfied goal positions
      * @param boxes            available box positions
+     * @param agentPositions   positions of same-color agents (for agent→box cost)
      * @param state            current state
      * @param level            level definition
      * @param immovableDetector for distance calculation
      * @return assignment result, or null if assignment is impossible
      */
     static AssignmentResult computeAssignment(
-            List<Position> goals, List<Position> boxes,
+            List<Position> goals, List<Position> boxes, List<Position> agentPositions,
             State state, Level level, ImmovableBoxDetector immovableDetector) {
 
         int nGoals = goals.size();
@@ -154,20 +165,49 @@ public final class HungarianBoxAssigner {
             cols = nBoxes;
         }
 
-        // Build cost matrix
+        // Precompute minimum agent→box distance for each box.
+        // This makes the cost reflect TRUE transport cost (agent→box + box→goal)
+        // instead of just box→goal, which could select a box close to goal but
+        // far from all agents. Falls back to 0 if no agents found (shouldn't happen).
+        int[] minAgentToBox = new int[boxes.size()];
+        for (int b = 0; b < boxes.size(); b++) {
+            if (agentPositions.isEmpty()) {
+                minAgentToBox[b] = 0;
+            } else {
+                int minDist = Integer.MAX_VALUE;
+                for (Position agentPos : agentPositions) {
+                    int d = immovableDetector.getDistanceWithImmovableBoxes(
+                            agentPos, boxes.get(b), state, level);
+                    if (d < minDist) minDist = d;
+                }
+                minAgentToBox[b] = minDist;
+            }
+        }
+
+        // Build cost matrix: cost = agent→box + box→goal
         int[][] cost = new int[rows][cols];
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
-                Position from, to;
+                Position boxPos, goalPos;
+                int boxIdx;
                 if (transposed) {
-                    from = boxes.get(i);   // row = box
-                    to = goals.get(j);     // col = goal
+                    boxPos = boxes.get(i);    // row = box
+                    goalPos = goals.get(j);   // col = goal
+                    boxIdx = i;
                 } else {
-                    from = boxes.get(j);   // col = box
-                    to = goals.get(i);     // row = goal
+                    boxPos = boxes.get(j);    // col = box
+                    goalPos = goals.get(i);   // row = goal
+                    boxIdx = j;
                 }
-                // BFS distance (box → goal), treating immovable boxes as walls
-                cost[i][j] = immovableDetector.getDistanceWithImmovableBoxes(from, to, state, level);
+                int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(
+                        boxPos, goalPos, state, level);
+                int agentToBox = minAgentToBox[boxIdx];
+                // Combine: if either is unreachable, mark as impossible
+                if (boxToGoal == Integer.MAX_VALUE || agentToBox == Integer.MAX_VALUE) {
+                    cost[i][j] = Integer.MAX_VALUE;
+                } else {
+                    cost[i][j] = agentToBox + boxToGoal;
+                }
             }
         }
 
@@ -218,15 +258,33 @@ public final class HungarianBoxAssigner {
 
     /**
      * Checks if a box can be pushed or pulled in at least one direction.
-     * Push: requires opposite neighbors free along an axis.
-     * Pull: requires at least 1 free neighbor (agent stands adjacent, pulls).
-     * Returns false if the box is completely stuck (all neighbors are walls or boxes).
+     * 
+     * Push: agent on one side, box pushed to opposite side.
+     *   Requires: neighbor free (agent stands) AND opposite neighbor free (box destination).
+     * 
+     * Pull: agent adjacent, agent retreats further away, box follows into agent's cell.
+     *   Requires: neighbor free (agent stands) AND neighbor's continuation free (agent retreat).
+     * 
+     * Returns false if the box is completely stuck (no push or pull possible).
+     * 
+     * Package-private: shared by SubgoalManager to avoid duplication (DRY).
      */
-    private static boolean isBoxMovable(Position boxPos, State state, Level level) {
+    static boolean isBoxMovable(Position boxPos, State state, Level level) {
         for (Direction dir : Direction.values()) {
             Position neighbor = boxPos.move(dir);
-            if (!level.isWall(neighbor) && !state.hasBoxAt(neighbor)) {
-                return true; // At least one free neighbor → pull is possible
+            if (level.isWall(neighbor) || state.hasBoxAt(neighbor)) continue;
+            // neighbor is free — agent could stand here
+            
+            // Push check: agent at neighbor pushes box to opposite side
+            Position pushTarget = boxPos.move(dir.opposite());
+            if (!level.isWall(pushTarget) && !state.hasBoxAt(pushTarget)) {
+                return true; // Push feasible along this axis
+            }
+            
+            // Pull check: agent at neighbor retreats further in dir, box follows to neighbor
+            Position agentRetreat = neighbor.move(dir);
+            if (!level.isWall(agentRetreat) && !state.hasBoxAt(agentRetreat)) {
+                return true; // Pull feasible: agent stands at neighbor, retreats to agentRetreat
             }
         }
         return false;

@@ -266,6 +266,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     boolean recovered = tryRecovery(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
                     if (recovered) {
                         currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                        // Invalidate caches: recovery may have displaced boxes, making both
+                        // the Hungarian assignment and cached subgoal order stale.
+                        // Without this, the next iteration uses pre-recovery cache data,
+                        // potentially selecting boxes that are no longer in their expected positions.
+                        subgoalManager.invalidateHungarianCache();
+                        cachedSubgoalOrder = null;
                         // Do NOT call revalidateCompletedGoals here.
                         // Displaced goals stay in completedBoxGoals (satisfying dependency checks)
                         // but are tracked in displacedGoals (excluded from frozen set in planSubgoal).
@@ -1375,18 +1381,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (path != null) return path;
             
             // Round 4: BSP-failure retry — if all rounds failed with the initial box pick,
-            // try a DIFFERENT box. This handles the case where Hungarian assigns a box that
-            // is theoretically optimal but practically hard for BSP (e.g., box deep in a
-            // congested area where BFS distance is optimistic but actual push/pull planning fails).
-            // Exclude the failed box and let findBestBoxForGoal try the next best candidate.
-            Position retryBoxPos = subgoalManager.findBestBoxForGoalExcluding(
-                    subgoal, state, level, allSubgoals, completedBoxGoals, boxPos);
-            if (retryBoxPos != null && !retryBoxPos.equals(boxPos)) {
-                logNormal("[PP] Round 4 (retry with different box): " + subgoal.boxType 
-                        + " at " + retryBoxPos + " -> " + subgoal.goalPos 
-                        + " (original box " + boxPos + " failed)");
+            // try DIFFERENT boxes in a loop. This handles the case where Hungarian assigns a
+            // box that is theoretically optimal but practically hard for BSP (e.g., box deep
+            // in a congested area). Loop up to MAX_RETRY_BOXES times, excluding all previously
+            // failed boxes.
+            final int MAX_RETRY_BOXES = 3;
+            Set<Position> excludedBoxes = new HashSet<>();
+            excludedBoxes.add(boxPos);
+            
+            for (int retry = 0; retry < MAX_RETRY_BOXES; retry++) {
+                Position retryBoxPos = subgoalManager.findBestBoxForGoalExcluding(
+                        subgoal, state, level, allSubgoals, completedBoxGoals, excludedBoxes);
+                if (retryBoxPos == null || excludedBoxes.contains(retryBoxPos)) break;
                 
-                // Try all frozen levels with the new box
+                logNormal("[PP] Round 4 (retry " + (retry + 1) + " with different box): " + subgoal.boxType 
+                        + " at " + retryBoxPos + " -> " + subgoal.goalPos 
+                        + " (excluded: " + excludedBoxes + ")");
+                
+                // Try all frozen levels with the retry box
                 path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, retryBoxPos,
                         subgoal.goalPos, subgoal.boxType, state, level, frozen,
                         reservationTable, globalTimeStep);
@@ -1398,6 +1410,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, retryBoxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
                 }
+                if (path != null) break; // Success — stop retrying
+                excludedBoxes.add(retryBoxPos);
             }
             
             logVerbose("[PP] All rounds exhausted for " + subgoal.boxType + " -> " + subgoal.goalPos
