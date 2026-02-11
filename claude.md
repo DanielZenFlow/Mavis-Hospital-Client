@@ -274,6 +274,18 @@ identified 7 issues. All fixed in this session:
    both `hungarianCache` and `cachedSubgoalOrder` are now invalidated. Previously, recovery could
    displace boxes without refreshing the stale assignment/ordering caches.
 
+**isBoxMovable Pull/Push completeness fix (2026-02-11)**
+`isBoxMovable` was too conservative for both Pull and Push:
+1. **Pull retreat**: Only checked retreat in one direction (further from box). Fixed to check ALL 4
+   directions. Agent can retreat laterally, not just straight away. A box in a corner where the
+   straight retreat is walled off but lateral retreat is clear was falsely marked stuck.
+2. **Push lateral**: Only checked straight push (`boxDir = dir.opposite()`). Fixed to check all 3
+   valid box move directions (excluding `dir` where agent stands). In this domain, Push allows
+   `boxDir ≠ agentDir` (lateral push), so boxes that can only be pushed sideways were also missed.
+Impact: all 4 callers (`computeAllAssignments`, `findBestBoxForGoal`, `findBestBoxForGoalExcluding`,
+`getHungarianCandidate`) exclude boxes that fail this check. False negatives → valid boxes excluded
+→ Hungarian cost matrix missing rows → solver failure on congested maps with corner boxes.
+
 ## File Conventions
 
 - **Level files**: `levels/` (warmup), `complevels/` (competition)

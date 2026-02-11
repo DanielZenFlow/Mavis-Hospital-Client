@@ -272,11 +272,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         // potentially selecting boxes that are no longer in their expected positions.
                         subgoalManager.invalidateHungarianCache();
                         cachedSubgoalOrder = null;
-                        // Do NOT call revalidateCompletedGoals here.
-                        // Displaced goals stay in completedBoxGoals (satisfying dependency checks)
-                        // but are tracked in displacedGoals (excluded from frozen set in planSubgoal).
-                        // revalidateCompletedGoals will run after the NEXT successful goal completes,
-                        // naturally detecting and cleaning up the displaced goals.
+                        // Revalidate completed goals: recovery (especially Strategy 3) may have
+                        // disturbed previously completed goals as a side-effect. Without this,
+                        // those goals remain in completedBoxGoals (stale), causing
+                        // filterUnsatisfiedSubgoals to skip them even though they're physically
+                        // unsatisfied → isGoalState returns false → infinite loop.
+                        // Strategy 2 (intentional displacement) tracks its targets in displacedGoals,
+                        // so they are re-added as unsatisfied subgoals naturally.
+                        revalidateCompletedGoals(currentState, level);
                         stuckCount = 0;
                     }
                 }
@@ -1101,6 +1104,46 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             List<Action[]> fullPlan, int numAgents, List<Subgoal> pendingSubgoals) {
         Position agentPos = state.getAgentPosition(agentId);
         
+        // PRE-POSITION: If this agent has a pending agent goal reachable via Move-only
+        // BFS, go there NOW while the path is still open. This prevents the agent from
+        // getting stranded on the wrong side of a just-completed chokepoint box goal.
+        // Example: TeamAgent — after placing C at (3,8), Agent 2 is at (3,7) and can
+        // reach (5,7) in 2 steps. But generic parking would put it at (4,9) on the
+        // WRONG side; by the time Phase 2 starts, C+A+B block all paths.
+        // Only activate when the agent has no remaining box tasks.
+        Position myAgentGoal = level.getAgentGoalPositionMap().get(agentId);
+        if (myAgentGoal != null && !agentPos.equals(myAgentGoal) 
+                && !completedAgentGoals.contains(myAgentGoal)) {
+            boolean hasMoreBoxWork = false;
+            for (Subgoal sg : pendingSubgoals) {
+                if (!sg.isAgentGoal && sg.agentId == agentId) {
+                    hasMoreBoxWork = true;
+                    break;
+                }
+            }
+            if (!hasMoreBoxWork) {
+                List<Action> pathToGoal = pathAnalyzer.planAgentPath(
+                        agentId, myAgentGoal, state, level, numAgents);
+                if (pathToGoal != null && !pathToGoal.isEmpty() && pathToGoal.size() <= 20) {
+                    logNormal("[PP] [PRE-POS] Agent " + agentId + " -> agent goal " 
+                            + myAgentGoal + " (" + pathToGoal.size() + " steps, early positioning)");
+                    State tempState = state;
+                    for (Action moveAction : pathToGoal) {
+                        if (!tempState.isApplicable(moveAction, agentId, level)) break;
+                        Action[] jointAction = new Action[numAgents];
+                        for (int i = 0; i < numAgents; i++) {
+                            jointAction[i] = (i == agentId) ? moveAction : Action.noOp();
+                        }
+                        fullPlan.add(jointAction);
+                        tempState = tempState.apply(moveAction, agentId);
+                        globalTimeStep++;
+                    }
+                    completedAgentGoals.add(myAgentGoal);
+                    return tempState;
+                }
+            }
+        }
+        
         // Check if agent is already at a safe position:
         // Not on a goal, not in a corridor (2 passable neighbors = corridor)
         // TASK-AWARE FIX: Also check if agent is on the critical path of any pending subgoal
@@ -1286,15 +1329,63 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         frozen.removeAll(displacedGoals);
         
         if (subgoal.isAgentGoal) {
-            // Round 1: Agent goal with frozen protection (don't push completed goals)
-            List<Action> path = boxSearchPlanner.searchForAgentGoal(
-                    subgoal.agentId, subgoal.goalPos, state, level, frozen);
-            if (path != null) return path;
+            // Round 0: Move-only BFS — guaranteed O(grid_size), never disturbs boxes.
+            // Critical for levels where a completed box goal partitions the maze,
+            // making the short path require Push/Pull but a Move-only detour exists.
+            // Example: TeamAgent — C at (3,8) blocks the only short path between
+            // cols 9-13 and cols 5-7; BSP Round 1 can't find the 40-step detour
+            // through the top corridor within state limits, but BFS does trivially.
+            List<Action> path = pathAnalyzer.planAgentPath(
+                    subgoal.agentId, subgoal.goalPos, state, level, state.getNumAgents());
+            if (path != null && !path.isEmpty()) {
+                logVerbose("[PP] [AGENT-GOAL] Round 0 (Move-only BFS) OK: " + path.size() + " steps");
+                return path;
+            }
             
-            // Round 2: Without frozen (allow pushing if path is blocked by completed goals)
+            // Round 1: BSP with frozen protection — if Move-only fails (boxes or
+            // agents physically blocking), BSP can Push/Pull non-frozen boxes.
+            logVerbose("[PP] [AGENT-GOAL] Agent " + subgoal.agentId + " -> " + subgoal.goalPos 
+                    + " from " + state.getAgentPosition(subgoal.agentId) + " frozen=" + frozen);
+            path = boxSearchPlanner.searchForAgentGoal(
+                    subgoal.agentId, subgoal.goalPos, state, level, frozen);
+            if (path != null) {
+                logVerbose("[PP] [AGENT-GOAL] Round 1 OK (" + path.size() + " steps): " + path);
+                return path;
+            }
+            
+            // Round 2: BSP "borrow-and-return" — allows temporarily moving frozen boxes, 
+            // but the goal check requires ALL frozen goals to be RESTORED in the final state.
+            // This handles chokepoint patterns: C at (3,8) blocks agent's path, so agent
+            // pulls C off, walks past, pushes C back, then walks to goal.
+            // Unlike Round 3 (no frozen), this GUARANTEES no regression.
             if (!frozen.isEmpty()) {
+                logVerbose("[PP] [AGENT-GOAL] Round 1 FAILED, trying Round 2 (borrow-and-return)");
+                Map<Position, Character> requiredBoxPositions = new java.util.HashMap<>();
+                for (Position frozenPos : frozen) {
+                    char goalType = level.getBoxGoal(frozenPos.row, frozenPos.col);
+                    if (goalType != '\0') {
+                        requiredBoxPositions.put(frozenPos, goalType);
+                    }
+                }
+                if (!requiredBoxPositions.isEmpty()) {
+                    path = boxSearchPlanner.searchForAgentGoalWithRestore(
+                            subgoal.agentId, subgoal.goalPos, state, level, requiredBoxPositions);
+                    if (path != null) {
+                        logNormal("[PP] [AGENT-GOAL] Round 2 (borrow-and-return) OK (" + path.size() + " steps)");
+                        return path;
+                    }
+                }
+            }
+            
+            // Round 3: BSP without frozen — last resort, may disturb completed goals.
+            // Regression guard in tryExecuteSubgoals will catch any disturbance.
+            if (!frozen.isEmpty()) {
+                logVerbose("[PP] [AGENT-GOAL] Round 2 FAILED, trying Round 3 (no frozen)");
                 path = boxSearchPlanner.searchForAgentGoal(
                         subgoal.agentId, subgoal.goalPos, state, level, Collections.emptySet());
+                if (path != null) {
+                    logVerbose("[PP] [AGENT-GOAL] Round 3 OK (" + path.size() + " steps): " + path);
+                }
             }
             return path;
         } else {
@@ -1738,10 +1829,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         
         // Strategy 3: Random reorder and retry
+        // Must apply the same safety checks as tryExecuteSubgoals:
+        // - goalCompletionCount cycle check (prevent re-solving cycling goals)
+        // - regression guard (prevent disturbing completed goals)
+        // - goalCompletionCount increment (track recovery completions)
+        // Without these, recovery creates phantom progress that resets stuckCount
+        // endlessly, causing the main loop to never reach MAX_STUCK_ITERATIONS.
         Collections.shuffle(subgoals, random);
         for (Subgoal sg : subgoals) {
+            // Cycle check: same as tryExecuteSubgoals — skip over-completed goals
+            if (!sg.isAgentGoal) {
+                int completions = goalCompletionCount.getOrDefault(sg.goalPos, 0);
+                if (completions >= MAX_GOAL_COMPLETIONS) {
+                    continue;
+                }
+            }
+            
             List<Action> path = planSubgoal(sg, currentState, level, subgoals);
             if (path != null && !path.isEmpty()) {
+                planSizeBefore = fullPlan.size();
                 State tempState = currentState;
                 for (Action action : path) {
                     Action[] jointAction = planMerger.createJointActionWithMerging(
@@ -1750,11 +1856,32 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     fullPlan.add(jointAction);
                     tempState = applyJointAction(jointAction, tempState, level, numAgents);
                 }
+                
+                // Regression guard: check if this path disturbed completed goals
+                if (!completedBoxGoals.isEmpty()) {
+                    List<Position> regressedGoals = detectRegressedGoals(tempState, level);
+                    regressedGoals.removeAll(displacedGoals);
+                    if (!regressedGoals.isEmpty()) {
+                        logNormal("[PP] Recovery path disturbed " + regressedGoals.size() 
+                                + " completed goal(s) — rollback");
+                        while (fullPlan.size() > planSizeBefore) {
+                            fullPlan.remove(fullPlan.size() - 1);
+                        }
+                        continue; // try next subgoal
+                    }
+                }
+                
                 if (verifyGoalReached(sg, tempState, level)) {
                     if (!sg.isAgentGoal) {
                         completedBoxGoals.add(sg.goalPos);
+                        // Track completion count (mirrors tryExecuteSubgoals)
+                        int count = goalCompletionCount.getOrDefault(sg.goalPos, 0) + 1;
+                        goalCompletionCount.put(sg.goalPos, count);
                         subgoalManager.invalidateHungarianCache();
+                        cachedSubgoalOrder = null;
                     }
+                    // Revalidate: recovery may have disturbed other goals as side-effect
+                    revalidateCompletedGoals(tempState, level);
                     return true;
                 }
             }

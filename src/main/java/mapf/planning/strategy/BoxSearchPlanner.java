@@ -278,6 +278,112 @@ public class BoxSearchPlanner {
     }
 
     /**
+     * A* search to move an agent to its goal with "borrow and return" semantics.
+     * 
+     * Unlike searchForAgentGoal with frozen:
+     * - Does NOT filter Push/Pull of frozen/completed goals (allows temporary displacement)
+     * - Goal check: agent at goalPos AND all required box positions preserved
+     * 
+     * This handles the chokepoint pattern: a completed box goal partitions the maze,
+     * so the agent must temporarily move it, walk past, and push it back. The standard
+     * frozen search blocks all movement of the goal, and the unfrozen search allows
+     * movement but the regression guard catches the final disturbed state.
+     * Borrow-and-return allows movement but REQUIRES restoration in the goal state.
+     * 
+     * Example: TeamAgent — C at (3,8) blocks Agent 2's path to (5,7). Agent pulls C off,
+     * walks through, pushes C back to (3,8), then walks to (5,7). Goal check confirms
+     * both Agent 2 at (5,7) AND C at (3,8).
+     */
+    public List<Action> searchForAgentGoalWithRestore(int agentId, Position goalPos,
+            State initialState, Level level, Map<Position, Character> requiredBoxPositions) {
+        Position startPos = initialState.getAgentPosition(agentId);
+        if (startPos.equals(goalPos) && allBoxPositionsPreserved(initialState, requiredBoxPositions)) {
+            return Collections.emptyList();
+        }
+
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKey, Integer> bestG = new HashMap<>();
+
+        int h = getDistance(startPos, goalPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, null);
+        StateKey startKey = new AgentGoalStateKey(initialState, agentId);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        // Allow more states: borrow-and-return paths are inherently longer 
+        // (displace + walk + restore + walk-to-goal)
+        int maxStates = SearchConfig.MAX_STATES_PER_SUBGOAL * 2;
+        int exploredCount = 0;
+
+        while (!openList.isEmpty() && exploredCount < maxStates) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            Position currentAgentPos = current.state.getAgentPosition(agentId);
+            if (currentAgentPos.equals(goalPos) 
+                    && allBoxPositionsPreserved(current.state, requiredBoxPositions)) {
+                return reconstructPath(current);
+            }
+
+            for (Action action : PlanningUtils.getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) continue;
+                if (!current.state.isApplicable(action, agentId, level)) continue;
+
+                // NO wouldDisturbSatisfiedGoal filter — allow moving frozen boxes temporarily
+
+                State newState = current.state.apply(action, agentId);
+                Position newAgentPos = newState.getAgentPosition(agentId);
+                int newG = current.g + 1;
+
+                StateKey newKey = new AgentGoalStateKey(newState, agentId);
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) continue;
+                bestG.put(newKey, newG);
+
+                // Compound heuristic: agent-to-goal + penalty for displaced boxes
+                int agentH = getDistance(newAgentPos, goalPos, level);
+                int boxPenalty = boxDisplacementPenalty(newState, requiredBoxPositions, level);
+                int newH = agentH + boxPenalty;
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, null);
+                openList.add(newNode);
+            }
+        }
+
+        return null;
+    }
+
+    /** Check if all required box positions are preserved in the state. */
+    private boolean allBoxPositionsPreserved(State state, Map<Position, Character> required) {
+        for (Map.Entry<Position, Character> entry : required.entrySet()) {
+            Character actual = state.getBoxes().get(entry.getKey());
+            if (actual == null || actual != entry.getValue()) return false;
+        }
+        return true;
+    }
+
+    /** Heuristic penalty for displaced required boxes: sum of BFS distances to their goals. */
+    private int boxDisplacementPenalty(State state, Map<Position, Character> required, Level level) {
+        int penalty = 0;
+        for (Map.Entry<Position, Character> entry : required.entrySet()) {
+            Position goalPos = entry.getKey();
+            Character actual = state.getBoxes().get(goalPos);
+            if (actual == null || actual != entry.getValue()) {
+                // Box displaced — find where it actually is and add distance
+                char boxType = entry.getValue();
+                int minDist = Integer.MAX_VALUE;
+                for (Map.Entry<Position, Character> box : state.getBoxes().entrySet()) {
+                    if (box.getValue() == boxType) {
+                        int d = getDistance(box.getKey(), goalPos, level);
+                        if (d < minDist) minDist = d;
+                    }
+                }
+                if (minDist < Integer.MAX_VALUE) penalty += minDist;
+            }
+        }
+        return penalty;
+    }
+
+    /**
      * Search for a path to displace a box to a temporary position.
      */
     public List<Action> searchForDisplacement(int agentId, Position boxStart, Position targetPos,

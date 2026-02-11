@@ -259,11 +259,16 @@ public final class HungarianBoxAssigner {
     /**
      * Checks if a box can be pushed or pulled in at least one direction.
      * 
-     * Push: agent on one side, box pushed to opposite side.
-     *   Requires: neighbor free (agent stands) AND opposite neighbor free (box destination).
+     * Push: agent at neighbor, box moves in any direction except toward the agent.
+     *   Push(agentDir, boxDir): agent at boxPos.move(dir) pushes box. Box can move
+     *   in ANY of the 3 directions that aren't back toward the agent (lateral push
+     *   is valid in this domain: agentDir ≠ boxDir is allowed).
      * 
-     * Pull: agent adjacent, agent retreats further away, box follows into agent's cell.
-     *   Requires: neighbor free (agent stands) AND neighbor's continuation free (agent retreat).
+     * Pull: agent at neighbor, agent retreats in ANY free direction, box follows.
+     *   Pull requires: agent stands adjacent, retreats to any free cell (not just
+     *   further from box). The agent can retreat laterally or in any direction
+     *   where the destination cell is free (excluding boxPos, which still has the
+     *   box when checking applicability in pre-move state).
      * 
      * Returns false if the box is completely stuck (no push or pull possible).
      * 
@@ -275,16 +280,32 @@ public final class HungarianBoxAssigner {
             if (level.isWall(neighbor) || state.hasBoxAt(neighbor)) continue;
             // neighbor is free — agent could stand here
             
-            // Push check: agent at neighbor pushes box to opposite side
-            Position pushTarget = boxPos.move(dir.opposite());
-            if (!level.isWall(pushTarget) && !state.hasBoxAt(pushTarget)) {
-                return true; // Push feasible along this axis
+            // Push check: box can move in any direction except dir (where agent stands).
+            // In Push(agentDir=dir.opposite(), boxDir), boxDir can differ from agentDir.
+            // The box destination must be free (not wall, not box). The agent's pre-move
+            // position (neighbor) is blocked by hasAgentAt in isApplicable, so boxDir ≠ dir.
+            for (Direction boxMoveDir : Direction.values()) {
+                if (boxMoveDir == dir) continue; // can't push box onto agent's position
+                Position pushTarget = boxPos.move(boxMoveDir);
+                if (!level.isWall(pushTarget) && !state.hasBoxAt(pushTarget)) {
+                    return true; // Push feasible
+                }
             }
             
-            // Pull check: agent at neighbor retreats further in dir, box follows to neighbor
-            Position agentRetreat = neighbor.move(dir);
-            if (!level.isWall(agentRetreat) && !state.hasBoxAt(agentRetreat)) {
-                return true; // Pull feasible: agent stands at neighbor, retreats to agentRetreat
+            // Pull check: agent at neighbor retreats in ANY direction where the
+            // destination is free. boxDir identifies the box (relative to agent),
+            // and agentDir (retreat direction) is independent.
+            // Exclude retreat to boxPos: box is still there in pre-move state,
+            // so isApplicable would reject it (hasBoxAt check on newAgentPos? No —
+            // isFree checks newAgentPos, but boxPos has a box).
+            // Actually: retreat to boxPos means agentRetreat = boxPos. Since
+            // neighbor.move(dir.opposite()) = boxPos, retreatDir = dir.opposite().
+            // boxPos has a box → state.hasBoxAt(agentRetreat) = true → correctly rejected.
+            for (Direction retreatDir : Direction.values()) {
+                Position agentRetreat = neighbor.move(retreatDir);
+                if (!level.isWall(agentRetreat) && !state.hasBoxAt(agentRetreat)) {
+                    return true; // Pull feasible: agent retreats in retreatDir
+                }
             }
         }
         return false;
