@@ -227,7 +227,7 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 
 ### Design Decisions Log
 
-**Hungarian algorithm: always-on (2026-02-11)**
+**Hungarian algorithm: always-on with 3-layer hardening (2026-02-11)**
 Previously, `computeAndCacheSubgoals()` disabled Hungarian assignment entirely when
 `goalDependsOn` was non-empty (any goal dependency existed). This was overly conservative:
 Hungarian assigns boxes-to-goals (transport optimization), NOT execution order.
@@ -235,6 +235,21 @@ Execution order is independently enforced by `filterUnsatisfiedSubgoals()` + `so
 Hungarian results are validated at runtime by `getHungarianCandidate()` (reachability check)
 and `isAllocationFeasible()` (bipartite matching). If validation fails, greedy fallback
 kicks in automatically. Therefore, Hungarian is now always computed regardless of dependencies.
+
+**ClosedAI regression fix: 3-layer defense against Hungarian misassignment (2026-02-11)**
+Enabling Hungarian unconditionally exposed a fundamental gap: the BFS cost matrix ignores
+dynamic (movable) obstacles, producing unrealistically optimistic distances for boxes deep
+in congested areas (e.g., packed row 12 of ClosedAI: `JHIIJH` at cols 9-14). Hungarian
+would assign a physically inaccessible box, BSP would fail, and no retry mechanism existed.
+Three fixes applied:
+1. **Cost matrix filtering** (`HungarianBoxAssigner`): Exclude boxes where `isBoxMovable()`
+   returns false (all 4 neighbors are walls/boxes). Prevents wasting assignment slots.
+2. **Physical accessibility check** (`SubgoalManager.getHungarianCandidate`): BFS from agent
+   treating ALL boxes as obstacles. If agent can't walk to any cell adjacent to the
+   Hungarian-assigned box, reject it → greedy fallback activates.
+3. **BSP-failure retry** (`PriorityPlanningStrategy.planSubgoal`): If all BSP rounds fail
+   with the initial box, call `findBestBoxForGoalExcluding(failedBox)` to get the next-best
+   candidate (greedy, skipping Hungarian and the failed box) and retry BSP.
 
 ## File Conventions
 

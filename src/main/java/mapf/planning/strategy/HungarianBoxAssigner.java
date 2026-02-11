@@ -99,6 +99,12 @@ public final class HungarianBoxAssigner {
                 // Skip immovable boxes
                 if (immovableBoxes.contains(boxPos)) continue;
 
+                // Skip physically stuck boxes (no free neighbor at all).
+                // In Pull-Sokoban, a box needs at least 1 free neighbor to be pulled.
+                // Including stuck boxes wastes assignment slots and produces
+                // unrealistic cost estimates (BFS ignores dynamic obstacles).
+                if (!isBoxMovable(boxPos, state, level)) continue;
+
                 availableBoxes.add(boxPos);
             }
 
@@ -208,6 +214,22 @@ public final class HungarianBoxAssigner {
                 + " goals for type, total cost=" + totalCost);
 
         return new AssignmentResult(goalToBox, totalCost);
+    }
+
+    /**
+     * Checks if a box can be pushed or pulled in at least one direction.
+     * Push: requires opposite neighbors free along an axis.
+     * Pull: requires at least 1 free neighbor (agent stands adjacent, pulls).
+     * Returns false if the box is completely stuck (all neighbors are walls or boxes).
+     */
+    private static boolean isBoxMovable(Position boxPos, State state, Level level) {
+        for (Direction dir : Direction.values()) {
+            Position neighbor = boxPos.move(dir);
+            if (!level.isWall(neighbor) && !state.hasBoxAt(neighbor)) {
+                return true; // At least one free neighbor → pull is possible
+            }
+        }
+        return false;
     }
 
     private static void logVerbose(String msg) {

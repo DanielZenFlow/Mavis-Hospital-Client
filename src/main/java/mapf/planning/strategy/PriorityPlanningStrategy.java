@@ -1372,6 +1372,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                         subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
             }
+            if (path != null) return path;
+            
+            // Round 4: BSP-failure retry — if all rounds failed with the initial box pick,
+            // try a DIFFERENT box. This handles the case where Hungarian assigns a box that
+            // is theoretically optimal but practically hard for BSP (e.g., box deep in a
+            // congested area where BFS distance is optimistic but actual push/pull planning fails).
+            // Exclude the failed box and let findBestBoxForGoal try the next best candidate.
+            Position retryBoxPos = subgoalManager.findBestBoxForGoalExcluding(
+                    subgoal, state, level, allSubgoals, completedBoxGoals, boxPos);
+            if (retryBoxPos != null && !retryBoxPos.equals(boxPos)) {
+                logNormal("[PP] Round 4 (retry with different box): " + subgoal.boxType 
+                        + " at " + retryBoxPos + " -> " + subgoal.goalPos 
+                        + " (original box " + boxPos + " failed)");
+                
+                // Try all frozen levels with the new box
+                path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, retryBoxPos,
+                        subgoal.goalPos, subgoal.boxType, state, level, frozen,
+                        reservationTable, globalTimeStep);
+                if (path == null) {
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, retryBoxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, frozen);
+                }
+                if (path == null && !frozen.isEmpty()) {
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, retryBoxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
+                }
+            }
             
             logVerbose("[PP] All rounds exhausted for " + subgoal.boxType + " -> " + subgoal.goalPos
                     + " result=" + (path != null ? path.size() + " steps" : "null"));

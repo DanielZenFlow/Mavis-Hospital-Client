@@ -270,6 +270,48 @@ public class SubgoalManager {
         
         return null;
     }
+    
+    /**
+     * Like findBestBoxForGoal, but excludes a specific box position.
+     * Used for BSP-failure retry: when the initial box pick fails all BSP rounds,
+     * retry with the next best candidate (skipping the failed box entirely).
+     * Skips Hungarian Layer 1 (since its pick was already tried and failed) and
+     * goes directly to greedy Layer 2.
+     */
+    public Position findBestBoxForGoalExcluding(PriorityPlanningStrategy.Subgoal subgoal, State state, Level level,
+            List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals, Set<Position> completedBoxGoals,
+            Position excludeBox) {
+        Position agentPos = state.getAgentPosition(subgoal.agentId);
+        Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
+        
+        // Skip Hungarian (Layer 1) — go directly to greedy, excluding the failed box
+        List<BoxCandidate> candidates = new ArrayList<>();
+
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != subgoal.boxType) continue;
+            Position boxPos = entry.getKey();
+            if (boxPos.equals(excludeBox)) continue; // Skip the failed box
+            if (level.getBoxGoal(boxPos) == subgoal.boxType) continue;
+            if (subgoal.boxType == level.getBoxGoal(boxPos) && completedBoxGoals.contains(boxPos)) continue;
+            if (immovableBoxes.contains(boxPos)) continue;
+            if (!isBoxMovable(boxPos, state, level)) continue;
+            
+            int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
+            if (agentToBox == Integer.MAX_VALUE) continue;
+            int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(boxPos, subgoal.goalPos, state, level);
+            if (boxToGoal == Integer.MAX_VALUE) continue;
+            
+            candidates.add(new BoxCandidate(boxPos, agentToBox + boxToGoal));
+        }
+
+        candidates.sort(Comparator.comparingInt(c -> c.dist));
+        for (BoxCandidate candidate : candidates) {
+            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
+                return candidate.pos;
+            }
+        }
+        return null;
+    }
 
     /**
      * Retrieves the Hungarian-assigned box for a subgoal, if the assignment is still valid.
@@ -294,13 +336,67 @@ public class SubgoalManager {
         if (level.getBoxGoal(assignedBox) == subgoal.boxType) return null; // Box already at a goal
         if (!isBoxMovable(assignedBox, state, level)) return null;        // Box stuck
         
-        // Check reachability
+        // Check reachability (optimistic: ignores dynamic boxes)
         int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, assignedBox, state, level);
         if (agentToBox == Integer.MAX_VALUE) return null;
         int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(assignedBox, subgoal.goalPos, state, level);
         if (boxToGoal == Integer.MAX_VALUE) return null;
         
+        // Physical accessibility check: verify the agent can actually walk to a cell
+        // adjacent to the assigned box in the current state (treating ALL boxes as obstacles).
+        // The BFS distance above ignores movable boxes, which is too optimistic for
+        // congested areas (e.g., boxes packed in row 12 of ClosedAI).
+        if (!isAgentPhysicallyAdjacentReachable(agentPos, assignedBox, state, level)) {
+            if (mapf.planning.SearchConfig.isVerbose()) {
+                System.err.println("[SubgoalManager] Hungarian pick " + subgoal.boxType 
+                        + " at " + assignedBox + " physically unreachable by agent — falling back to greedy");
+            }
+            return null;
+        }
+        
         return assignedBox;
+    }
+
+    /**
+     * Checks if the agent can physically walk to any cell adjacent to the target box,
+     * treating ALL boxes (not just immovable) as obstacles.
+     * 
+     * This catches the case where BFS-ignoring-dynamic-obstacles says "reachable"
+     * but the agent is actually separated from the box by other movable boxes.
+     * In Pull-Sokoban, the agent must be adjacent to a box to push or pull it.
+     */
+    private boolean isAgentPhysicallyAdjacentReachable(Position agentPos, Position boxPos, 
+                                                        State state, Level level) {
+        // Collect positions adjacent to the box that are not walls/boxes
+        Set<Position> targetCells = new HashSet<>();
+        for (Direction dir : Direction.values()) {
+            Position adj = boxPos.move(dir);
+            if (!level.isWall(adj) && !state.hasBoxAt(adj)) {
+                targetCells.add(adj);
+            }
+        }
+        if (targetCells.isEmpty()) return false; // Box completely stuck
+        if (targetCells.contains(agentPos)) return true; // Agent already adjacent
+        
+        // BFS from agent position, treating ALL boxes as walls
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        visited.add(agentPos);
+        queue.add(agentPos);
+        
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (state.hasBoxAt(next)) continue; // Treat ALL boxes as obstacles
+                visited.add(next);
+                if (targetCells.contains(next)) return true; // Can reach adjacent cell
+                queue.add(next);
+            }
+        }
+        return false;
     }
 
     private static class BoxCandidate {
