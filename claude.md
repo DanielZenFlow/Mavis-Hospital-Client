@@ -225,8 +225,13 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 - K-robust conflicts (synchronous model only)
 - Symmetry breaking (small scale)
 
-### Temporarily Disabled (under review)
-- Hungarian algorithm for box-goal assignment (currently disabled in PriorityPlanningStrategy.computeAndCacheSubgoals to ensure stable dependency analysis; architecturally should be orthogonal to dependency analysis and co-active, pending re-enablement after validation)
+### Active Architectural Decisions
+- Hungarian algorithm for box-goal assignment: **ENABLED** with box-retry fallback.
+  Hungarian (SELECTION: which box fills which goal) and dependency analysis (ORDER: what
+  order to fill goals) are orthogonal — both always active. If Hungarian's globally-optimal
+  pick fails all BSP rounds (serial execution mismatch), planSubgoal automatically retries
+  with greedy Layer 2 candidates. revalidateCompletedGoals invalidates Hungarian cache when
+  completed goals are disturbed.
 
 ## File Conventions
 

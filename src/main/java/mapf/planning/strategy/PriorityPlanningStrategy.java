@@ -386,21 +386,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     private void computeAndCacheSubgoals(State state, Level level) {
-        // TEMPORARY: Hungarian algorithm is DISABLED to ensure stable dependency analysis.
-        // 
-        // ARCHITECTURAL NOTE: Hungarian (SELECTION: which box fills which goal) and 
-        // dependency analysis (ORDER: what order to fill goals) are ORTHOGONAL concerns
-        // and should both be active. Hungarian's cost matrix is pure box-to-goal distance
-        // with NO execution order assumptions. findBestBoxForGoal() uses Hungarian as
-        // Layer 1 candidate with feasibility-check fallback, making it safe even when
-        // dependencies constrain execution order.
-        // 
-        // TODO: After verifying core dependency logic stability, re-enable Hungarian
-        // by calling computeHungarianAssignment() unconditionally (remove invalidate call).
-        subgoalManager.invalidateHungarianCache();
+        // Hungarian (SELECTION: which box fills which goal) and dependency analysis
+        // (ORDER: what order to fill goals) are ORTHOGONAL concerns — both always active.
+        // Hungarian's cost matrix is pure box-to-goal distance with NO execution order
+        // assumptions. planSubgoal() has a box-retry fallback: if Hungarian's globally-
+        // optimal pick fails BSP (serial execution mismatch), it automatically falls
+        // through to greedy Layer 2 candidates.
+        subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
         if (!goalDependsOn.isEmpty()) {
             logNormal("[PP] Goal dependencies detected (" + goalDependsOn.size() 
-                    + " deps) — using greedy per-step assignment");
+                    + " deps) — Hungarian + dependency analysis (orthogonal)");
         }
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
@@ -1287,90 +1282,131 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
             return path;
         } else {
-            // Task-Aware Allocation: Pass all remaining subgoals to ensure global feasibility
+            // Box-retry mechanism: try BSP with the best box candidate. If ALL rounds
+            // fail AND Hungarian was used for selection, invalidate the cache and retry
+            // with greedy fallback (which may pick a different, BSP-friendlier box).
+            //
+            // WHY: Hungarian optimizes for SIMULTANEOUS fulfillment (global minimum total
+            // distance), but PP executes SERIALLY. A globally-optimal box can be locally
+            // terrible for BSP's limited search budget (far away, complex path). The retry
+            // gives greedy Layer 2 a chance to pick a closer, easier box.
+            boolean usedHungarian = subgoalManager.hasHungarianCache();
             Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
-            if (boxPos == null) {
-                logVerbose("[PP] findBestBoxForGoal returned null for " + subgoal.boxType + " -> " + subgoal.goalPos);
+            
+            for (int attempt = 0; attempt < 2; attempt++) {
+                if (boxPos == null) {
+                    if (attempt == 0 && usedHungarian) {
+                        // Hungarian may have constrained the feasibility check too strictly.
+                        // Retry with greedy-only.
+                        logVerbose("[PP] findBestBoxForGoal returned null (attempt " + attempt 
+                                + "), retrying without Hungarian");
+                        subgoalManager.invalidateHungarianCache();
+                        boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
+                        continue;
+                    }
+                    logVerbose("[PP] findBestBoxForGoal returned null for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    return null;
+                }
+                
+                logVerbose("[PP] Box " + subgoal.boxType + " at " + boxPos + " -> goal " + subgoal.goalPos
+                        + " (agent " + subgoal.agentId + " at " + state.getAgentPosition(subgoal.agentId) 
+                        + ", frozen=" + frozen + ", attempt=" + attempt + ")");
+                
+                // Round 1: ST-A* with all frozen as walls
+                List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                        subgoal.goalPos, subgoal.boxType, state, level, frozen,
+                        reservationTable, globalTimeStep);
+                
+                // Round 1b: 2D A* with all frozen as walls
+                if (path == null) {
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, frozen);
+                }
+                if (path != null) return path;
+                logVerbose("[PP] Round 1 (frozen) failed for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                
+                // Round 2a: Same-color self-blocking recovery — find frozen goals of the
+                // same color that block the agent's path to the target box.
+                if (!frozen.isEmpty()) {
+                    Color agentColor = level.getAgentColor(subgoal.agentId);
+                    Set<Position> selfBlockers = findPathBlockers(
+                            subgoal.agentId, boxPos, state, level, frozen, agentColor, true);
+                    
+                    if (!selfBlockers.isEmpty()) {
+                        Set<Position> relaxedFrozen = new HashSet<>(frozen);
+                        relaxedFrozen.removeAll(selfBlockers);
+                        
+                        logVerbose("[PP] Targeted unlock (same-color): " + selfBlockers.size() 
+                                + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                        
+                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
+                                reservationTable, globalTimeStep);
+                        if (path == null) {
+                            path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                    subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
+                        }
+                        if (path != null) return path;
+                    }
+                }
+                
+                // Round 2b: Cross-color blocking recovery — find ANY frozen goal (regardless
+                // of color) that blocks the path. This handles multi-agent scenarios where
+                // e.g. a blue box on its goal blocks a red agent's path (MADS-level pattern).
+                // More permissive than Round 2a but still targeted (not blanket removal).
+                if (!frozen.isEmpty()) {
+                    Set<Position> crossColorBlockers = findPathBlockers(
+                            subgoal.agentId, boxPos, state, level, frozen, null, false);
+                    
+                    if (!crossColorBlockers.isEmpty()) {
+                        Set<Position> relaxedFrozen = new HashSet<>(frozen);
+                        relaxedFrozen.removeAll(crossColorBlockers);
+                        
+                        logVerbose("[PP] Targeted unlock (cross-color): " + crossColorBlockers.size() 
+                                + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                        
+                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
+                                reservationTable, globalTimeStep);
+                        if (path == null) {
+                            path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                    subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
+                        }
+                        if (path != null) return path;
+                    }
+                }
+                
+                // Round 3: No frozen at all (desperate — allows disturbing any completed goal)
+                if (!frozen.isEmpty()) {
+                    logVerbose("[PP] Round 3 (no frozen) for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
+                    if (path != null) return path;
+                }
+                
+                // All BSP rounds failed for this box. If Hungarian was used on the first
+                // attempt, the globally-optimal pick may be BSP-hard for serial execution.
+                // Invalidate cache and retry — greedy Layer 2 may pick a different box.
+                if (attempt == 0 && usedHungarian) {
+                    Position failedBox = boxPos;
+                    subgoalManager.invalidateHungarianCache();
+                    boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
+                    // If greedy picks the SAME box, no point retrying BSP rounds
+                    if (boxPos != null && boxPos.equals(failedBox)) {
+                        logVerbose("[PP] Greedy fallback picked same box " + boxPos + " — no retry");
+                        return null;
+                    }
+                    if (boxPos != null) {
+                        logNormal("[PP] All rounds failed for Hungarian box " + failedBox 
+                                + " — retrying with greedy pick " + boxPos);
+                    }
+                    continue; // retry BSP rounds with new box
+                }
+                
+                logVerbose("[PP] All rounds exhausted for " + subgoal.boxType + " -> " + subgoal.goalPos);
                 return null;
             }
-            logVerbose("[PP] Box " + subgoal.boxType + " at " + boxPos + " -> goal " + subgoal.goalPos
-                    + " (agent " + subgoal.agentId + " at " + state.getAgentPosition(subgoal.agentId) 
-                    + ", frozen=" + frozen + ")");
-            
-            // Round 1: ST-A* with all frozen as walls
-            List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                    subgoal.goalPos, subgoal.boxType, state, level, frozen,
-                    reservationTable, globalTimeStep);
-            
-            // Round 1b: 2D A* with all frozen as walls
-            if (path == null) {
-                path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                        subgoal.goalPos, subgoal.boxType, state, level, frozen);
-            }
-            if (path != null) return path;
-            logVerbose("[PP] Round 1 (frozen) failed for " + subgoal.boxType + " -> " + subgoal.goalPos);
-            
-            // Round 2a: Same-color self-blocking recovery — find frozen goals of the
-            // same color that block the agent's path to the target box.
-            if (!frozen.isEmpty()) {
-                Color agentColor = level.getAgentColor(subgoal.agentId);
-                Set<Position> selfBlockers = findPathBlockers(
-                        subgoal.agentId, boxPos, state, level, frozen, agentColor, true);
-                
-                if (!selfBlockers.isEmpty()) {
-                    Set<Position> relaxedFrozen = new HashSet<>(frozen);
-                    relaxedFrozen.removeAll(selfBlockers);
-                    
-                    logVerbose("[PP] Targeted unlock (same-color): " + selfBlockers.size() 
-                            + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
-                    
-                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                            subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
-                            reservationTable, globalTimeStep);
-                    if (path == null) {
-                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
-                    }
-                    if (path != null) return path;
-                }
-            }
-            
-            // Round 2b: Cross-color blocking recovery — find ANY frozen goal (regardless
-            // of color) that blocks the path. This handles multi-agent scenarios where
-            // e.g. a blue box on its goal blocks a red agent's path (MADS-level pattern).
-            // More permissive than Round 2a but still targeted (not blanket removal).
-            if (!frozen.isEmpty()) {
-                Set<Position> crossColorBlockers = findPathBlockers(
-                        subgoal.agentId, boxPos, state, level, frozen, null, false);
-                
-                if (!crossColorBlockers.isEmpty()) {
-                    Set<Position> relaxedFrozen = new HashSet<>(frozen);
-                    relaxedFrozen.removeAll(crossColorBlockers);
-                    
-                    logVerbose("[PP] Targeted unlock (cross-color): " + crossColorBlockers.size() 
-                            + " blockers for " + subgoal.boxType + " -> " + subgoal.goalPos);
-                    
-                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                            subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen,
-                            reservationTable, globalTimeStep);
-                    if (path == null) {
-                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                                subgoal.goalPos, subgoal.boxType, state, level, relaxedFrozen);
-                    }
-                    if (path != null) return path;
-                }
-            }
-            
-            // Round 3: No frozen at all (desperate — allows disturbing any completed goal)
-            if (!frozen.isEmpty()) {
-                logVerbose("[PP] Round 3 (no frozen) for " + subgoal.boxType + " -> " + subgoal.goalPos);
-                path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
-                        subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
-            }
-            
-            logVerbose("[PP] All rounds exhausted for " + subgoal.boxType + " -> " + subgoal.goalPos
-                    + " result=" + (path != null ? path.size() + " steps" : "null"));
-            return path;
+            return null; // should not reach here, but safety
         }
     }
     
@@ -1511,21 +1547,29 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Revalidate completed goals - remove any that were disturbed (e.g. by soft-unlock). */
     private void revalidateCompletedGoals(State state, Level level) {
+        boolean anyRemoved = false;
         Iterator<Position> it = completedBoxGoals.iterator();
         while (it.hasNext()) {
             Position goalPos = it.next();
             char goalType = level.getBoxGoal(goalPos.row, goalPos.col);
             if (goalType == '\0') {
                 it.remove();
+                anyRemoved = true;
                 continue;
             }
             Character actualBox = state.getBoxes().get(goalPos);
             if (actualBox == null || actualBox != goalType) {
                 logVerbose("[PP] Goal at " + goalPos + " disturbed (type " + goalType + "), removing from frozen set");
                 it.remove();
+                anyRemoved = true;
                 // Force subgoal list refresh so this disturbed goal gets re-added
                 cachedSubgoalOrder = null;
             }
+        }
+        // Invalidate Hungarian cache when goals are removed — the optimal assignment
+        // changes as completed goals shrink (different boxes become available).
+        if (anyRemoved) {
+            subgoalManager.invalidateHungarianCache();
         }
     }
     
