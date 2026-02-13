@@ -66,6 +66,11 @@ public class SubgoalManager {
         hungarianCache = null;
     }
     
+    /** Returns true if a Hungarian assignment cache is currently active. */
+    public boolean hasHungarianCache() {
+        return hungarianCache != null;
+    }
+    
     /**
      * Gets all unsatisfied subgoals in priority order.
      * Phase 1: Box goals (excluding already completed ones)
