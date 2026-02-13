@@ -386,18 +386,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     private void computeAndCacheSubgoals(State state, Level level) {
-        // Hungarian optimal box-to-goal assignment: only when NO serialization dependencies.
-        // When goalDependsOn is non-empty, goals must be filled in strict topological order
-        // (e.g., dead-end corridors: inner-first). Hungarian's static global assignment
-        // conflicts with this dynamic sequential execution — it assumes all goals are
-        // simultaneously accessible, which is false in dead-end topologies.
-        // In dependency-free levels, Hungarian minimizes total transport distance.
-        if (goalDependsOn.isEmpty()) {
-            subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
-        } else {
-            subgoalManager.invalidateHungarianCache();
+        // TEMPORARY: Hungarian algorithm is DISABLED to ensure stable dependency analysis.
+        // 
+        // ARCHITECTURAL NOTE: Hungarian (SELECTION: which box fills which goal) and 
+        // dependency analysis (ORDER: what order to fill goals) are ORTHOGONAL concerns
+        // and should both be active. Hungarian's cost matrix is pure box-to-goal distance
+        // with NO execution order assumptions. findBestBoxForGoal() uses Hungarian as
+        // Layer 1 candidate with feasibility-check fallback, making it safe even when
+        // dependencies constrain execution order.
+        // 
+        // TODO: After verifying core dependency logic stability, re-enable Hungarian
+        // by calling computeHungarianAssignment() unconditionally (remove invalidate call).
+        subgoalManager.invalidateHungarianCache();
+        if (!goalDependsOn.isEmpty()) {
             logNormal("[PP] Goal dependencies detected (" + goalDependsOn.size() 
-                    + " deps) — using greedy per-step assignment (Hungarian disabled)");
+                    + " deps) — using greedy per-step assignment");
         }
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);

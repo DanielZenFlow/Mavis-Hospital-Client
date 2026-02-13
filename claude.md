@@ -223,8 +223,10 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 - Reverse/Pull search (pure Sokoban technique, not in requirements)
 - Pattern Database heuristics (overkill for max 50×50)
 - K-robust conflicts (synchronous model only)
-- Hungarian algorithm for task assignment (≤10 agents, greedy sufficient)
 - Symmetry breaking (small scale)
+
+### Temporarily Disabled (under review)
+- Hungarian algorithm for box-goal assignment (currently disabled in PriorityPlanningStrategy.computeAndCacheSubgoals to ensure stable dependency analysis; architecturally should be orthogonal to dependency analysis and co-active, pending re-enablement after validation)
 
 ## File Conventions
 
