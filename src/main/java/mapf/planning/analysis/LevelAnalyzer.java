@@ -133,8 +133,13 @@ public class LevelAnalyzer {
         // Reachability analysis (computeGoalDependencies) already handles blocking correctly so
         // we should rely purely on topological sort + distance tie-breaking.
         
+        // Compute agent box task counts for sorting: agents with fewer box tasks
+        // should complete agent goals first (walk-only agents can settle quickly,
+        // reducing congestion for box-moving agents).
+        Map<Position, Integer> agentGoalBoxTasks = computeAgentGoalBoxTasks(level, state, activeGoals);
+        
         List<Position> executionOrder = hasCycle ? activeGoals : 
-            topologicalSort(goalDependsOn, activeGoals, distances);
+            topologicalSort(goalDependsOn, activeGoals, distances, agentGoalBoxTasks);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
@@ -245,20 +250,30 @@ public class LevelAnalyzer {
                     // When an agent Pulls a box to goalI, the agent's body occupies an
                     // adjacent cell. In narrow corridors, the 2-cell footprint (goalI +
                     // agent body) can sever the path to goalJ even though blocking goalI
-                    // alone does not. Test each non-wall neighbor of goalI as a potential
-                    // agent-body position. If {goalI, neighbor} together block goalJ,
-                    // a dependency exists.
-                    boolean bodyBlocks = false;
+                    // alone does not.
+                    //
+                    // KEY INSIGHT: The agent can CHOOSE which direction to pull from.
+                    // A dependency only exists if ALL valid pull directions block goalJ
+                    // (no safe pull exists). If even one pull direction keeps goalJ
+                    // reachable, the solver can use that direction — no dependency needed.
+                    //
+                    // body-on-goalJ: When the agent body IS on goalJ, that direction
+                    // trivially blocks goalJ. Count it as blocking (continue) but don't
+                    // break — other directions may still be safe.
+                    boolean allBodyPositionsBlock = true;
+                    int validBodyPositions = 0;
                     for (Direction bodyDir : Direction.values()) {
                         Position agentBodyPos = goalI.move(bodyDir);
                         if (level.isWall(agentBodyPos)) continue;
-                        if (effectiveImpassable.contains(agentBodyPos)) continue; // already a wall
+                        if (effectiveImpassable.contains(agentBodyPos)) continue;
+                        validBodyPositions++;
                         if (agentBodyPos.equals(goalJ)) {
-                            // Agent body directly on goalJ → definitely blocked
-                            bodyBlocks = true;
+                            // Agent body directly on goalJ → transient obstruction.
+                            // This position will be cleared when goalJ is serviced, so
+                            // it should not create a permanent dependency.
+                            allBodyPositionsBlock = false;
                             break;
                         }
-                        // Test reachability with BOTH goalI and agent body blocked
                         Set<Position> blockedPair = new HashSet<>();
                         blockedPair.add(goalI);
                         blockedPair.add(agentBodyPos);
@@ -272,18 +287,16 @@ public class LevelAnalyzer {
                                 goalJ, blockedPair, level, Collections.emptySet(),
                                 effectiveImpassable, localRoot, candidateBoxes2);
                         }
-                        if (!canReachWithBody) {
-                            bodyBlocks = true;
+                        if (canReachWithBody) {
+                            allBodyPositionsBlock = false;
                             break;
                         }
                     }
-                    if (bodyBlocks) {
+                    if (allBodyPositionsBlock && validBodyPositions > 0) {
                         dependsOn.get(goalI).add(goalJ);
                         dependencyCount++;
-                        if (SearchConfig.isVerbose()) {
-                            System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
-                                + " + agent body blocks " + goalJ);
-                        }
+                        System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
+                            + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
                     }
                 }
             }
@@ -428,6 +441,43 @@ public class LevelAnalyzer {
             }
         }
         return false;
+    }
+    
+    /**
+     * Computes the number of remaining box tasks for each agent's goal position.
+     * Used in topologicalSort tie-breaking: agents with fewer box tasks should
+     * complete their agent goals first (walk-only agents settle quickly, reducing
+     * congestion for box-heavy agents — fixes DatzCrazy-like crossing scenarios).
+     * 
+     * @return Map from agent-goal position to the number of box goals that agent services.
+     *         Only contains entries for agent goals; box goals are not in this map.
+     */
+    private static Map<Position, Integer> computeAgentGoalBoxTasks(Level level, State state, List<Position> activeGoals) {
+        Map<Position, Integer> result = new HashMap<>();
+        
+        // Count box goals per agent color
+        Map<Color, Integer> boxGoalsByColor = new HashMap<>();
+        for (Position goal : activeGoals) {
+            char boxType = level.getBoxGoal(goal.row, goal.col);
+            if (boxType != '\0') {
+                Color color = level.getBoxColor(boxType);
+                if (color != null) {
+                    boxGoalsByColor.merge(color, 1, Integer::sum);
+                }
+            }
+        }
+        
+        // For each agent goal, look up how many box goals that agent's color has
+        for (Position goal : activeGoals) {
+            int agentId = level.getAgentGoal(goal.row, goal.col);
+            if (agentId >= 0) {
+                Color agentColor = level.getAgentColor(agentId);
+                int boxTasks = (agentColor != null) ? boxGoalsByColor.getOrDefault(agentColor, 0) : 0;
+                result.put(goal, boxTasks);
+            }
+        }
+        
+        return result;
     }
     
     /**
@@ -1003,7 +1053,8 @@ public class LevelAnalyzer {
      * 1. Topological Importance (Dependency-based)
      * 2. BFS Distance from Root (Distance-based): Furthest goals first
      */
-    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, Map<Position, Integer> distances) {
+    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, 
+            Map<Position, Integer> distances, Map<Position, Integer> agentGoalBoxTasks) {
         List<Position> result = new ArrayList<>();
         Set<Position> visited = new HashSet<>();
         
@@ -1027,7 +1078,9 @@ public class LevelAnalyzer {
         }
         
         // Sort goals by importance (most important = most depended upon = first)
-        // Tie-breaker: Distance from root (Descending) -> Fill deepest rooms first
+        // Tie-breaker 1: Distance from root (Descending) -> Fill deepest rooms first
+        // Tie-breaker 2: Agent goals with fewer box tasks first (walk-only agents settle
+        //   quickly, reducing congestion for box-moving agents — fixes DatzCrazy-like scenarios)
         List<Position> sortedGoals = new ArrayList<>(goals);
         sortedGoals.sort((a, b) -> {
             int impA = importance.getOrDefault(a, 0);
@@ -1035,7 +1088,14 @@ public class LevelAnalyzer {
             if (impA != impB) {
                 return Integer.compare(impB, impA);  // Higher importance first
             }
-            // Tie-breaker: Furthest distance first
+            // Tie-breaker 1: Agent goals with fewer box tasks first
+            // Non-agent goals get MAX_VALUE (sorted after agent goals with same importance)
+            int boxA = agentGoalBoxTasks.getOrDefault(a, Integer.MAX_VALUE);
+            int boxB = agentGoalBoxTasks.getOrDefault(b, Integer.MAX_VALUE);
+            if (boxA != boxB) {
+                return Integer.compare(boxA, boxB);  // Fewer box tasks first
+            }
+            // Tie-breaker 2: Furthest distance first
             int distA = distances.getOrDefault(a, 0);
             int distB = distances.getOrDefault(b, 0);
             return Integer.compare(distB, distA);
