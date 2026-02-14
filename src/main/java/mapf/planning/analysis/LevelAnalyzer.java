@@ -133,8 +133,13 @@ public class LevelAnalyzer {
         // Reachability analysis (computeGoalDependencies) already handles blocking correctly so
         // we should rely purely on topological sort + distance tie-breaking.
         
+        // Compute agent box task counts for sorting: agents with fewer box tasks
+        // should complete agent goals first (walk-only agents can settle quickly,
+        // reducing congestion for box-moving agents).
+        Map<Position, Integer> agentGoalBoxTasks = computeAgentGoalBoxTasks(level, state, activeGoals);
+        
         List<Position> executionOrder = hasCycle ? activeGoals : 
-            topologicalSort(goalDependsOn, activeGoals, distances);
+            topologicalSort(goalDependsOn, activeGoals, distances, agentGoalBoxTasks);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
@@ -240,6 +245,59 @@ public class LevelAnalyzer {
                     // Goal I must wait for Goal J.
                     dependsOn.get(goalI).add(goalJ);
                     dependencyCount++;
+                } else {
+                    // AGENT-BODY DEPENDENCY CHECK (Pull awareness):
+                    // When an agent Pulls a box to goalI, the agent's body occupies an
+                    // adjacent cell. In narrow corridors, the 2-cell footprint (goalI +
+                    // agent body) can sever the path to goalJ even though blocking goalI
+                    // alone does not.
+                    //
+                    // KEY INSIGHT: The agent can CHOOSE which direction to pull from.
+                    // A dependency only exists if ALL valid pull directions block goalJ
+                    // (no safe pull exists). If even one pull direction keeps goalJ
+                    // reachable, the solver can use that direction — no dependency needed.
+                    //
+                    // body-on-goalJ: When the agent body IS on goalJ, that direction
+                    // trivially blocks goalJ. Count it as blocking (continue) but don't
+                    // break — other directions may still be safe.
+                    boolean allBodyPositionsBlock = true;
+                    int validBodyPositions = 0;
+                    for (Direction bodyDir : Direction.values()) {
+                        Position agentBodyPos = goalI.move(bodyDir);
+                        if (level.isWall(agentBodyPos)) continue;
+                        if (effectiveImpassable.contains(agentBodyPos)) continue;
+                        validBodyPositions++;
+                        if (agentBodyPos.equals(goalJ)) {
+                            // Agent body directly on goalJ → transient obstruction.
+                            // This position will be cleared when goalJ is serviced, so
+                            // it should not create a permanent dependency.
+                            allBodyPositionsBlock = false;
+                            break;
+                        }
+                        Set<Position> blockedPair = new HashSet<>();
+                        blockedPair.add(goalI);
+                        blockedPair.add(agentBodyPos);
+                        boolean canReachWithBody;
+                        if (isAgentGoal) {
+                            canReachWithBody = isReachableWithMultipleBlocks(
+                                localRoot, goalJ, level, blockedPair, Collections.emptySet(), effectiveImpassable);
+                        } else {
+                            List<Position> candidateBoxes2 = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
+                            canReachWithBody = canPushBoxToGoalWithMultipleBlocks(
+                                goalJ, blockedPair, level, Collections.emptySet(),
+                                effectiveImpassable, localRoot, candidateBoxes2);
+                        }
+                        if (canReachWithBody) {
+                            allBodyPositionsBlock = false;
+                            break;
+                        }
+                    }
+                    if (allBodyPositionsBlock && validBodyPositions > 0) {
+                        dependsOn.get(goalI).add(goalJ);
+                        dependencyCount++;
+                        System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
+                            + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
+                    }
                 }
             }
         }
@@ -383,6 +441,43 @@ public class LevelAnalyzer {
             }
         }
         return false;
+    }
+    
+    /**
+     * Computes the number of remaining box tasks for each agent's goal position.
+     * Used in topologicalSort tie-breaking: agents with fewer box tasks should
+     * complete their agent goals first (walk-only agents settle quickly, reducing
+     * congestion for box-heavy agents — fixes DatzCrazy-like crossing scenarios).
+     * 
+     * @return Map from agent-goal position to the number of box goals that agent services.
+     *         Only contains entries for agent goals; box goals are not in this map.
+     */
+    private static Map<Position, Integer> computeAgentGoalBoxTasks(Level level, State state, List<Position> activeGoals) {
+        Map<Position, Integer> result = new HashMap<>();
+        
+        // Count box goals per agent color
+        Map<Color, Integer> boxGoalsByColor = new HashMap<>();
+        for (Position goal : activeGoals) {
+            char boxType = level.getBoxGoal(goal.row, goal.col);
+            if (boxType != '\0') {
+                Color color = level.getBoxColor(boxType);
+                if (color != null) {
+                    boxGoalsByColor.merge(color, 1, Integer::sum);
+                }
+            }
+        }
+        
+        // For each agent goal, look up how many box goals that agent's color has
+        for (Position goal : activeGoals) {
+            int agentId = level.getAgentGoal(goal.row, goal.col);
+            if (agentId >= 0) {
+                Color agentColor = level.getAgentColor(agentId);
+                int boxTasks = (agentColor != null) ? boxGoalsByColor.getOrDefault(agentColor, 0) : 0;
+                result.put(goal, boxTasks);
+            }
+        }
+        
+        return result;
     }
     
     /**
@@ -609,6 +704,155 @@ public class LevelAnalyzer {
     }
 
     /**
+     * Checks if target is reachable from start with MULTIPLE hypothetical blocks.
+     * Used for agent-body dependency detection: when Pulling a box to a goal position,
+     * the agent's body occupies an adjacent cell, creating a 2-cell footprint.
+     * In narrow corridors, this 2-cell block can sever paths that a single-cell
+     * block would not.
+     */
+    private static boolean isReachableWithMultipleBlocks(Position start, Position target,
+            Level level, Set<Position> blockedPositions, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (blockedPositions.contains(target)) return false;
+        if (immovableBoxes.contains(target)) return false;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        q.add(start);
+        visited.add(start);
+        visited.addAll(blockedPositions);  // Block ALL hypothetical positions
+        visited.addAll(immovableBoxes);
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!level.isWall(next) && !visited.contains(next)) {
+                    visited.add(next);
+                    q.add(next);
+                }
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Checks if a box can reach its goal with MULTIPLE hypothetical blocks.
+     * Used for agent-body dependency detection on box goals.
+     */
+    private static boolean canPushBoxToGoalWithMultipleBlocks(Position goalPos, Set<Position> blockedPositions,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes,
+            Position openSpaceRoot, List<Position> candidateBoxes) {
+        if (candidateBoxes.isEmpty()) return false;
+        
+        for (Position boxPos : candidateBoxes) {
+            if (blockedPositions.contains(boxPos)) continue;
+            
+            // Can agent reach the box?
+            boolean agentCanReachBox = isReachableWithMultipleBlocks(
+                openSpaceRoot, boxPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (!agentCanReachBox) continue;
+            
+            // Can box reach the goal? (Use existsPushPath with combined obstacles)
+            // Build a combined obstacle set for existsPushPath
+            boolean boxCanReachGoal = existsPushPathWithMultipleBlocks(
+                boxPos, goalPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (!boxCanReachGoal) continue;
+            
+            // Local feasibility check with multiple blocks
+            if (checkLocalEntryFeasibilityMultiBlock(goalPos, blockedPositions, level,
+                    movableBoxPositions, immovableBoxes, openSpaceRoot)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * existsPushPath variant that blocks multiple positions.
+     */
+    private static boolean existsPushPathWithMultipleBlocks(Position start, Position target,
+            Level level, Set<Position> blockedPositions, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (blockedPositions.contains(target)) return false;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        Set<Position> obstacles = new HashSet<>(immovableBoxes);
+        obstacles.addAll(blockedPositions);
+        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        obstacles.remove(start);
+        
+        q.add(start);
+        visited.add(start);
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (level.isWall(next) || obstacles.contains(next) || visited.contains(next)) continue;
+                
+                Position pushAgentPos = current.move(dir.opposite());
+                boolean canPush = !level.isWall(pushAgentPos) && !obstacles.contains(pushAgentPos);
+                
+                Position pullAgentDest = next.move(dir);
+                boolean canPull = !level.isWall(pullAgentDest) && !obstacles.contains(pullAgentDest)
+                                  && !level.isWall(next) && !obstacles.contains(next);
+                
+                if (!canPush && !canPull) continue;
+                
+                visited.add(next);
+                q.add(next);
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * checkLocalEntryFeasibility variant with multiple blocked positions.
+     */
+    private static boolean checkLocalEntryFeasibilityMultiBlock(Position goalPos, Set<Position> blockedPositions,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes, Position openSpaceRoot) {
+        // Push paths
+        for (Direction pushDir : Direction.values()) {
+            Position agentPushPosition = goalPos.move(pushDir.opposite());
+            if (level.isWall(agentPushPosition)) continue;
+            if (immovableBoxes.contains(agentPushPosition)) continue;
+            if (blockedPositions.contains(agentPushPosition)) continue;
+            
+            boolean canReach = isReachableWithMultipleBlocks(
+                openSpaceRoot, agentPushPosition, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (canReach) return true;
+        }
+        
+        // Pull paths
+        if (!level.isWall(goalPos) && !immovableBoxes.contains(goalPos) && !blockedPositions.contains(goalPos)) {
+            boolean agentCanReachGoal = isReachableWithMultipleBlocks(
+                openSpaceRoot, goalPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (agentCanReachGoal) {
+                boolean hasExit = false;
+                boolean hasBoxApproach = false;
+                for (Direction dir : Direction.values()) {
+                    Position adjacent = goalPos.move(dir);
+                    if (!level.isWall(adjacent) && !immovableBoxes.contains(adjacent) && !blockedPositions.contains(adjacent)) {
+                        hasExit = true;
+                    }
+                    if (!level.isWall(adjacent) && !blockedPositions.contains(adjacent)) {
+                        hasBoxApproach = true;
+                    }
+                }
+                if (hasExit && hasBoxApproach) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Checks if a box can be moved from start to target using Push OR Pull mechanics.
      * 
      * Push: Agent at current.opposite(dir) pushes box from current → next.
@@ -809,7 +1053,8 @@ public class LevelAnalyzer {
      * 1. Topological Importance (Dependency-based)
      * 2. BFS Distance from Root (Distance-based): Furthest goals first
      */
-    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, Map<Position, Integer> distances) {
+    private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, 
+            Map<Position, Integer> distances, Map<Position, Integer> agentGoalBoxTasks) {
         List<Position> result = new ArrayList<>();
         Set<Position> visited = new HashSet<>();
         
@@ -833,7 +1078,9 @@ public class LevelAnalyzer {
         }
         
         // Sort goals by importance (most important = most depended upon = first)
-        // Tie-breaker: Distance from root (Descending) -> Fill deepest rooms first
+        // Tie-breaker 1: Distance from root (Descending) -> Fill deepest rooms first
+        // Tie-breaker 2: Agent goals with fewer box tasks first (walk-only agents settle
+        //   quickly, reducing congestion for box-moving agents — fixes DatzCrazy-like scenarios)
         List<Position> sortedGoals = new ArrayList<>(goals);
         sortedGoals.sort((a, b) -> {
             int impA = importance.getOrDefault(a, 0);
@@ -841,7 +1088,14 @@ public class LevelAnalyzer {
             if (impA != impB) {
                 return Integer.compare(impB, impA);  // Higher importance first
             }
-            // Tie-breaker: Furthest distance first
+            // Tie-breaker 1: Agent goals with fewer box tasks first
+            // Non-agent goals get MAX_VALUE (sorted after agent goals with same importance)
+            int boxA = agentGoalBoxTasks.getOrDefault(a, Integer.MAX_VALUE);
+            int boxB = agentGoalBoxTasks.getOrDefault(b, Integer.MAX_VALUE);
+            if (boxA != boxB) {
+                return Integer.compare(boxA, boxB);  // Fewer box tasks first
+            }
+            // Tie-breaker 2: Furthest distance first
             int distA = distances.getOrDefault(a, 0);
             int distB = distances.getOrDefault(b, 0);
             return Integer.compare(distB, distA);

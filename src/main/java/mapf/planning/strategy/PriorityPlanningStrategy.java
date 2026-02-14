@@ -99,6 +99,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Flag: was the last progress from re-solving a previously-completed agent goal? */
     private boolean lastProgressWasPhantom = false;
+    
+    /** Maps agent ID to connected component ID. Agents in different components can execute in parallel. */
+    private Map<Integer, Integer> agentComponentId = Collections.emptyMap();
+    
+    /** Tracks subgoals being executed via stored plans for independent agents. */
+    private Map<Integer, Subgoal> storedPlanSubgoals = new HashMap<>();
 
     // Logging helpers
     private void logMinimal(String msg) {
@@ -186,6 +192,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Precompute BFS distance maps for all goals (O(G×N) once, then O(1) per query)
         subgoalManager.initDistanceCache(initialState, level);
 
+        // Compute independent agent groups for parallel execution
+        agentComponentId = computeAgentComponents(initialState, level);
+
         // Reset for new search
         displacementHistory.clear();
         displacementAttempts = 0;
@@ -194,6 +203,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         goalCompletionCount.clear();
         displacedGoals.clear();
         reservationTable.clear();
+        planMerger.clearAllPlans();
+        storedPlanSubgoals.clear();
         globalTimeStep = 0;
         lastComputedState = null;
         lastComputedPlanSize = 0;
@@ -611,6 +622,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Snapshot plan size for potential rollback (agent-trap detection)
                 int planSizeBefore = fullPlan.size();
                 
+                // Plan parallel subgoals for agents in independent components
+                planIndependentAgents(subgoal, subgoals, currentState, level);
+                
                 // Record agent path in reservation table for space-time collision avoidance
                 List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
                 boolean permanentEnd = subgoal.isAgentGoal;
@@ -625,6 +639,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     fullPlan.add(jointAction);
                     tempState = applyJointAction(jointAction, tempState, level, numAgents);
                     globalTimeStep++;
+                    planMerger.updatePlanIndexes(jointAction, numAgents, subgoal.agentId);
                 }
                 
                 // POST-PLAN REGRESSION GUARD: Check if executing this path disturbed
@@ -647,9 +662,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             fullPlan.remove(fullPlan.size() - 1);
                             globalTimeStep--;
                         }
+                        // Invalidate stored plans — state rolled back
+                        planMerger.clearAllPlans();
+                        storedPlanSubgoals.clear();
                         continue; // try next subgoal in priority order
                     }
                 }
+                
+                // Check if any parallel (stored plan) agents completed their goals
+                checkStoredPlanCompletions(tempState, level);
                 
                 // Verify goal was reached
                 boolean reached = verifyGoalReached(subgoal, tempState, level);
@@ -667,6 +688,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             fullPlan.remove(fullPlan.size() - 1);
                             globalTimeStep--;
                         }
+                        // Invalidate stored plans — state rolled back
+                        planMerger.clearAllPlans();
+                        storedPlanSubgoals.clear();
                         continue; // try next subgoal in priority order
                     }
                     
@@ -773,6 +797,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         fullPlan.add(jointAction);
                         tempState = applyJointAction(jointAction, tempState, level, numAgents);
                         globalTimeStep++;
+                        planMerger.updatePlanIndexes(jointAction, numAgents, subgoal.agentId);
                     }
                     
                     // Same post-plan checks as normal path
@@ -1054,6 +1079,170 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return visited;
     }
     
+    // ====================== Connected Component Parallel Execution ======================
+    
+    /**
+     * Computes connected components for agents. Agents in different components
+     * are separated by walls/immovable boxes and cannot interact — their plans
+     * can execute in parallel, reducing total plan steps from O(sum) to O(max).
+     */
+    private Map<Integer, Integer> computeAgentComponents(State state, Level level) {
+        int numAgents = state.getNumAgents();
+        if (numAgents <= 1) {
+            Map<Integer, Integer> single = new HashMap<>();
+            single.put(0, 0);
+            return single;
+        }
+        
+        // BFS reachability per agent (movable boxes are passable — agent can push/pull them)
+        Map<Integer, Set<Position>> reachable = new HashMap<>();
+        for (int a = 0; a < numAgents; a++) {
+            Set<Position> area = new HashSet<>();
+            Queue<Position> queue = new LinkedList<>();
+            Position start = state.getAgentPosition(a);
+            queue.add(start);
+            area.add(start);
+            while (!queue.isEmpty()) {
+                Position current = queue.poll();
+                for (Direction dir : Direction.values()) {
+                    Position next = current.move(dir);
+                    if (!level.isWall(next) && !immovableBoxes.contains(next) && !area.contains(next)) {
+                        area.add(next);
+                        queue.add(next);
+                    }
+                }
+            }
+            reachable.put(a, area);
+        }
+        
+        // Union-Find: agents whose reachable sets overlap are in the same component
+        int[] parent = new int[numAgents];
+        for (int i = 0; i < numAgents; i++) parent[i] = i;
+        
+        for (int a = 0; a < numAgents; a++) {
+            for (int b = a + 1; b < numAgents; b++) {
+                // Fast check: is agent b's position in agent a's reachable set?
+                if (reachable.get(a).contains(state.getAgentPosition(b))) {
+                    unionFind(parent, a, b);
+                }
+            }
+        }
+        
+        Map<Integer, Integer> result = new HashMap<>();
+        for (int a = 0; a < numAgents; a++) {
+            result.put(a, findRoot(parent, a));
+        }
+        
+        // Log independent groups
+        Map<Integer, List<Integer>> groups = new HashMap<>();
+        for (var entry : result.entrySet()) {
+            groups.computeIfAbsent(entry.getValue(), k -> new ArrayList<>()).add(entry.getKey());
+        }
+        if (groups.size() > 1) {
+            logNormal("[PP] Detected " + groups.size() + " independent agent groups: " + groups.values());
+        }
+        
+        return result;
+    }
+    
+    private int findRoot(int[] parent, int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]]; // path compression
+            x = parent[x];
+        }
+        return x;
+    }
+    
+    private void unionFind(int[] parent, int a, int b) {
+        int pa = findRoot(parent, a);
+        int pb = findRoot(parent, b);
+        parent[pa] = pb;
+    }
+    
+    /**
+     * Plans subgoals for agents in independent connected components.
+     * When the primary agent's subgoal is being executed, agents in other
+     * components can execute their own subgoals in parallel via stored plans.
+     * The existing addOtherAgentMoves() in PlanMerger merges them at each step.
+     */
+    private void planIndependentAgents(Subgoal primarySubgoal, List<Subgoal> allSubgoals,
+            State state, Level level) {
+        if (agentComponentId.size() <= 1) return;
+        
+        int primaryComponent = agentComponentId.getOrDefault(primarySubgoal.agentId, -1);
+        Set<Integer> plannedComponents = new HashSet<>();
+        plannedComponents.add(primaryComponent);
+        
+        for (Subgoal sg : allSubgoals) {
+            if (sg == primarySubgoal) continue;
+            int sgComponent = agentComponentId.getOrDefault(sg.agentId, -1);
+            if (sgComponent == primaryComponent || plannedComponents.contains(sgComponent)) continue;
+            
+            // Skip if agent already has a stored plan being executed
+            if (planMerger.hasPlanRemaining(sg.agentId)) {
+                plannedComponents.add(sgComponent);
+                continue;
+            }
+            
+            // Check dependencies
+            if (!areDependenciesMet(sg.goalPos, level)) continue;
+            
+            // Skip goals completed too many times (cycle detection)
+            if (!sg.isAgentGoal) {
+                int completions = goalCompletionCount.getOrDefault(sg.goalPos, 0);
+                if (completions >= MAX_GOAL_COMPLETIONS) continue;
+            }
+            
+            // Plan this subgoal
+            List<Action> path = planSubgoal(sg, state, level, allSubgoals);
+            if (path != null && !path.isEmpty()) {
+                planMerger.storePlan(sg.agentId, path, globalTimeStep);
+                storedPlanSubgoals.put(sg.agentId, sg);
+                plannedComponents.add(sgComponent);
+                logNormal("[PP] [PARALLEL] Stored plan for Agent " + sg.agentId 
+                        + " (" + (sg.isAgentGoal ? "AgentGoal" : "Box " + sg.boxType) + " -> " + sg.goalPos
+                        + ", " + path.size() + " steps) in component " + sgComponent);
+            }
+        }
+    }
+    
+    /**
+     * Checks if any agents executing via stored plans (parallel execution)
+     * have completed their goals. Updates completion tracking accordingly.
+     */
+    private void checkStoredPlanCompletions(State state, Level level) {
+        if (storedPlanSubgoals.isEmpty()) return;
+        
+        Iterator<Map.Entry<Integer, Subgoal>> it = storedPlanSubgoals.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Integer, Subgoal> entry = it.next();
+            int agentId = entry.getKey();
+            Subgoal sg = entry.getValue();
+            
+            // Check if plan is exhausted
+            if (!planMerger.hasPlanRemaining(agentId)) {
+                boolean reached = verifyGoalReached(sg, state, level);
+                if (reached) {
+                    if (!sg.isAgentGoal) {
+                        completedBoxGoals.add(sg.goalPos);
+                        int count = goalCompletionCount.getOrDefault(sg.goalPos, 0) + 1;
+                        goalCompletionCount.put(sg.goalPos, count);
+                        subgoalManager.invalidateHungarianCache();
+                        cachedSubgoalOrder = null;
+                    }
+                    if (sg.isAgentGoal) {
+                        completedAgentGoals.add(sg.goalPos);
+                    }
+                    logMinimal(getName() + ": [OK] " 
+                            + (sg.isAgentGoal ? "Agent " + agentId : "Box " + sg.boxType)
+                            + " -> " + sg.goalPos + " [PARALLEL]");
+                }
+                planMerger.invalidatePlan(agentId);
+                it.remove();
+            }
+        }
+    }
+
     /** Extract agent position path from action sequence. */
     private List<Position> extractAgentPath(int agentId, State startState, List<Action> actions, Level level) {
         List<Position> path = new ArrayList<>();
