@@ -404,10 +404,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // optimal pick fails BSP (serial execution mismatch), it automatically falls
         // through to greedy Layer 2 candidates.
         subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
-        if (!goalDependsOn.isEmpty()) {
-            logNormal("[PP] Goal dependencies detected (" + goalDependsOn.size() 
-                    + " deps) — Hungarian + dependency analysis (orthogonal)");
-        }
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
         sortSubgoals(cachedSubgoalOrder, state, level);
@@ -515,7 +511,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         int orderB = orderMap.getOrDefault(b.goalPos, -1);
                         return Integer.compare(orderB, orderA);
                     });
-                    logNormal("[PP] Sorted subgoals in REVERSE topological order");
+                    logVerbose("[PP] Sorted subgoals in REVERSE topological order");
                 } else {
                     sortByDifficulty(subgoals, state, level);
                 }
@@ -524,12 +520,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             case DISTANCE_GREEDY:
                 // Sort by estimated difficulty: easiest (nearest) first
                 sortByDifficulty(subgoals, state, level);
-                logNormal("[PP] Sorted subgoals by DISTANCE_GREEDY (nearest first)");
+                logVerbose("[PP] Sorted subgoals by DISTANCE_GREEDY (nearest first)");
                 break;
                 
             case RANDOM:
                 Collections.shuffle(subgoals, random);
-                logNormal("[PP] Sorted subgoals in RANDOM order");
+                logVerbose("[PP] Sorted subgoals in RANDOM order");
                 break;
                 
             case TOPOLOGICAL:
@@ -608,7 +604,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (!subgoal.isAgentGoal) {
                 int completions = goalCompletionCount.getOrDefault(subgoal.goalPos, 0);
                 if (completions >= MAX_GOAL_COMPLETIONS) {
-                    logNormal("[PP] [CYCLE-SKIP] Goal " + subgoal.goalPos + " (box " + subgoal.boxType
+                    logVerbose("[PP] [CYCLE-SKIP] Goal " + subgoal.goalPos + " (box " + subgoal.boxType
                             + ") already completed " + completions + " times — skipping to break cycle");
                     continue;
                 }
@@ -703,7 +699,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         // detected as regressed by revalidateCompletedGoals below
                         // and re-added to the unsatisfied list naturally.
                         if (!displacedGoals.isEmpty()) {
-                            logNormal("[PP] Clearing " + displacedGoals.size() 
+                            logVerbose("[PP] Clearing " + displacedGoals.size() 
                                     + " displaced goal(s) after progress: " + displacedGoals);
                             displacedGoals.clear();
                         }
@@ -712,7 +708,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
                         goalCompletionCount.put(subgoal.goalPos, count);
                         if (count > MAX_GOAL_COMPLETIONS) {
-                            logNormal("[PP] CYCLE DETECTED: goal " + subgoal.goalPos 
+                            logVerbose("[PP] CYCLE DETECTED: goal " + subgoal.goalPos 
                                     + " completed " + count + " times (box " + subgoal.boxType + ")");
                         }
                         
@@ -897,7 +893,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         if (blockerPositions.isEmpty()) return null;
         
-        logNormal("[PP] [CLEAR] Found " + blockerPositions.size() + " box(es) blocking path for "
+        logVerbose("[PP] [CLEAR] Found " + blockerPositions.size() + " box(es) blocking path for "
                 + subgoal.boxType + " -> " + subgoal.goalPos + ": " + blockerPositions);
         
         // Step 3: For each blocker, find its agent and a safe clearing position
@@ -924,11 +920,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // Find safe clearing position: BFS from blocker to find nearest cell NOT in dangerZone
             Position clearTarget = findClearingPosition(blockerPos, dangerZone, currentState, level);
             if (clearTarget == null) {
-                logNormal("[PP] [CLEAR] No safe clearing position for " + blockerType + " at " + blockerPos);
+                logVerbose("[PP] [CLEAR] No safe clearing position for " + blockerType + " at " + blockerPos);
                 continue;
             }
             
-            logNormal("[PP] [CLEAR] Moving " + blockerType + " from " + blockerPos + " to " + clearTarget
+            logVerbose("[PP] [CLEAR] Moving " + blockerType + " from " + blockerPos + " to " + clearTarget
                     + " (agent " + clearingAgent + ")");
             
             // Plan displacement
@@ -946,9 +942,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     globalTimeStep++;
                 }
                 anyCleared = true;
-                logNormal("[PP] [CLEAR] Cleared " + blockerType + " in " + displacePath.size() + " steps");
+                logVerbose("[PP] [CLEAR] Cleared " + blockerType + " in " + displacePath.size() + " steps");
             } else {
-                logNormal("[PP] [CLEAR] BSP can't plan displacement for " + blockerType + " at " + blockerPos);
+                logVerbose("[PP] [CLEAR] BSP can't plan displacement for " + blockerType + " at " + blockerPos);
             }
         }
         
@@ -1586,7 +1582,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         return null;
                     }
                     if (boxPos != null) {
-                        logNormal("[PP] All rounds failed for Hungarian box " + failedBox 
+                        logVerbose("[PP] All rounds failed for Hungarian box " + failedBox 
                                 + " — retrying with greedy pick " + boxPos);
                     }
                     continue; // retry BSP rounds with new box
@@ -1915,7 +1911,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         List<Position> regressed = detectRegressedGoals(tempState, level);
                         if (!regressed.isEmpty()) {
                             displacedGoals.addAll(regressed);
-                            logNormal("[PP] Displacement displaced " + regressed.size()
+                            logVerbose("[PP] Displacement displaced " + regressed.size()
                                     + " completed goal(s): " + regressed + " (deferred for re-planning)");
                         }
                     }

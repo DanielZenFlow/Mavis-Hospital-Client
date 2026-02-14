@@ -322,8 +322,10 @@ public class LevelAnalyzer {
                     if (allBodyPositionsBlock && validBodyPositions > 0) {
                         dependsOn.get(goalI).add(goalJ);
                         dependencyCount++;
-                        System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
-                            + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
+                        if (SearchConfig.isVerbose()) {
+                            System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
+                                + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
+                        }
                     }
                 }
             }
