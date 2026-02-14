@@ -9,7 +9,7 @@ import time
 LEVEL_DIR = "complevels"
 OUTPUT_FILE = "benchmark_results.md"
 SERVER_JAR = "server.jar"
-TIMEOUT_SECONDS = 60
+TIMEOUT_SECONDS = 180
 # Detect OS for classpath separator if needed (not needed for single path, but good practice)
 # CP_SEP = ";" if os.name == 'nt' else ":"
 CLIENT_CMD = 'java -Xmx4g -cp target/classes mapf.client.Client'

@@ -36,6 +36,10 @@ public class LevelAnalyzer {
         // MAPF FIX: Coupling degree (for strategy selection)
         public final double couplingDegree;  // 0.0 = independent, 1.0 = fully coupled
         
+        // P3: Agent-to-Agent path conflict prediction
+        public final Map<Position, Integer> pathConflictScores;  // goal -> overlap count with other-agent paths
+        public final Map<Position, Double> goalPathNarrowness;   // goal -> avg narrowness of ideal path
+        
         // Structural features
         public final int corridorCells;      // cells with ≤2 neighbors
         public final int junctionCells;      // cells with ≥3 neighbors
@@ -51,6 +55,7 @@ public class LevelAnalyzer {
                             List<Position> executionOrder, int maxDepth, boolean hasCycle,
                             Set<Position> bottlenecks, Map<Position, Integer> bottleneckScores,
                             double couplingDegree,
+                            Map<Position, Integer> pathConflictScores, Map<Position, Double> goalPathNarrowness,
                             int corridorCells, int junctionCells,
                             StrategyType recommended, String report) {
             this.numAgents = numAgents;
@@ -66,6 +71,8 @@ public class LevelAnalyzer {
             this.bottleneckPositions = bottlenecks;
             this.bottleneckScores = bottleneckScores;
             this.couplingDegree = couplingDegree;
+            this.pathConflictScores = pathConflictScores;
+            this.goalPathNarrowness = goalPathNarrowness;
             this.corridorCells = corridorCells;
             this.junctionCells = junctionCells;
             this.corridorRatio = (double) corridorCells / Math.max(1, freeSpaces);
@@ -138,8 +145,19 @@ public class LevelAnalyzer {
         // reducing congestion for box-moving agents).
         Map<Position, Integer> agentGoalBoxTasks = computeAgentGoalBoxTasks(level, state, activeGoals);
         
+        // P3: Agent-to-Agent path conflict static prediction
+        PathConflictAnalysis pathConflicts = computePathConflictAnalysis(
+                activeGoals, level, state, taskFilter.immovableBoxes);
+        if (pathConflicts.analyzedPaths > 0) {
+            int totalOverlaps = pathConflicts.conflictScores.values().stream()
+                    .mapToInt(Integer::intValue).sum() / 2;
+            System.err.println("[LevelAnalyzer] P3 Path conflict analysis: " + totalOverlaps
+                    + " cross-agent overlaps across " + pathConflicts.analyzedPaths + " goal paths");
+        }
+        
         List<Position> executionOrder = hasCycle ? activeGoals : 
-            topologicalSort(goalDependsOn, activeGoals, distances, agentGoalBoxTasks);
+            topologicalSort(goalDependsOn, activeGoals, distances, agentGoalBoxTasks,
+                           pathConflicts.conflictScores, pathConflicts.narrowness);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
@@ -151,9 +169,18 @@ public class LevelAnalyzer {
                                        goalDependsOn, maxDepth, hasCycle, 
                                        corridorCells, junctionCells, recommended);
         
+        // Append P3 path conflict summary to report
+        if (pathConflicts.analyzedPaths > 0) {
+            int totalOverlaps = pathConflicts.conflictScores.values().stream()
+                    .mapToInt(Integer::intValue).sum() / 2;
+            report += String.format("Path conflicts: %d cross-agent overlaps (%d paths analyzed)\n", 
+                                   totalOverlaps, pathConflicts.analyzedPaths);
+        }
+        
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                 goalDependsOn, executionOrder, maxDepth, hasCycle,
                                 bottlenecks, bottleneckScores, couplingDegree,
+                                pathConflicts.conflictScores, pathConflicts.narrowness,
                                 corridorCells, junctionCells, recommended, report);
     }
     
@@ -295,8 +322,10 @@ public class LevelAnalyzer {
                     if (allBodyPositionsBlock && validBodyPositions > 0) {
                         dependsOn.get(goalI).add(goalJ);
                         dependencyCount++;
-                        System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
-                            + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
+                        if (SearchConfig.isVerbose()) {
+                            System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
+                                + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
+                        }
                     }
                 }
             }
@@ -478,6 +507,205 @@ public class LevelAnalyzer {
         }
         
         return result;
+    }
+    
+    // ========== P3: Agent-to-Agent Path Conflict Static Prediction ==========
+    
+    /**
+     * Result of path conflict analysis between agent goals.
+     */
+    private static class PathConflictAnalysis {
+        final Map<Position, Integer> conflictScores;  // goal → total overlap cells with other-agent goals
+        final Map<Position, Double> narrowness;        // goal → avg inverse free-neighbors along path
+        final int analyzedPaths;
+        
+        PathConflictAnalysis(Map<Position, Integer> conflictScores, 
+                            Map<Position, Double> narrowness, int analyzedPaths) {
+            this.conflictScores = conflictScores;
+            this.narrowness = narrowness;
+            this.analyzedPaths = analyzedPaths;
+        }
+    }
+    
+    /**
+     * P3: Computes ideal paths for each goal and detects path overlaps between
+     * goals serviced by different agents.
+     * 
+     * Algorithm:
+     * 1. For each goal, compute the ideal path (ignoring dynamic obstacles):
+     *    - Agent goals: agent current position → goal position
+     *    - Box goals: nearest matching agent → nearest matching box → goal position
+     * 2. For each pair of goals with DIFFERENT servicing agents, compute path overlap
+     * 3. Aggregate: pathConflictScore[goal] = sum of overlaps with all other-agent goals
+     * 4. Compute path narrowness: avg(1/freeNeighbors) along each goal's path
+     * 
+     * Goals on contested paths should be planned first to claim space before it
+     * gets cluttered with frozen completed agents/boxes.
+     * Goals on narrow paths should also be planned first since narrow paths are
+     * harder to reroute around obstacles.
+     */
+    private static PathConflictAnalysis computePathConflictAnalysis(
+            List<Position> activeGoals, Level level, State state, Set<Position> immovableBoxes) {
+        
+        // Step 1: Compute ideal path for each goal
+        Map<Position, Set<Position>> goalPathSets = new HashMap<>();
+        Map<Position, Integer> goalServicingAgent = new HashMap<>();
+        
+        // Pre-compute box positions by type (excluding immovable)
+        Map<Character, List<Position>> boxesByType = new HashMap<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (!immovableBoxes.contains(entry.getKey())) {
+                boxesByType.computeIfAbsent(entry.getValue(), k -> new ArrayList<>()).add(entry.getKey());
+            }
+        }
+        
+        for (Position goal : activeGoals) {
+            int agentGoalId = level.getAgentGoal(goal.row, goal.col);
+            if (agentGoalId >= 0) {
+                // Agent goal: path from agent's current position to goal
+                Position agentPos = state.getAgentPosition(agentGoalId);
+                List<Position> path = findIdealPath(agentPos, goal, level, immovableBoxes);
+                if (path != null) {
+                    goalPathSets.put(goal, new HashSet<>(path));
+                    goalServicingAgent.put(goal, agentGoalId);
+                }
+            } else {
+                // Box goal: find nearest matching box + nearest matching-color agent
+                char boxType = level.getBoxGoal(goal.row, goal.col);
+                if (boxType == '\0') continue;
+                
+                Color boxColor = level.getBoxColor(boxType);
+                List<Position> candidates = boxesByType.get(boxType);
+                if (candidates == null || candidates.isEmpty()) continue;
+                
+                // Find nearest box of this type to the goal
+                Position nearestBox = null;
+                int minBoxDist = Integer.MAX_VALUE;
+                for (Position bp : candidates) {
+                    int d = manhattanDistance(bp, goal);
+                    if (d < minBoxDist) { minBoxDist = d; nearestBox = bp; }
+                }
+                
+                // Find nearest matching-color agent to the box
+                int bestAgent = -1;
+                int minAgentDist = Integer.MAX_VALUE;
+                for (int i = 0; i < state.getNumAgents(); i++) {
+                    if (level.getAgentColor(i) == boxColor) {
+                        int d = manhattanDistance(state.getAgentPosition(i), nearestBox);
+                        if (d < minAgentDist) { minAgentDist = d; bestAgent = i; }
+                    }
+                }
+                
+                if (bestAgent < 0 || nearestBox == null) continue;
+                
+                // Compose path: agent→box + box→goal (union of positions)
+                Set<Position> combinedPath = new HashSet<>();
+                List<Position> agentToBox = findIdealPath(
+                        state.getAgentPosition(bestAgent), nearestBox, level, immovableBoxes);
+                List<Position> boxToGoal = findIdealPath(nearestBox, goal, level, immovableBoxes);
+                if (agentToBox != null) combinedPath.addAll(agentToBox);
+                if (boxToGoal != null) combinedPath.addAll(boxToGoal);
+                
+                if (!combinedPath.isEmpty()) {
+                    goalPathSets.put(goal, combinedPath);
+                    goalServicingAgent.put(goal, bestAgent);
+                }
+            }
+        }
+        
+        // Step 2: Detect path conflicts between goals with different servicing agents
+        Map<Position, Integer> conflictScores = new HashMap<>();
+        for (Position goal : activeGoals) conflictScores.put(goal, 0);
+        
+        List<Position> goalsWithPaths = new ArrayList<>(goalPathSets.keySet());
+        for (int i = 0; i < goalsWithPaths.size(); i++) {
+            Position gi = goalsWithPaths.get(i);
+            Set<Position> pathI = goalPathSets.get(gi);
+            int agentI = goalServicingAgent.getOrDefault(gi, -1);
+            
+            for (int j = i + 1; j < goalsWithPaths.size(); j++) {
+                Position gj = goalsWithPaths.get(j);
+                int agentJ = goalServicingAgent.getOrDefault(gj, -1);
+                
+                // Only count conflicts between DIFFERENT agents
+                // Same-agent goals are serialized by subgoal ordering — no spatial conflict
+                if (agentI == agentJ && agentI >= 0) continue;
+                
+                // Count overlapping positions
+                Set<Position> pathJ = goalPathSets.get(gj);
+                int overlap = 0;
+                for (Position p : pathJ) {
+                    if (pathI.contains(p)) overlap++;
+                }
+                
+                if (overlap > 0) {
+                    conflictScores.merge(gi, overlap, Integer::sum);
+                    conflictScores.merge(gj, overlap, Integer::sum);
+                }
+            }
+        }
+        
+        // Step 3: Compute path narrowness for each goal
+        // Narrowness = avg(1/freeNeighbors) along the path. Higher = narrower corridor.
+        Map<Position, Double> narrowness = new HashMap<>();
+        for (Map.Entry<Position, Set<Position>> entry : goalPathSets.entrySet()) {
+            double totalInvNeighbors = 0;
+            int count = 0;
+            for (Position p : entry.getValue()) {
+                int freeNeighbors = countFreeNeighbors(p, level);
+                if (freeNeighbors > 0) {
+                    totalInvNeighbors += 1.0 / freeNeighbors;
+                    count++;
+                }
+            }
+            narrowness.put(entry.getKey(), count > 0 ? totalInvNeighbors / count : 0.0);
+        }
+        
+        // Debug logging
+        if (SearchConfig.isVerbose()) {
+            for (Position goal : activeGoals) {
+                int score = conflictScores.getOrDefault(goal, 0);
+                double nar = narrowness.getOrDefault(goal, 0.0);
+                if (score > 0 || nar > 0.3) {
+                    System.err.println("[LevelAnalyzer] P3: " + goal 
+                            + " conflict=" + score + " narrowness=" + String.format("%.2f", nar));
+                }
+            }
+        }
+        
+        return new PathConflictAnalysis(conflictScores, narrowness, goalPathSets.size());
+    }
+    
+    /**
+     * BFS pathfinding treating walls + extraWalls as impassable.
+     * Used for ideal path computation (ignores dynamic obstacles like boxes and agents).
+     */
+    private static List<Position> findIdealPath(Position start, Position target, 
+                                                Level level, Set<Position> extraWalls) {
+        if (start.equals(target)) return Collections.singletonList(start);
+        
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Position> parent = new HashMap<>();
+        queue.add(start);
+        parent.put(start, null);
+        
+        while (!queue.isEmpty()) {
+            Position curr = queue.poll();
+            if (curr.equals(target)) {
+                List<Position> path = new ArrayList<>();
+                Position p = curr;
+                while (p != null) { path.add(0, p); p = parent.get(p); }
+                return path;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = curr.move(dir);
+                if (!level.isWall(next) && !extraWalls.contains(next) && !parent.containsKey(next)) {
+                    parent.put(next, curr);
+                    queue.add(next);
+                }
+            }
+        }
+        return null;
     }
     
     /**
@@ -1049,12 +1277,16 @@ public class LevelAnalyzer {
     /**
      * Returns goals in execution order (dependencies first).
      * 
-     * Uses two-level sorting:
-     * 1. Topological Importance (Dependency-based)
-     * 2. BFS Distance from Root (Distance-based): Furthest goals first
+     * P4: Theoretically grounded 5-tier tie-breaking:
+     * 1. Structural importance (transitive dependency count) — enables dependent goals
+     * 2. Path conflict score (P3) — claim contested space before frozen goals clutter it
+     * 3. Path narrowness (P4) — narrow-corridor goals first (harder to reroute)
+     * 4. Box task count — walk-only agents settle quickly (reduces congestion)
+     * 5. BFS distance — fill deepest rooms first (prevents trapping)
      */
     private static List<Position> topologicalSort(Map<Position, Set<Position>> dependsOn, List<Position> goals, 
-            Map<Position, Integer> distances, Map<Position, Integer> agentGoalBoxTasks) {
+            Map<Position, Integer> distances, Map<Position, Integer> agentGoalBoxTasks,
+            Map<Position, Integer> pathConflictScores, Map<Position, Double> pathNarrowness) {
         List<Position> result = new ArrayList<>();
         Set<Position> visited = new HashSet<>();
         
@@ -1077,25 +1309,38 @@ public class LevelAnalyzer {
             computeImportance(goal, dependedBy, importance, new HashSet<>());
         }
         
-        // Sort goals by importance (most important = most depended upon = first)
-        // Tie-breaker 1: Distance from root (Descending) -> Fill deepest rooms first
-        // Tie-breaker 2: Agent goals with fewer box tasks first (walk-only agents settle
-        //   quickly, reducing congestion for box-moving agents — fixes DatzCrazy-like scenarios)
+        // P4: Theoretically grounded tie-breaking hierarchy
+        // Each tier has a clear rationale based on planning theory:
+        // 1. Importance: structural (transitive dep count) — goals that enable others go first
+        // 2. Path conflict: contested paths planned first — claim space before it's cluttered
+        //    with frozen completed agents/boxes (Priority Planning freezes done goals)
+        // 3. Path narrowness: narrow-path goals first — harder to reroute around obstacles,
+        //    so execute them while corridors are clear
+        // 4. Box tasks: walk-only agents settle quickly — reduces congestion for box-movers
+        // 5. Distance: fill deepest rooms first — prevents later agents from being trapped
         List<Position> sortedGoals = new ArrayList<>(goals);
         sortedGoals.sort((a, b) -> {
+            // Tier 1: Structural importance (most depended upon → first)
             int impA = importance.getOrDefault(a, 0);
             int impB = importance.getOrDefault(b, 0);
-            if (impA != impB) {
-                return Integer.compare(impB, impA);  // Higher importance first
-            }
-            // Tie-breaker 1: Agent goals with fewer box tasks first
-            // Non-agent goals get MAX_VALUE (sorted after agent goals with same importance)
+            if (impA != impB) return Integer.compare(impB, impA);
+            
+            // Tier 2: P3 path conflict score (more contested path → first)
+            int confA = pathConflictScores.getOrDefault(a, 0);
+            int confB = pathConflictScores.getOrDefault(b, 0);
+            if (confA != confB) return Integer.compare(confB, confA);
+            
+            // Tier 3: P4 path narrowness (narrower path → first, threshold 0.01)
+            double narA = pathNarrowness.getOrDefault(a, 0.0);
+            double narB = pathNarrowness.getOrDefault(b, 0.0);
+            if (Math.abs(narA - narB) > 0.01) return Double.compare(narB, narA);
+            
+            // Tier 4: Box task count (fewer tasks → first, walk-only agents settle quickly)
             int boxA = agentGoalBoxTasks.getOrDefault(a, Integer.MAX_VALUE);
             int boxB = agentGoalBoxTasks.getOrDefault(b, Integer.MAX_VALUE);
-            if (boxA != boxB) {
-                return Integer.compare(boxA, boxB);  // Fewer box tasks first
-            }
-            // Tie-breaker 2: Furthest distance first
+            if (boxA != boxB) return Integer.compare(boxA, boxB);
+            
+            // Tier 5: BFS distance (furthest → first, fill deepest rooms)
             int distA = distances.getOrDefault(a, 0);
             int distB = distances.getOrDefault(b, 0);
             return Integer.compare(distB, distA);
