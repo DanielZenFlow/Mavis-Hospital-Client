@@ -240,6 +240,51 @@ public class LevelAnalyzer {
                     // Goal I must wait for Goal J.
                     dependsOn.get(goalI).add(goalJ);
                     dependencyCount++;
+                } else {
+                    // AGENT-BODY DEPENDENCY CHECK (Pull awareness):
+                    // When an agent Pulls a box to goalI, the agent's body occupies an
+                    // adjacent cell. In narrow corridors, the 2-cell footprint (goalI +
+                    // agent body) can sever the path to goalJ even though blocking goalI
+                    // alone does not. Test each non-wall neighbor of goalI as a potential
+                    // agent-body position. If {goalI, neighbor} together block goalJ,
+                    // a dependency exists.
+                    boolean bodyBlocks = false;
+                    for (Direction bodyDir : Direction.values()) {
+                        Position agentBodyPos = goalI.move(bodyDir);
+                        if (level.isWall(agentBodyPos)) continue;
+                        if (effectiveImpassable.contains(agentBodyPos)) continue; // already a wall
+                        if (agentBodyPos.equals(goalJ)) {
+                            // Agent body directly on goalJ → definitely blocked
+                            bodyBlocks = true;
+                            break;
+                        }
+                        // Test reachability with BOTH goalI and agent body blocked
+                        Set<Position> blockedPair = new HashSet<>();
+                        blockedPair.add(goalI);
+                        blockedPair.add(agentBodyPos);
+                        boolean canReachWithBody;
+                        if (isAgentGoal) {
+                            canReachWithBody = isReachableWithMultipleBlocks(
+                                localRoot, goalJ, level, blockedPair, Collections.emptySet(), effectiveImpassable);
+                        } else {
+                            List<Position> candidateBoxes2 = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
+                            canReachWithBody = canPushBoxToGoalWithMultipleBlocks(
+                                goalJ, blockedPair, level, Collections.emptySet(),
+                                effectiveImpassable, localRoot, candidateBoxes2);
+                        }
+                        if (!canReachWithBody) {
+                            bodyBlocks = true;
+                            break;
+                        }
+                    }
+                    if (bodyBlocks) {
+                        dependsOn.get(goalI).add(goalJ);
+                        dependencyCount++;
+                        if (SearchConfig.isVerbose()) {
+                            System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
+                                + " + agent body blocks " + goalJ);
+                        }
+                    }
                 }
             }
         }
@@ -603,6 +648,155 @@ public class LevelAnalyzer {
                     visited.add(next);
                     q.add(next);
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks if target is reachable from start with MULTIPLE hypothetical blocks.
+     * Used for agent-body dependency detection: when Pulling a box to a goal position,
+     * the agent's body occupies an adjacent cell, creating a 2-cell footprint.
+     * In narrow corridors, this 2-cell block can sever paths that a single-cell
+     * block would not.
+     */
+    private static boolean isReachableWithMultipleBlocks(Position start, Position target,
+            Level level, Set<Position> blockedPositions, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (blockedPositions.contains(target)) return false;
+        if (immovableBoxes.contains(target)) return false;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        
+        q.add(start);
+        visited.add(start);
+        visited.addAll(blockedPositions);  // Block ALL hypothetical positions
+        visited.addAll(immovableBoxes);
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (!level.isWall(next) && !visited.contains(next)) {
+                    visited.add(next);
+                    q.add(next);
+                }
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Checks if a box can reach its goal with MULTIPLE hypothetical blocks.
+     * Used for agent-body dependency detection on box goals.
+     */
+    private static boolean canPushBoxToGoalWithMultipleBlocks(Position goalPos, Set<Position> blockedPositions,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes,
+            Position openSpaceRoot, List<Position> candidateBoxes) {
+        if (candidateBoxes.isEmpty()) return false;
+        
+        for (Position boxPos : candidateBoxes) {
+            if (blockedPositions.contains(boxPos)) continue;
+            
+            // Can agent reach the box?
+            boolean agentCanReachBox = isReachableWithMultipleBlocks(
+                openSpaceRoot, boxPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (!agentCanReachBox) continue;
+            
+            // Can box reach the goal? (Use existsPushPath with combined obstacles)
+            // Build a combined obstacle set for existsPushPath
+            boolean boxCanReachGoal = existsPushPathWithMultipleBlocks(
+                boxPos, goalPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (!boxCanReachGoal) continue;
+            
+            // Local feasibility check with multiple blocks
+            if (checkLocalEntryFeasibilityMultiBlock(goalPos, blockedPositions, level,
+                    movableBoxPositions, immovableBoxes, openSpaceRoot)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * existsPushPath variant that blocks multiple positions.
+     */
+    private static boolean existsPushPathWithMultipleBlocks(Position start, Position target,
+            Level level, Set<Position> blockedPositions, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        if (start.equals(target)) return true;
+        if (blockedPositions.contains(target)) return false;
+        
+        Queue<Position> q = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        Set<Position> obstacles = new HashSet<>(immovableBoxes);
+        obstacles.addAll(blockedPositions);
+        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        obstacles.remove(start);
+        
+        q.add(start);
+        visited.add(start);
+        
+        while (!q.isEmpty()) {
+            Position current = q.poll();
+            if (current.equals(target)) return true;
+            
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (level.isWall(next) || obstacles.contains(next) || visited.contains(next)) continue;
+                
+                Position pushAgentPos = current.move(dir.opposite());
+                boolean canPush = !level.isWall(pushAgentPos) && !obstacles.contains(pushAgentPos);
+                
+                Position pullAgentDest = next.move(dir);
+                boolean canPull = !level.isWall(pullAgentDest) && !obstacles.contains(pullAgentDest)
+                                  && !level.isWall(next) && !obstacles.contains(next);
+                
+                if (!canPush && !canPull) continue;
+                
+                visited.add(next);
+                q.add(next);
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * checkLocalEntryFeasibility variant with multiple blocked positions.
+     */
+    private static boolean checkLocalEntryFeasibilityMultiBlock(Position goalPos, Set<Position> blockedPositions,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes, Position openSpaceRoot) {
+        // Push paths
+        for (Direction pushDir : Direction.values()) {
+            Position agentPushPosition = goalPos.move(pushDir.opposite());
+            if (level.isWall(agentPushPosition)) continue;
+            if (immovableBoxes.contains(agentPushPosition)) continue;
+            if (blockedPositions.contains(agentPushPosition)) continue;
+            
+            boolean canReach = isReachableWithMultipleBlocks(
+                openSpaceRoot, agentPushPosition, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (canReach) return true;
+        }
+        
+        // Pull paths
+        if (!level.isWall(goalPos) && !immovableBoxes.contains(goalPos) && !blockedPositions.contains(goalPos)) {
+            boolean agentCanReachGoal = isReachableWithMultipleBlocks(
+                openSpaceRoot, goalPos, level, blockedPositions, movableBoxPositions, immovableBoxes);
+            if (agentCanReachGoal) {
+                boolean hasExit = false;
+                boolean hasBoxApproach = false;
+                for (Direction dir : Direction.values()) {
+                    Position adjacent = goalPos.move(dir);
+                    if (!level.isWall(adjacent) && !immovableBoxes.contains(adjacent) && !blockedPositions.contains(adjacent)) {
+                        hasExit = true;
+                    }
+                    if (!level.isWall(adjacent) && !blockedPositions.contains(adjacent)) {
+                        hasBoxApproach = true;
+                    }
+                }
+                if (hasExit && hasBoxApproach) return true;
             }
         }
         return false;
