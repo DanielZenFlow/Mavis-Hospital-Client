@@ -183,9 +183,14 @@ public class DeadlockBreaker {
             if (satisfiedGoalPositions.contains(newBoxPos))
                 continue;
 
-            // Check if agent can push
-            if (agentToBox == pushDir.opposite()) {
-                // Agent is behind box, can push
+            // Check if agent can push: agent must be on the opposite side of the box
+            // from the push direction. E.g., to push box North, agent must be South of box.
+            if (agentToBox == pushDir) {
+                // Agent is on the push side — can push in the opposite direction (forward push)
+                // Actually we need: agent approaches from opposite of pushDir
+                // agentToBox is the direction FROM agent TO box.
+                // To push box in pushDir, agent must be at box.move(pushDir.opposite()),
+                // i.e., agentToBox == pushDir (agent is on the side opposite to push target).
                 Action pushAction = Action.push(agentToBox, pushDir);
                 if (state.isApplicable(pushAction, agentId, level)) {
                     Action[] jointAction = new Action[numAgents];
@@ -195,6 +200,33 @@ public class DeadlockBreaker {
                     plan.add(jointAction);
                     return true;
                 }
+            }
+        }
+
+        // Also try pulling the box out of the way (pull domain support)
+        for (Direction pullAgentDir : Direction.values()) {
+            Position newAgentPos = agentPos.move(pullAgentDir);
+            if (level.isWall(newAgentPos)) continue;
+            if (state.getBoxes().containsKey(newAgentPos)) continue;
+            if (state.hasAgentAt(newAgentPos)) continue;
+            if (criticalPositions.contains(newAgentPos)) continue;
+
+            // For Pull(agentDir, boxDir): box is at agentPos + opposite(boxDir)
+            // We want to pull the box at boxPos. So: boxPos = agentPos + opposite(boxDir)
+            // => boxDir = getDirection(boxPos, agentPos) (direction from box to agent's old pos)
+            // Wait, boxDir is the direction the box MOVES. Box moves to agentPos (agent's old position).
+            // So boxDir = direction from boxPos to agentPos.
+            Direction boxDir = getDirection(boxPos, agentPos);
+            if (boxDir == null) continue;
+
+            Action pullAction = Action.pull(pullAgentDir, boxDir);
+            if (state.isApplicable(pullAction, agentId, level)) {
+                Action[] jointAction = new Action[numAgents];
+                Arrays.fill(jointAction, Action.noOp());
+                jointAction[agentId] = pullAction;
+                jointAction = conflictResolver.resolveConflicts(jointAction, state, level);
+                plan.add(jointAction);
+                return true;
             }
         }
 

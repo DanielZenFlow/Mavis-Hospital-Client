@@ -147,6 +147,16 @@ public class ImmovableBoxDetector {
     public int getDistanceWithImmovableBoxes(Position from, Position to, State state, Level level) {
         if (from.equals(to)) return 0;
         
+        // Bounds check: positions outside the grid are unreachable
+        if (cacheInitialized) {
+            if (from.row < 0 || from.row >= cachedRows || from.col < 0 || from.col >= cachedCols) {
+                return UNREACHABLE;
+            }
+            if (to.row < 0 || to.row >= cachedRows || to.col < 0 || to.col >= cachedCols) {
+                return UNREACHABLE;
+            }
+        }
+        
         // Immovable boxes are computed once in initializeDistanceCache or first getImmovableBoxes call.
         // No need to recompute per call since they're constant (determined by color, not position).
         

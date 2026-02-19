@@ -600,28 +600,33 @@ public class BoxSearchPlanner {
     private static class StateKey {
         final Position agentPos;
         final Position targetBoxPos;
-        /** Hash of ALL same-type box positions. When agent pushes/pulls other boxes
-         *  of the same type to make way, the layout change must be captured. */
-        final int sameTypeBoxHash;
+        /** Sorted list of ALL same-type box positions for collision-resistant equality.
+         *  XOR hash is prone to collisions (e.g. {P1,P2} vs {P3,P4} can match).
+         *  Using a sorted list ensures deterministic, collision-free comparison. */
+        final List<Position> sameTypeBoxPositions;
+        final int cachedHash;
 
         StateKey(State state, int agentId, Position targetBoxPos) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            this.sameTypeBoxHash = 0; // legacy: no box type tracking
+            this.sameTypeBoxPositions = Collections.emptyList();
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
         }
         
         StateKey(State state, int agentId, Position targetBoxPos, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            // Hash all positions of boxes with the same type
-            // This ensures different layouts of same-color boxes are distinguished
-            int hash = 0;
+            // Collect and sort all positions of boxes with the same type
+            // Sorted list provides deterministic, collision-free equality comparison
+            List<Position> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
                 if (e.getValue() == boxType) {
-                    hash ^= e.getKey().hashCode() * 31;
+                    positions.add(e.getKey());
                 }
             }
-            this.sameTypeBoxHash = hash;
+            positions.sort((a, b) -> a.row != b.row ? Integer.compare(a.row, b.row) : Integer.compare(a.col, b.col));
+            this.sameTypeBoxPositions = positions;
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
         }
 
         @Override
@@ -631,12 +636,12 @@ public class BoxSearchPlanner {
             StateKey other = (StateKey) obj;
             return agentPos.equals(other.agentPos) &&
                     Objects.equals(targetBoxPos, other.targetBoxPos) &&
-                    sameTypeBoxHash == other.sameTypeBoxHash;
+                    sameTypeBoxPositions.equals(other.sameTypeBoxPositions);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, targetBoxPos, sameTypeBoxHash);
+            return cachedHash;
         }
     }
     
@@ -645,26 +650,30 @@ public class BoxSearchPlanner {
         final Position agentPos;
         final Position targetBoxPos;
         final int time;
-        final int sameTypeBoxHash;
+        final List<Position> sameTypeBoxPositions;
+        final int cachedHash;
 
         StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
-            this.sameTypeBoxHash = 0;
+            this.sameTypeBoxPositions = Collections.emptyList();
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxPositions);
         }
         
         StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
-            int hash = 0;
+            List<Position> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
                 if (e.getValue() == boxType) {
-                    hash ^= e.getKey().hashCode() * 31;
+                    positions.add(e.getKey());
                 }
             }
-            this.sameTypeBoxHash = hash;
+            positions.sort((a, b) -> a.row != b.row ? Integer.compare(a.row, b.row) : Integer.compare(a.col, b.col));
+            this.sameTypeBoxPositions = positions;
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxPositions);
         }
 
         @Override
@@ -674,12 +683,12 @@ public class BoxSearchPlanner {
             StateKeyWithTime other = (StateKeyWithTime) obj;
             return time == other.time && agentPos.equals(other.agentPos) &&
                     Objects.equals(targetBoxPos, other.targetBoxPos) &&
-                    sameTypeBoxHash == other.sameTypeBoxHash;
+                    sameTypeBoxPositions.equals(other.sameTypeBoxPositions);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxHash);
+            return cachedHash;
         }
     }
     

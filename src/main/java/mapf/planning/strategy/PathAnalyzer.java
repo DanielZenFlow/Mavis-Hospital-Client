@@ -205,7 +205,9 @@ public class PathAnalyzer {
             return false;
 
         int freeNeighbors = countFreeNeighbors(pos, state, level);
-        if (freeNeighbors < 2)
+        // In a pull-supporting domain, agents can always walk out of dead-ends.
+        // Only reject completely blocked positions (0 free neighbors).
+        if (freeNeighbors < 1)
             return false;
 
         char boxGoal = level.getBoxGoal(pos);

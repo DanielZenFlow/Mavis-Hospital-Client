@@ -103,7 +103,13 @@ public class PortfolioController implements SearchStrategy {
             
             // Execute
             long attemptStart = System.currentTimeMillis();
-            List<Action[]> result = strategy.search(initialState, level);
+            List<Action[]> result = null;
+            try {
+                result = strategy.search(initialState, level);
+            } catch (Exception e) {
+                System.err.println("[Portfolio] Strategy " + strategyConfig.type + " threw exception: " + e.getMessage());
+                e.printStackTrace(System.err);
+            }
             long attemptDuration = System.currentTimeMillis() - attemptStart;
             
             // Record attempt

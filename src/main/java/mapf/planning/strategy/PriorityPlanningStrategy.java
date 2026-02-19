@@ -995,15 +995,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
 
     /**
-     * Pukoban agent-trap detection: checks if committing to this subgoal would trap the agent.
+     * Agent-trap detection: checks if committing to this subgoal would trap the agent.
      * 
-     * After filling goalPos, the agent ends up at some position. We BFS from that position
-     * to check if the agent can still reach any candidate box for its remaining same-color tasks.
-     * If not, the agent would be stranded in a dead-end — a classic Pukoban failure mode.
+     * IMPORTANT: In a pull-supporting domain, the agent can always pull same-color
+     * boxes out of the way to create paths. This means boxes of the agent's color
+     * are NOT permanent obstacles. Only treat walls and different-color/immovable
+     * boxes as obstacles. Also, the agent can push/pull boxes it's adjacent to,
+     * so we include cells reachable after moving a same-color box.
      * 
-     * This is the correct architectural location for this check (post-plan, not static analysis)
-     * because it operates on the actual state after execution, avoiding false positives from
-     * pre-existing room disconnections that static pairwise analysis cannot distinguish.
+     * This prevents false positive trap detection that was causing levels like ZOOM
+     * to fail (agent incorrectly detected as "trapped" behind its own boxes).
      */
     private boolean wouldTrapAgent(Subgoal completedSubgoal, State stateAfterExecution, Level level, List<Subgoal> allSubgoals) {
         int agentId = completedSubgoal.agentId;
@@ -1026,9 +1027,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // No remaining same-color tasks → agent has nothing left to do → not trapped
         if (remainingSameColor.isEmpty()) return false;
         
-        // BFS from agent's final position to find reachable cells
-        // Obstacles: walls + all boxes in current state (agent navigates around them)
-        Set<Position> reachable = agentReachabilityBFS(agentPos, stateAfterExecution, level);
+        // Pull-aware BFS: same-color boxes are NOT permanent obstacles.
+        // Agent can pull them out of the way, so they don't block movement.
+        Set<Position> reachable = agentReachabilityBFS(agentPos, stateAfterExecution, level, agentColor);
         
         // Check if agent can reach ANY candidate box for its remaining tasks
         for (Subgoal sg : remainingSameColor) {
@@ -1052,12 +1053,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /**
      * BFS from a position to find all cells reachable by the agent.
-     * Agent can walk through empty cells but not walls or boxes.
+     * Pull-aware: same-color boxes can be pulled out of the way, so they are
+     * NOT treated as permanent obstacles. Only walls, immovable boxes, and
+     * different-color boxes block the agent.
      */
-    private Set<Position> agentReachabilityBFS(Position start, State state, Level level) {
+    private Set<Position> agentReachabilityBFS(Position start, State state, Level level, Color agentColor) {
         Set<Position> visited = new HashSet<>();
         Queue<Position> queue = new LinkedList<>();
-        Set<Position> boxPositions = state.getBoxes().keySet();
         
         visited.add(start);
         queue.add(start);
@@ -1066,10 +1068,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             Position current = queue.poll();
             for (Direction dir : Direction.values()) {
                 Position next = current.move(dir);
-                if (!visited.contains(next) && !level.isWall(next) && !boxPositions.contains(next)) {
-                    visited.add(next);
-                    queue.add(next);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                
+                // Check if there's a box at this position
+                Character boxAtNext = state.getBoxes().get(next);
+                if (boxAtNext != null) {
+                    // Same-color box: agent can pull it out of the way → passable
+                    Color boxColor = level.getBoxColor(boxAtNext);
+                    if (boxColor != null && boxColor.equals(agentColor)) {
+                        // Box is same color — agent can interact (push/pull) to clear path
+                        visited.add(next);
+                        queue.add(next);
+                        continue;
+                    }
+                    // Different-color or immovable box → obstacle
+                    continue;
                 }
+                
+                visited.add(next);
+                queue.add(next);
             }
         }
         return visited;
