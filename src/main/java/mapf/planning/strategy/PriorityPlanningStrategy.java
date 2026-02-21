@@ -776,10 +776,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // agent is trapped in a dead-end disconnected from remaining tasks.
                     // This is a POST-PLAN validation (not static analysis) because it depends
                     // on the actual agent position and world state after execution.
-                    if (!subgoal.isAgentGoal && wouldTrapAgent(subgoal, tempState, level, subgoals)) {
+                    if (!subgoal.isAgentGoal && wouldTrapAgent(subgoal, tempState, level, subgoals, currentState)) {
                         // Agent would be trapped — skip this subgoal, let PP try alternatives
                         logNormal(getName() + ": [TRAP] Skipping " + subgoal.boxType + " -> " + subgoal.goalPos
                                 + " — agent " + subgoal.agentId + " would be trapped after filling");
+                        // Rollback: remove the executed actions from fullPlan
                         // Rollback: remove the executed actions from fullPlan
                         while (fullPlan.size() > planSizeBefore) {
                             fullPlan.remove(fullPlan.size() - 1);
@@ -1307,12 +1308,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * boxes as obstacles. Also, the agent can push/pull boxes it's adjacent to,
      * so we include cells reachable after moving a same-color box.
      * 
-     * This prevents false positive trap detection that was causing levels like ZOOM
-     * to fail (agent incorrectly detected as "trapped" behind its own boxes).
+     * Pre-execution comparison: If the agent was ALREADY unable to reach remaining
+     * tasks before executing this subgoal (e.g., blocked by cross-color boxes),
+     * then filling the goal doesn't make things worse — don't flag as trapped.
+     * This prevents false positives in dense levels like ZOOM where A-boxes
+     * permanently separate map regions.
      */
-    private boolean wouldTrapAgent(Subgoal completedSubgoal, State stateAfterExecution, Level level, List<Subgoal> allSubgoals) {
+    private boolean wouldTrapAgent(Subgoal completedSubgoal, State stateAfterExecution, 
+            Level level, List<Subgoal> allSubgoals, State stateBeforeExecution) {
         int agentId = completedSubgoal.agentId;
-        Position agentPos = stateAfterExecution.getAgentPosition(agentId);
+        Position agentPosAfter = stateAfterExecution.getAgentPosition(agentId);
         Color agentColor = level.getAgentColor(agentId);
         
         // Collect remaining same-color box subgoals (excluding the one just completed)
@@ -1333,25 +1338,65 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Pull-aware BFS: same-color boxes are NOT permanent obstacles.
         // Agent can pull them out of the way, so they don't block movement.
-        Set<Position> reachable = agentReachabilityBFS(agentPos, stateAfterExecution, level, agentColor);
+        Set<Position> reachableAfter = agentReachabilityBFS(agentPosAfter, stateAfterExecution, level, agentColor);
         
-        // Check if agent can reach ANY candidate box for its remaining tasks
+        // Check if agent can reach ANY candidate box for its remaining tasks (post-execution)
+        boolean canReachAfter = false;
         for (Subgoal sg : remainingSameColor) {
+            if (canReachAfter) break;
             for (Map.Entry<Position, Character> entry : stateAfterExecution.getBoxes().entrySet()) {
                 if (entry.getValue() == sg.boxType) {
-                    // Agent needs to reach a neighbor of the box (to push/pull it)
                     Position boxPos = entry.getKey();
                     for (Direction dir : Direction.values()) {
                         Position neighbor = boxPos.move(dir);
-                        if (reachable.contains(neighbor)) {
-                            return false; // Can reach at least one box → not trapped
+                        if (reachableAfter.contains(neighbor)) {
+                            canReachAfter = true;
+                            break;
                         }
                     }
+                    if (canReachAfter) break;
                 }
             }
         }
         
-        // Agent cannot reach any box for remaining tasks → trapped
+        if (canReachAfter) return false; // Can reach remaining tasks → not trapped
+        
+        // Agent can't reach remaining tasks AFTER execution.
+        // But was the agent ALREADY unable to reach them BEFORE execution?
+        // If yes → filling this goal doesn't make things worse → allow it.
+        Position agentPosBefore = stateBeforeExecution.getAgentPosition(agentId);
+        Set<Position> reachableBefore = agentReachabilityBFS(agentPosBefore, stateBeforeExecution, level, agentColor);
+        
+        boolean couldReachBefore = false;
+        for (Subgoal sg : remainingSameColor) {
+            if (couldReachBefore) break;
+            for (Map.Entry<Position, Character> entry : stateBeforeExecution.getBoxes().entrySet()) {
+                if (entry.getValue() == sg.boxType) {
+                    Position boxPos = entry.getKey();
+                    for (Direction dir : Direction.values()) {
+                        Position neighbor = boxPos.move(dir);
+                        if (reachableBefore.contains(neighbor)) {
+                            couldReachBefore = true;
+                            break;
+                        }
+                    }
+                    if (couldReachBefore) break;
+                }
+            }
+        }
+        
+        if (!couldReachBefore && remainingSameColor.size() >= 2) {
+            // Agent was already cut off from multiple remaining tasks — filling this goal
+            // doesn't trap it any more than it already was. Allow the goal.
+            // Threshold ≥2: with only 1 remaining task, the trap rollback can accidentally
+            // improve parallel scheduling (observed in ClosedAI: K→(6,10) agent 9).
+            logVerbose("[PP] [TRAP-BYPASS] Agent " + agentId + " already couldn't reach remaining " 
+                    + remainingSameColor.size() + " tasks before " + completedSubgoal.boxType 
+                    + " -> " + completedSubgoal.goalPos + " — allowing");
+            return false;
+        }
+        
+        // Agent COULD reach tasks before but CAN'T after → truly trapped
         return true;
     }
     
