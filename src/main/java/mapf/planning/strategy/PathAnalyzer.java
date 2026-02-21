@@ -130,13 +130,20 @@ public class PathAnalyzer {
 
     /**
      * Finds a parking position for an agent that doesn't block critical positions.
+     * Uses a scoring system that balances distance with position quality:
+     * - Dead-end positions (1 passable neighbor): +30 score bonus (out of the way)
+     * - Corridor positions (2 passable neighbors): -10 score penalty (may block)
+     * - Articulation points: -20 score penalty (may split map)
+     * - Distance penalty: -dist (closer is better)
+     * 
+     * Higher score = better parking position.
      */
     public Position findParkingPosition(int agentId, State state, Level level, int numAgents,
             Set<Position> criticalPositions, Set<Position> satisfiedGoalPositions) {
         
         Position agentPos = state.getAgentPosition(agentId);
         Position bestPosition = null;
-        int bestDistance = Integer.MAX_VALUE;
+        int bestScore = Integer.MIN_VALUE;
 
         Set<Position> allAgentPositions = new HashSet<>();
         for (int i = 0; i < numAgents; i++) {
@@ -152,8 +159,6 @@ public class PathAnalyzer {
         distances.put(agentPos, 0);
 
         int maxSearchDistance = 30;
-        Position firstAPFallback = null; // first valid position on an articulation point
-        int firstAPDist = Integer.MAX_VALUE;
 
         while (!queue.isEmpty()) {
             Position current = queue.poll();
@@ -164,14 +169,22 @@ public class PathAnalyzer {
 
             if (isValidParkingPosition(current, agentPos, state, level, criticalPositions,
                     satisfiedGoalPositions, allAgentPositions)) {
-                // Prefer non-articulation-point positions
+                int score = -dist * 3; // base: closer is much better (distance weighted 3x)
+                
+                int passableNeighbors = countPassableNeighbors(current, level);
+                if (passableNeighbors == 1) {
+                    score += 8; // dead-end: good parking, but not worth going far
+                } else if (passableNeighbors == 2) {
+                    score -= 3; // corridor: mild penalty
+                }
+                // 3+ neighbors: junction, neutral (score += 0)
+                
                 if (articulationPoints.contains(current)) {
-                    if (firstAPFallback == null || dist < firstAPDist) {
-                        firstAPFallback = current;
-                        firstAPDist = dist;
-                    }
-                } else if (dist < bestDistance) {
-                    bestDistance = dist;
+                    score -= 5; // avoid splitting the map
+                }
+                
+                if (score > bestScore) {
+                    bestScore = score;
                     bestPosition = current;
                 }
             }
@@ -202,8 +215,7 @@ public class PathAnalyzer {
             }
         }
 
-        // Fall back to articulation point if no other valid position found
-        return (bestPosition != null) ? bestPosition : firstAPFallback;
+        return bestPosition;
     }
 
     /**
