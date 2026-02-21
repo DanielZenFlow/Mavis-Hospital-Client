@@ -948,6 +948,70 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         
+        // Phase B: Agent→box approach path clearing
+        // Only runs if box→goal clearing didn't make progress AND the agent actually
+        // can't reach the box (BFS through real obstacles fails).
+        if (!anyCleared) {
+            Position agentPos = currentState.getAgentPosition(subgoal.agentId);
+            Color agentColor = level.getAgentColor(subgoal.agentId);
+            
+            // Check if agent can actually reach the box
+            List<Action> agentPath = pathAnalyzer.planAgentPath(
+                    subgoal.agentId, boxPos, currentState, level, numAgents);
+            
+            if (agentPath == null) {
+                // Agent can't reach box — find different-color boxes blocking the path
+                List<Position> agentToBoxPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                        agentPos, boxPos, level);
+                
+                if (agentToBoxPath != null) {
+                    for (Position pathCell : agentToBoxPath) {
+                        Character boxAtCell = currentState.getBoxes().get(pathCell);
+                        if (boxAtCell != null && level.getBoxColor(boxAtCell) != agentColor) {
+                            // Find same-color agent for this blocker
+                            Color bColor = level.getBoxColor(boxAtCell);
+                            int clearAgent = -1;
+                            for (int a = 0; a < level.getNumAgents(); a++) {
+                                if (bColor.equals(level.getAgentColor(a))) {
+                                    clearAgent = a;
+                                    break;
+                                }
+                            }
+                            if (clearAgent < 0) continue;
+                            
+                            // Clear it away from both dangerZone and agent→box path
+                            Set<Position> excludeZone = new HashSet<>(dangerZone);
+                            excludeZone.addAll(agentToBoxPath);
+                            Position clearTarget = findClearingPosition(pathCell, excludeZone, currentState, level);
+                            if (clearTarget == null) {
+                                clearTarget = findClearingPosition(pathCell, dangerZone, currentState, level);
+                            }
+                            if (clearTarget == null) continue;
+                            
+                            logVerbose("[PP] [CLEAR-A2B] Moving " + boxAtCell + " from " + pathCell 
+                                    + " to " + clearTarget + " (agent " + clearAgent + ")");
+                            
+                            List<Action> displacePath = boxSearchPlanner.planBoxDisplacement(
+                                    clearAgent, pathCell, clearTarget, boxAtCell, currentState, level);
+                            
+                            if (displacePath != null && !displacePath.isEmpty()) {
+                                for (Action action : displacePath) {
+                                    Action[] jointAction = planMerger.createJointActionWithMerging(
+                                            clearAgent, action, currentState, level, numAgents, false, completedBoxGoals);
+                                    jointAction = conflictResolver.resolveConflicts(jointAction, currentState, level, clearAgent);
+                                    fullPlan.add(jointAction);
+                                    currentState = applyJointAction(jointAction, currentState, level, numAgents);
+                                    globalTimeStep++;
+                                }
+                                anyCleared = true;
+                                logVerbose("[PP] [CLEAR-A2B] Cleared " + boxAtCell + " in " + displacePath.size() + " steps");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         return anyCleared ? currentState : null;
     }
     

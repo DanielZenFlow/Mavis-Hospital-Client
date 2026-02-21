@@ -60,10 +60,12 @@ public class SubgoalManager {
     
     /**
      * Invalidates the Hungarian cache, forcing recomputation on next access.
+     * Also invalidates the color-aware distance cache since box positions may have changed.
      * Call when the world state has changed significantly (e.g., after completing a subgoal).
      */
     public void invalidateHungarianCache() {
         hungarianCache = null;
+        immovableDetector.invalidateColorAwareCache();
     }
     
     /** Returns true if a Hungarian assignment cache is currently active. */
@@ -464,6 +466,8 @@ public class SubgoalManager {
     /**
      * Finds the nearest agent of the matching color to the target position.
      * Uses connectivity-aware BFS distance instead of Manhattan.
+     * Uses color-agnostic distance (not color-aware) because agent assignment is about
+     * REACHABILITY with full coordination — other agents can clear obstacles.
      */
     private int findNearestAgentForColor(Color color, Position target, Level level, State state) {
         int bestAgentId = -1;
@@ -474,9 +478,6 @@ public class SubgoalManager {
             if (level.getAgentColor(i) == color) {
                 Position agentPos = state.getAgentPosition(i);
                 
-                // FIX: Use reachable distance instead of Manhattan logic
-                // This prevents assigning tasks to agents in disconnected components (e.g., trapped in rooms).
-                // getDistanceWithImmovableBoxes returns MAX_VALUE if unreachable.
                 int dist = immovableDetector.getDistanceWithImmovableBoxes(agentPos, target, state, level);
                 
                 if (dist < minDistance) {
