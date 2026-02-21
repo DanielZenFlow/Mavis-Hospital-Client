@@ -422,6 +422,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
         sortSubgoals(cachedSubgoalOrder, state, level);
+        
+        // Physical blocking sort: reorder subgoals where filling goal A would place a box
+        // on goal B's box-to-goal path. Goal B should be filled BEFORE goal A.
+        applyPhysicalBlockingSort(cachedSubgoalOrder, state, level);
+        
         logGoalOrder(cachedSubgoalOrder);
     }
     
@@ -572,6 +577,73 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             int diffB = subgoalManager.estimateSubgoalDifficulty(b, s, lv, completedBoxGoals);
             return Integer.compare(diffA, diffB);
         });
+    }
+    
+    /**
+     * Physical blocking sort: detects cross-color physical blocking between subgoals
+     * and reorders to avoid deadlocks.
+     * 
+     * For each pair (A, B) of box subgoals handled by DIFFERENT color agents:
+     *   If A's goalPos lies on B's box→goal path, then B should be done BEFORE A
+     *   (because filling A would block B's path).
+     * 
+     * Uses bubble-sort style promotion: if B is blocked by A and B comes after A,
+     * swap them. Only applies to cross-color pairs (same-color handled by dependency graph).
+     * Limited to O(n²) pairwise checks with max n² swaps.
+     */
+    private void applyPhysicalBlockingSort(List<Subgoal> subgoals, State state, Level level) {
+        int n = subgoals.size();
+        if (n < 2) return;
+        
+        // Build box→goal paths for each subgoal (lazily cached)
+        Map<Integer, Set<Position>> pathCells = new HashMap<>();
+        
+        boolean changed = true;
+        int passes = 0;
+        int maxPasses = n; // limit iterations
+        
+        while (changed && passes < maxPasses) {
+            changed = false;
+            passes++;
+            
+            for (int i = 0; i < n - 1; i++) {
+                Subgoal a = subgoals.get(i);
+                if (a.isAgentGoal) continue;
+                
+                Color colorA = level.getAgentColor(a.agentId);
+                
+                for (int j = i + 1; j < n; j++) {
+                    Subgoal b = subgoals.get(j);
+                    if (b.isAgentGoal) continue;
+                    
+                    Color colorB = level.getAgentColor(b.agentId);
+                    
+                    // Only check cross-color pairs
+                    if (colorA != null && colorA.equals(colorB)) continue;
+                    
+                    // Does A's goalPos block B's box→goal path?
+                    Set<Position> bPath = pathCells.computeIfAbsent(j, idx -> {
+                        Position boxPos = subgoalManager.findBestBoxForGoal(b, state, level, subgoals, completedBoxGoals);
+                        if (boxPos == null) return Collections.emptySet();
+                        List<Position> path = pathAnalyzer.findPathIgnoringDynamicObstacles(boxPos, b.goalPos, level);
+                        return (path != null) ? new HashSet<>(path) : Collections.emptySet();
+                    });
+                    
+                    if (bPath.contains(a.goalPos)) {
+                        // A's goal blocks B's path → B should be done before A
+                        // Promote B to position i (move A down)
+                        subgoals.remove(j);
+                        subgoals.add(i, b);
+                        pathCells.clear(); // invalidate path cache after reorder
+                        changed = true;
+                        logVerbose("[PP] [PHYS-SORT] Promoted " + b.boxType + "->" + b.goalPos 
+                                + " before " + a.boxType + "->" + a.goalPos + " (cross-color blocking)");
+                        break; // restart inner loop from new i
+                    }
+                }
+                if (changed) break; // restart outer loop
+            }
+        }
     }
     
     /** Log the goal execution order. Internal planning detail, verbose only. */
