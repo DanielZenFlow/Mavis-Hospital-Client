@@ -16,6 +16,19 @@ import java.util.*;
  */
 public class PathAnalyzer {
 
+    /** Articulation points of the free-space graph. Parking on these can split the map. */
+    private Set<Position> articulationPoints = Collections.emptySet();
+
+    /** Set the pre-computed articulation points for parking avoidance. */
+    public void setArticulationPoints(Set<Position> ap) {
+        this.articulationPoints = (ap != null) ? ap : Collections.emptySet();
+    }
+
+    /** Get the articulation points set. */
+    public Set<Position> getArticulationPoints() {
+        return articulationPoints;
+    }
+
     /**
      * Plans a path for an agent to a target position.
      * Returns list of MOVE actions only.
@@ -139,6 +152,8 @@ public class PathAnalyzer {
         distances.put(agentPos, 0);
 
         int maxSearchDistance = 30;
+        Position firstAPFallback = null; // first valid position on an articulation point
+        int firstAPDist = Integer.MAX_VALUE;
 
         while (!queue.isEmpty()) {
             Position current = queue.poll();
@@ -149,7 +164,13 @@ public class PathAnalyzer {
 
             if (isValidParkingPosition(current, agentPos, state, level, criticalPositions,
                     satisfiedGoalPositions, allAgentPositions)) {
-                if (dist < bestDistance) {
+                // Prefer non-articulation-point positions
+                if (articulationPoints.contains(current)) {
+                    if (firstAPFallback == null || dist < firstAPDist) {
+                        firstAPFallback = current;
+                        firstAPDist = dist;
+                    }
+                } else if (dist < bestDistance) {
                     bestDistance = dist;
                     bestPosition = current;
                 }
@@ -181,7 +202,8 @@ public class PathAnalyzer {
             }
         }
 
-        return bestPosition;
+        // Fall back to articulation point if no other valid position found
+        return (bestPosition != null) ? bestPosition : firstAPFallback;
     }
 
     /**

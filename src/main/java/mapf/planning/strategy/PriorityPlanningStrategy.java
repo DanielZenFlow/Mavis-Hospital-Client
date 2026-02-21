@@ -200,6 +200,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Precompute BFS distance maps for all goals (O(G×N) once, then O(1) per query)
         subgoalManager.initDistanceCache(initialState, level);
 
+        // Precompute articulation points for parking avoidance (O(V+E) once)
+        Set<Position> ap = ArticulationPointFinder.findArticulationPoints(level, immovableBoxes);
+        pathAnalyzer.setArticulationPoints(ap);
+        if (SearchConfig.isNormal()) {
+            System.err.println("[PP] Articulation points: " + ap.size());
+        }
+
         // Compute independent agent groups for parallel execution
         agentComponentId = computeAgentComponents(initialState, level);
 
