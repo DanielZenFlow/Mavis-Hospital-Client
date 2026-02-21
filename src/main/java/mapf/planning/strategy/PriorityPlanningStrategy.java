@@ -61,6 +61,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     private Set<Position> displacedGoals = new HashSet<>();
     
+    /**
+     * Borrow-and-return: goals displaced by the most recent tryPathClearing call.
+     * After clearing+BSP succeeds, these are re-planned back to their goals.
+     * Max MAX_CLEARING_DISPLACEMENTS allowed per clearing operation.
+     */
+    private List<Position> lastClearingDisplacedGoals = new ArrayList<>();
+    private static final int MAX_CLEARING_DISPLACEMENTS = 4;
+    
     /** Pre-computed goal execution order from LevelAnalyzer (optional). */
     private List<Position> precomputedGoalOrder = null;
     
@@ -822,6 +830,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             cachedSubgoalOrder = null;
                         }
                         revalidateCompletedGoals(tempState, level);
+                        
+                        // Borrow-and-return: re-plan displaced goals back
+                        if (!lastClearingDisplacedGoals.isEmpty()) {
+                            tempState = returnDisplacedGoals(tempState, level, fullPlan, numAgents);
+                        }
+                        
                         if (!subgoal.isAgentGoal) {
                             List<Subgoal> rem = new ArrayList<>();
                             for (Subgoal sg : subgoals) { if (sg != subgoal) rem.add(sg); }
@@ -899,6 +913,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Step 3: For each blocker, find its agent and a safe clearing position
         State currentState = state;
         boolean anyCleared = false;
+        lastClearingDisplacedGoals.clear();
+        int displacementCount = 0;
         
         for (Position blockerPos : blockerPositions) {
             Character blockerType = currentState.getBoxes().get(blockerPos);
@@ -932,6 +948,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     clearingAgent, blockerPos, clearTarget, blockerType, currentState, level);
             
             if (displacePath != null && !displacePath.isEmpty()) {
+                // Check if this displacement would exceed the cap
+                // Count goals that would be displaced by moving this blocker
+                boolean blockerOnCompletedGoal = completedBoxGoals.contains(blockerPos);
+                if (blockerOnCompletedGoal) {
+                    displacementCount++;
+                    if (displacementCount > MAX_CLEARING_DISPLACEMENTS) {
+                        logVerbose("[PP] [CLEAR] Displacement cap reached (" + MAX_CLEARING_DISPLACEMENTS + "), skipping remaining");
+                        break;
+                    }
+                }
+                
                 // Execute the clearing path
                 for (Action action : displacePath) {
                     Action[] jointAction = planMerger.createJointActionWithMerging(
@@ -942,6 +969,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     globalTimeStep++;
                 }
                 anyCleared = true;
+                
+                // Track displaced goals for borrow-and-return
+                if (blockerOnCompletedGoal) {
+                    lastClearingDisplacedGoals.add(blockerPos);
+                    displacedGoals.add(blockerPos);
+                    logVerbose("[PP] [CLEAR] Displaced completed goal at " + blockerPos);
+                }
+                
                 logVerbose("[PP] [CLEAR] Cleared " + blockerType + " in " + displacePath.size() + " steps");
             } else {
                 logVerbose("[PP] [CLEAR] BSP can't plan displacement for " + blockerType + " at " + blockerPos);
@@ -995,6 +1030,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                     clearAgent, pathCell, clearTarget, boxAtCell, currentState, level);
                             
                             if (displacePath != null && !displacePath.isEmpty()) {
+                                // Check displacement cap
+                                boolean onGoal = completedBoxGoals.contains(pathCell);
+                                if (onGoal) {
+                                    displacementCount++;
+                                    if (displacementCount > MAX_CLEARING_DISPLACEMENTS) {
+                                        logVerbose("[PP] [CLEAR-A2B] Displacement cap reached");
+                                        break;
+                                    }
+                                }
+                                
                                 for (Action action : displacePath) {
                                     Action[] jointAction = planMerger.createJointActionWithMerging(
                                             clearAgent, action, currentState, level, numAgents, false, completedBoxGoals);
@@ -1004,6 +1049,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                     globalTimeStep++;
                                 }
                                 anyCleared = true;
+                                
+                                if (onGoal) {
+                                    lastClearingDisplacedGoals.add(pathCell);
+                                    displacedGoals.add(pathCell);
+                                    logVerbose("[PP] [CLEAR-A2B] Displaced completed goal at " + pathCell);
+                                }
+                                
                                 logVerbose("[PP] [CLEAR-A2B] Cleared " + boxAtCell + " in " + displacePath.size() + " steps");
                             }
                         }
@@ -1022,7 +1074,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * - Not a wall
      * - Not occupied by another box
      * - Not an agent position
-     * - Preferably reachable by pushing the box there
+     * - Preferably NOT on a completed goal (borrow-and-return: minimize displacements)
      */
     private Position findClearingPosition(Position blockerPos, Set<Position> dangerZone,
             State state, Level level) {
@@ -1030,6 +1082,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         Queue<Position> queue = new LinkedList<>();
         visited.add(blockerPos);
         queue.add(blockerPos);
+        
+        Position firstGoalFallback = null; // first valid pos that's on a completed goal
         
         while (!queue.isEmpty()) {
             Position current = queue.poll();
@@ -1042,12 +1096,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (!dangerZone.contains(next) 
                         && !state.getBoxes().containsKey(next)
                         && !isAgentAt(next, state, level)) {
-                    return next;
+                    // Prefer positions NOT on completed goals
+                    if (!completedBoxGoals.contains(next)) {
+                        return next;
+                    }
+                    // Remember first goal-position as fallback
+                    if (firstGoalFallback == null) {
+                        firstGoalFallback = next;
+                    }
                 }
                 queue.add(next);
             }
         }
-        return null;
+        return firstGoalFallback; // may be null if nothing found at all
     }
     
     /** Check if any agent is at the given position. */
@@ -1056,6 +1117,92 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (state.getAgentPosition(a).equals(pos)) return true;
         }
         return false;
+    }
+    
+    /**
+     * Borrow-and-return: after path clearing + BSP succeeds, try to push
+     * displaced boxes back to their original goal positions.
+     * Best-effort: if any return fails, the goal will be re-planned normally
+     * in a later iteration (revalidateCompletedGoals removed it from completedBoxGoals).
+     */
+    private State returnDisplacedGoals(State state, Level level, List<Action[]> fullPlan, int numAgents) {
+        State currentState = state;
+        int returned = 0;
+        
+        for (Position goalPos : lastClearingDisplacedGoals) {
+            char goalType = level.getBoxGoal(goalPos.row, goalPos.col);
+            if (goalType == '\0') continue;
+            
+            // Check if the goal is actually still unsatisfied
+            Character boxAtGoal = currentState.getBoxes().get(goalPos);
+            if (boxAtGoal != null && boxAtGoal == goalType) continue; // already back
+            
+            // Find the nearest box of this type that can be pushed back
+            Color goalColor = level.getBoxColor(goalType);
+            if (goalColor == null) continue;
+            
+            int returnAgent = -1;
+            for (int a = 0; a < level.getNumAgents(); a++) {
+                if (goalColor.equals(level.getAgentColor(a))) {
+                    returnAgent = a;
+                    break;
+                }
+            }
+            if (returnAgent < 0) continue;
+            
+            // Find the displaced box — nearest box of the right type not on its goal
+            Position bestBoxPos = null;
+            int bestDist = Integer.MAX_VALUE;
+            for (Map.Entry<Position, Character> entry : currentState.getBoxes().entrySet()) {
+                if (entry.getValue() != goalType) continue;
+                Position bPos = entry.getKey();
+                // Skip boxes that are already on a satisfied goal
+                char bGoal = level.getBoxGoal(bPos.row, bPos.col);
+                if (bGoal == entry.getValue()) continue;
+                int dist = goalPos.manhattanDistance(bPos);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestBoxPos = bPos;
+                }
+            }
+            if (bestBoxPos == null) continue;
+            
+            // Plan BSP to push box back to goal
+            Set<Position> frozenForReturn = new HashSet<>(completedBoxGoals);
+            frozenForReturn.removeAll(displacedGoals);
+            frozenForReturn.remove(goalPos); // target must not be frozen
+            List<Action> returnPath = boxSearchPlanner.searchForSubgoal(
+                    returnAgent, bestBoxPos, goalPos, goalType, currentState, level, frozenForReturn);
+            
+            if (returnPath != null && !returnPath.isEmpty()) {
+                for (Action action : returnPath) {
+                    Action[] jointAction = planMerger.createJointActionWithMerging(
+                            returnAgent, action, currentState, level, numAgents, false, completedBoxGoals);
+                    jointAction = conflictResolver.resolveConflicts(jointAction, currentState, level, returnAgent);
+                    fullPlan.add(jointAction);
+                    currentState = applyJointAction(jointAction, currentState, level, numAgents);
+                    globalTimeStep++;
+                }
+                
+                // Verify the box actually reached the goal
+                Character atGoal = currentState.getBoxes().get(goalPos);
+                if (atGoal != null && atGoal == goalType) {
+                    completedBoxGoals.add(goalPos);
+                    displacedGoals.remove(goalPos);
+                    returned++;
+                    logVerbose("[PP] [RETURN] Returned " + goalType + " to " + goalPos 
+                            + " (" + returnPath.size() + " steps)");
+                }
+            }
+        }
+        
+        if (returned > 0) {
+            logNormal("[PP] [RETURN] Returned " + returned + "/" 
+                    + lastClearingDisplacedGoals.size() + " displaced goals");
+            revalidateCompletedGoals(currentState, level);
+        }
+        lastClearingDisplacedGoals.clear();
+        return currentState;
     }
 
     /**
