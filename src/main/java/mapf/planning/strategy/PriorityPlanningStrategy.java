@@ -580,6 +580,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     }
     
     /**
+     * Computes a dynamic BSP search budget based on estimated box-to-goal distance.
+     * Short distances get a smaller budget (fail/succeed fast), long distances get
+     * a larger budget (more room to explore complex maneuvers).
+     * 
+     * Formula: clamp(MIN_BSP_BUDGET + distance * BSP_BUDGET_PER_DISTANCE, MIN, MAX)
+     * e.g. dist=1→8K, dist=5→12K, dist=8→21K (≈current 20K), dist=15→38K, dist=20→40K
+     */
+    private int computeDynamicBspBudget(Position boxPos, Position goalPos) {
+        int distance = boxPos.manhattanDistance(goalPos);
+        int budget = SearchConfig.MIN_BSP_BUDGET + distance * SearchConfig.BSP_BUDGET_PER_DISTANCE;
+        return Math.max(SearchConfig.MIN_BSP_BUDGET, Math.min(SearchConfig.MAX_BSP_BUDGET, budget));
+    }
+    
+    /**
      * Physical blocking sort: detects cross-color physical blocking between subgoals
      * and reorders to avoid deadlocks.
      * 
@@ -1806,6 +1820,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         + " (agent " + subgoal.agentId + " at " + state.getAgentPosition(subgoal.agentId) 
                         + ", frozen=" + frozen + ", attempt=" + attempt + ")");
                 
+                // Dynamic BSP budget: scale search budget based on box-to-goal distance
+                int dynamicBudget = computeDynamicBspBudget(boxPos, subgoal.goalPos);
+                boxSearchPlanner.setMaxStatesOverride(dynamicBudget);
+                
+                try {
                 // Round 1: ST-A* with all frozen as walls
                 List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                         subgoal.goalPos, subgoal.boxType, state, level, frozen,
@@ -1899,6 +1918,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 
                 logVerbose("[PP] All rounds exhausted for " + subgoal.boxType + " -> " + subgoal.goalPos);
                 return null;
+                } finally {
+                    boxSearchPlanner.clearMaxStatesOverride();
+                }
             }
             return null; // should not reach here, but safety
         }

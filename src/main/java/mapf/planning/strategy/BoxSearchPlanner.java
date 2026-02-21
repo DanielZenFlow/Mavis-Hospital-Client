@@ -21,9 +21,28 @@ import java.util.*;
 public class BoxSearchPlanner {
 
     private final Heuristic heuristic;
+    private int maxStatesOverride = -1;
 
     public BoxSearchPlanner(Heuristic heuristic) {
         this.heuristic = heuristic;
+    }
+
+    /**
+     * Set a per-subgoal override for the maximum states budget.
+     * Call clearMaxStatesOverride() when done.
+     */
+    public void setMaxStatesOverride(int maxStates) {
+        this.maxStatesOverride = maxStates;
+    }
+
+    /** Clear the override, reverting to SearchConfig.MAX_STATES_PER_SUBGOAL. */
+    public void clearMaxStatesOverride() {
+        this.maxStatesOverride = -1;
+    }
+
+    /** Returns the effective max states: override if set, else config default. */
+    private int getEffectiveMaxStates() {
+        return maxStatesOverride > 0 ? maxStatesOverride : SearchConfig.MAX_STATES_PER_SUBGOAL;
     }
 
     /**
@@ -57,7 +76,9 @@ public class BoxSearchPlanner {
 
         int exploredCount = 0;
 
-        while (!openList.isEmpty() && exploredCount < SearchConfig.MAX_STATES_PER_SUBGOAL) {
+        int effectiveMaxStates = getEffectiveMaxStates();
+
+        while (!openList.isEmpty() && exploredCount < effectiveMaxStates) {
             SearchNode current = openList.poll();
             exploredCount++;
 
@@ -104,7 +125,7 @@ public class BoxSearchPlanner {
 
         // Debug log removed to reduce noise
         // System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "tier1" : "tier2") + "): box=" + boxType + " " + boxStart + " -> " + goalPos 
-        //    + " explored=" + exploredCount + "/" + SearchConfig.MAX_STATES_PER_SUBGOAL 
+        //    + " explored=" + exploredCount + "/" + effectiveMaxStates 
         //    + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
         return null;
     }
@@ -134,7 +155,7 @@ public class BoxSearchPlanner {
 
         int exploredCount = 0;
 
-        while (!openList.isEmpty() && exploredCount < SearchConfig.MAX_STATES_PER_SUBGOAL) {
+        while (!openList.isEmpty() && exploredCount < getEffectiveMaxStates()) {
             SearchNode current = openList.poll();
             exploredCount++;
 
@@ -227,7 +248,7 @@ public class BoxSearchPlanner {
 
         int exploredCount = 0;
 
-        while (!openList.isEmpty() && exploredCount < SearchConfig.MAX_STATES_PER_SUBGOAL) {
+        while (!openList.isEmpty() && exploredCount < getEffectiveMaxStates()) {
             SearchNode current = openList.poll();
             exploredCount++;
 
@@ -385,7 +406,7 @@ public class BoxSearchPlanner {
         bestG.put(startKey, 0);
 
         int exploredCount = 0;
-        int maxStates = SearchConfig.MAX_STATES_PER_SUBGOAL / 2;
+        int maxStates = getEffectiveMaxStates() / 2;
 
         while (!openList.isEmpty() && exploredCount < maxStates) {
             SearchNode current = openList.poll();

@@ -78,6 +78,17 @@ public class SearchConfig {
     /** Use CBS when cyclic dependency is detected */
     public static final boolean USE_CBS_ON_CYCLE = true;
 
+    // ========== Dynamic BSP Budget ==========
+
+    /** Minimum BSP search budget (states) — even very short subgoals get this much */
+    public static final int MIN_BSP_BUDGET = 8_000;
+
+    /** Maximum BSP search budget (states) — cap for very long distance subgoals */
+    public static final int MAX_BSP_BUDGET = 40_000;
+
+    /** States budget added per unit of estimated distance */
+    public static final int BSP_BUDGET_PER_DISTANCE = 2_000;
+
     // ========== Logging Configuration ==========
     
     /**
