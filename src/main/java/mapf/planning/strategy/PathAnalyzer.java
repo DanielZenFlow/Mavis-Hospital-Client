@@ -85,6 +85,29 @@ public class PathAnalyzer {
     }
 
     /**
+     * Plans a path for an agent to a target, with push/pull fallback.
+     * First tries Move-only BFS. If that fails (agent blocked by boxes),
+     * falls back to BoxSearchPlanner's A* which can push/pull same-color boxes.
+     * 
+     * @return List of actions (may include Push/Pull), or null if unreachable
+     */
+    public List<Action> planAgentPathWithFallback(int agentId, Position targetPos, State state,
+            Level level, int numAgents, BoxSearchPlanner bsp) {
+        // Try fast Move-only BFS first
+        List<Action> movePath = planAgentPath(agentId, targetPos, state, level, numAgents);
+        if (movePath != null) {
+            return movePath;
+        }
+        
+        // Fallback: use BSP's agent-goal search (supports push/pull through same-color boxes)
+        if (bsp != null) {
+            return bsp.searchForAgentGoal(agentId, targetPos, state, level);
+        }
+        
+        return null;
+    }
+
+    /**
      * Finds a path ignoring dynamic obstacles (boxes and agents).
      * Uses A* with Manhattan distance heuristic.
      */

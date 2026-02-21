@@ -1566,8 +1566,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return state; // No better parking position found
         }
         
-        // Plan path to parking position
-        List<Action> parkPath = pathAnalyzer.planAgentPath(agentId, parkingPos, state, level, numAgents);
+        // Plan path to parking position (with push/pull fallback through same-color boxes)
+        List<Action> parkPath = pathAnalyzer.planAgentPathWithFallback(
+                agentId, parkingPos, state, level, numAgents, boxSearchPlanner);
         if (parkPath == null || parkPath.isEmpty()) {
             return state;
         }
