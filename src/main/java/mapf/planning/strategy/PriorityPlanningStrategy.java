@@ -22,7 +22,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private final SearchConfig config;
     private long timeoutMs;
     private int maxStates;
-    private final Random random = new Random(SearchConfig.RANDOM_SEED);
+    private Random random = new Random(SearchConfig.RANDOM_SEED);
 
     // Core helper classes (SRP: each handles one responsibility)
     private final SubgoalManager subgoalManager;
@@ -215,6 +215,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     /** Sets the ordering mode for subgoal execution. */
     public void setOrderingMode(OrderingMode mode) {
         this.orderingMode = mode != null ? mode : OrderingMode.TOPOLOGICAL;
+    }
+
+    /** Sets the random seed for RANDOM ordering mode. Allows portfolio to try different shuffles. */
+    public void setRandomSeed(int seed) {
+        this.random = new Random(seed);
     }
 
     @Override

@@ -75,7 +75,8 @@ public class PortfolioController implements SearchStrategy {
         if (SearchConfig.isMinimal()) {
             System.err.println("[Portfolio] Strategy sequence: " + 
                 strategies.stream().map(s -> s.type.name() + 
-                    (s.orderingMode != null ? "(" + s.orderingMode + ")" : "")).toList());
+                    (s.orderingMode != null ? "(" + s.orderingMode + 
+                        (s.orderingMode == OrderingMode.RANDOM ? "#" + s.randomSeed : "") + ")" : "")).toList());
         }
         
         // Step 3: Try strategies in sequence, keeping the best result
@@ -91,8 +92,13 @@ public class PortfolioController implements SearchStrategy {
             long attemptTimeout = computeAttemptTimeout(strategyConfig, remainingTime, strategies.size());
             
             if (SearchConfig.isMinimal()) {
-                System.err.println("[Portfolio] Trying " + strategyConfig.type + 
-                    (strategyConfig.orderingMode != null ? "(" + strategyConfig.orderingMode + ")" : "") +
+                String modeStr = "";
+                if (strategyConfig.orderingMode != null) {
+                    modeStr = "(" + strategyConfig.orderingMode;
+                    if (strategyConfig.orderingMode == OrderingMode.RANDOM) modeStr += "#" + strategyConfig.randomSeed;
+                    modeStr += ")";
+                }
+                System.err.println("[Portfolio] Trying " + strategyConfig.type + modeStr +
                     " (timeout=" + attemptTimeout + "ms, budget=" + 
                     String.format("%.0f%%", strategyConfig.timeBudgetFraction * 100) + ")");
             }
@@ -179,50 +185,36 @@ public class PortfolioController implements SearchStrategy {
     
     /**
      * Builds strategy sequence based on level features.
-     * Multi-agent levels get PP with different ordering modes as the real "retry knob".
-     * Time budget: TOPOLOGICAL 40%, REVERSE 25%, DISTANCE_GREEDY 20%, RANDOM 15%.
+     * 
+     * Pull-Sokoban portfolio design principles:
+     * - CBS/JointAStar are NOT used as top-level strategies (CBS models MAPF point-to-point,
+     *   not Sokoban push/pull; JointAStar is O(5^n) unusable above 3 agents).
+     *   CBS is retained as PP-internal cycle fallback (tryCBSFallback).
+     * - REVERSE_TOPOLOGICAL is removed (never solved any competition level in testing).
+     * - Multi-seed RANDOM is the primary cycle-breaking mechanism: different seeds
+     *   produce different shuffle orderings, multiplying the chance of finding a
+     *   subgoal order that avoids TRAP/REGRESS deadlocks.
      */
     private List<StrategyConfig> buildStrategySequence(LevelFeatures f, State state) {
         List<StrategyConfig> strategies = new ArrayList<>();
         
         if (f.recommendedStrategy == StrategyType.SINGLE_AGENT) {
-            // Simple case: just A* with increasing weights
-            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0.40));
-            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0.60));
-        } else if (f.numAgents <= SearchConfig.JOINT_ASTAR_AGENT_THRESHOLD 
-                   && f.couplingDegree >= 0.7) {
-            // Very tightly coupled, few agents: JointAStar first, then CBS, then PP
-            strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 1.0, null, 0.30));
-            strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
-        } else if (f.couplingDegree >= 0.4 && f.numAgents <= 5) {
-            // Medium coupling, moderate agents: CBS then PP
-            strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.30));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.20));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.25));
+            // Single agent: A* with increasing weights
+            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0, 0.40));
+            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0, 0.60));
+        } else if (f.hasCircularDependency) {
+            // Cyclic dependencies: multi-seed RANDOM is primary strategy.
+            // Each seed produces a different subgoal shuffle, breaking different cycles.
+            // TOPOLOGICAL retained as backup — still produces good partial plans even with cycles.
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 137, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.25));
         } else {
-            // General multi-agent: PP with different ordering modes (default)
-            if (f.hasCircularDependency) {
-                // Cyclic dependencies: deterministic orderings often get stuck on the cycle.
-                // RANDOM breaks cycles by shuffling, so it gets top priority.
-                // Standard practice in Prioritized Planning literature for cyclic deps.
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.30));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.25));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.25));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.20));
-            } else {
-                // No cycles: topological order is well-founded, use it first.
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.35));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.25));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
-                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.10));
-            }
-            // Last resort: CBS as final fallback for loosely coupled levels
-            if (f.numAgents <= 6) {
-                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.10));
-            }
+            // No cycles: topological order is well-founded, use it first.
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.40));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.30));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.30));
         }
         
         return strategies;
@@ -289,6 +281,10 @@ public class PortfolioController implements SearchStrategy {
                 if (config.orderingMode != null) {
                     priorityPlanning.setOrderingMode(config.orderingMode);
                 }
+                // Set random seed for RANDOM ordering (multi-seed diversification)
+                if (config.orderingMode == OrderingMode.RANDOM && config.randomSeed != 0) {
+                    priorityPlanning.setRandomSeed(config.randomSeed);
+                }
                 return priorityPlanning;
         }
     }
@@ -328,12 +324,14 @@ public class PortfolioController implements SearchStrategy {
         final StrategyType type;
         final double weight;
         final OrderingMode orderingMode;
+        final int randomSeed;
         final double timeBudgetFraction;
         
-        StrategyConfig(StrategyType type, double weight, OrderingMode orderingMode, double timeBudgetFraction) {
+        StrategyConfig(StrategyType type, double weight, OrderingMode orderingMode, int randomSeed, double timeBudgetFraction) {
             this.type = type;
             this.weight = weight;
             this.orderingMode = orderingMode;
+            this.randomSeed = randomSeed;
             this.timeBudgetFraction = timeBudgetFraction;
         }
     }
