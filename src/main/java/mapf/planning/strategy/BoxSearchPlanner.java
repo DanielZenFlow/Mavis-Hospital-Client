@@ -485,6 +485,21 @@ public class BoxSearchPlanner {
     public List<Action> planBoxDisplacementWithUnfreeze(int agentId, Position boxPos, Position targetPos,
             char boxType, State initialState, Level level,
             Set<Position> unfreezePositions, int maxStatesOverride) {
+        return planBoxDisplacementWithUnfreeze(agentId, boxPos, targetPos, boxType,
+                initialState, level, unfreezePositions, maxStatesOverride, Collections.emptySet());
+    }
+
+    /**
+     * Plans box displacement with unfreeze and protected positions.
+     * 
+     * @param protectedPositions positions where non-target boxes must NOT end up.
+     *        Actions that push/pull non-target boxes ONTO these positions are rejected.
+     *        This prevents BSP from creating collateral damage in critical corridors.
+     */
+    public List<Action> planBoxDisplacementWithUnfreeze(int agentId, Position boxPos, Position targetPos,
+            char boxType, State initialState, Level level,
+            Set<Position> unfreezePositions, int maxStatesOverride,
+            Set<Position> protectedPositions) {
 
         Character actualBox = initialState.getBoxAt(boxPos);
         if (actualBox == null || actualBox != boxType) {
@@ -497,9 +512,9 @@ public class BoxSearchPlanner {
         // Build frozen goals, but EXCLUDE the unfreezePositions
         Set<Position> frozenGoals = new HashSet<>();
         for (Position goalPosition : level.getAllBoxGoalPositions()) {
-            char goalType = level.getBoxGoal(goalPosition);
+            char goalTypeGoal = level.getBoxGoal(goalPosition);
             char currentBox = initialState.getBoxAt(goalPosition);
-            if (currentBox == goalType) {
+            if (currentBox == goalTypeGoal) {
                 frozenGoals.add(goalPosition);
             }
         }
@@ -530,6 +545,10 @@ public class BoxSearchPlanner {
                 if (action.type == Action.ActionType.NOOP) continue;
                 if (!current.state.isApplicable(action, agentId, level)) continue;
                 if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
+                // Protected positions: reject if non-target box would land on a protected cell
+                if (!protectedPositions.isEmpty() 
+                        && wouldPlaceBoxOnProtected(action, agentId, current.state, 
+                                current.targetBoxPos, protectedPositions)) continue;
 
                 State newState = current.state.apply(action, agentId);
                 Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
@@ -720,6 +739,39 @@ public class BoxSearchPlanner {
         if (action.type == Action.ActionType.PULL) {
             Position boxPos = agentPos.move(action.boxDir.opposite());
             return satisfiedGoals.contains(boxPos);
+        }
+
+        return false;
+    }
+
+    /**
+     * Checks if an action would move a NON-TARGET box onto a protected position.
+     * Used during barrier clearing to prevent BSP from pushing collateral boxes
+     * into the approach corridor (which would cut off the agent's return path).
+     * 
+     * The target box (tracked by targetBoxPos) is allowed to pass through protected
+     * positions as part of its displacement route.
+     */
+    private boolean wouldPlaceBoxOnProtected(Action action, int agentId, State state,
+                                              Position targetBoxPos, Set<Position> protectedPositions) {
+        Position agentPos = state.getAgentPosition(agentId);
+
+        if (action.type == Action.ActionType.PUSH) {
+            Position boxOldPos = agentPos.move(action.agentDir);
+            Position boxNewPos = boxOldPos.move(action.boxDir);
+            // If this is the target box being pushed, allow it (it's the one we're relocating)
+            if (boxOldPos.equals(targetBoxPos)) return false;
+            // Non-target box: check if destination is protected
+            return protectedPositions.contains(boxNewPos);
+        }
+
+        if (action.type == Action.ActionType.PULL) {
+            Position boxOldPos = agentPos.move(action.boxDir.opposite());
+            Position boxNewPos = agentPos; // box follows to agent's previous position
+            // If this is the target box, allow it
+            if (boxOldPos.equals(targetBoxPos)) return false;
+            // Non-target box: check if destination is protected
+            return protectedPositions.contains(boxNewPos);
         }
 
         return false;

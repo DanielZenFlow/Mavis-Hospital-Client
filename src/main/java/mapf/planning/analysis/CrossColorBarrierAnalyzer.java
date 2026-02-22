@@ -362,10 +362,12 @@ public class CrossColorBarrierAnalyzer {
 
         // Sort: moderate distance from reference — far enough to not block approach
         // corridor, close enough for BSP to find a displacement path.
-        // Filter out positions within Manhattan 3 of reference (too close to gap).
+        // Filter out positions within Manhattan 1 of reference (directly adjacent to gap).
+        // Previous threshold of 4 was too aggressive for large barriers (e.g., ZOOM)
+        // where nearby row-10 positions are the only viable parking.
         final Position sortRef = referencePos;
         if (sortRef != null) {
-            candidates.removeIf(pos -> pos.manhattanDistance(sortRef) < 4);
+            candidates.removeIf(pos -> pos.manhattanDistance(sortRef) < 2);
         }
         candidates.sort((a, b) -> {
             if (sortRef != null) {
@@ -414,6 +416,19 @@ public class CrossColorBarrierAnalyzer {
      */
     public static boolean isBoxExtractable(Position boxPos, Set<Position> agentReachable,
                                             State state, Level level) {
+        return isBoxExtractable(boxPos, agentReachable, state, level, Collections.emptySet());
+    }
+
+    /**
+     * Overload for barrier clearing context: otherBarrierBoxes are boxes that will
+     * be sequentially cleared, so they should be treated as "removable" (free space)
+     * when checking bypass routes. This fixes the case where a single-exit gap (like
+     * (9,13) in ZOOM) appears non-extractable because the pulled box blocks the only
+     * return path — but in reality, after parking the box aside, the gap re-opens.
+     */
+    public static boolean isBoxExtractable(Position boxPos, Set<Position> agentReachable,
+                                            State state, Level level,
+                                            Set<Position> otherBarrierBoxes) {
         // Count how many sides the agent can access
         List<Direction> accessibleDirs = new ArrayList<>();
         for (Direction dir : Direction.values()) {
@@ -432,6 +447,10 @@ public class CrossColorBarrierAnalyzer {
         if (!level.isWall(pushTarget) && !state.hasBoxAt(pushTarget)) {
             return true; // Agent can push the box directly from this side
         }
+        // Also check if push target is an other-barrier box (will be cleared)
+        if (!level.isWall(pushTarget) && otherBarrierBoxes.contains(pushTarget)) {
+            return true;
+        }
 
         // Can't push directly. Use pull-chain BFS: simulate a series of pulls
         // to move the box away from boxPos, checking at each step whether the
@@ -439,6 +458,14 @@ public class CrossColorBarrierAnalyzer {
         // gap scenarios where the agent needs to pull the box through a 1-cell
         // passage and then walk around via a longer route.
         Position adjPos = boxPos.move(accessDir); // agent stands here to start
+        // For barrier clearing: first try with barrier-aware bypass (treats other
+        // barrier boxes as removable). If that passes, the box is extractable in
+        // the sequential clearing context.
+        if (!otherBarrierBoxes.isEmpty()) {
+            if (canPullChainExtractBarrier(boxPos, adjPos, state, level, otherBarrierBoxes)) {
+                return true;
+            }
+        }
         return canPullChainExtract(boxPos, adjPos, state, level);
     }
 
@@ -523,6 +550,15 @@ public class CrossColorBarrierAnalyzer {
      */
     private static boolean canBypassToTarget(Position startPos, Position boxPos,
                                               Position targetPos, State state, Level level) {
+        return canBypassToTarget(startPos, boxPos, targetPos, state, level, Collections.emptySet());
+    }
+
+    /**
+     * Barrier-aware bypass: otherBarrierBoxes are treated as free (they'll be cleared).
+     */
+    private static boolean canBypassToTarget(Position startPos, Position boxPos,
+                                              Position targetPos, State state, Level level,
+                                              Set<Position> otherBarrierBoxes) {
         Set<Position> visited = new HashSet<>();
         Queue<Position> bfsQueue = new LinkedList<>();
         visited.add(startPos);
@@ -538,9 +574,64 @@ public class CrossColorBarrierAnalyzer {
                 if (level.isWall(next)) continue;
                 if (next.equals(boxPos)) continue; // current box position
                 // Original boxes block, except targetPos (emptied by extraction)
-                if (state.hasBoxAt(next) && !next.equals(targetPos)) continue;
+                // and other barrier boxes (will be cleared sequentially)
+                if (state.hasBoxAt(next) && !next.equals(targetPos)
+                        && !otherBarrierBoxes.contains(next)) continue;
                 visited.add(next);
                 bfsQueue.add(next);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Barrier-aware pull-chain extraction: like canPullChainExtract but treats
+     * other barrier boxes as removable in bypass checks.
+     */
+    private static boolean canPullChainExtractBarrier(Position originalBoxPos, Position agentStartPos,
+                                                      State state, Level level,
+                                                      Set<Position> otherBarrierBoxes) {
+        final int MAX_CHAIN_DEPTH = 10;
+        Set<Long> visited = new HashSet<>();
+        Queue<long[]> queue = new LinkedList<>();
+
+        long initState = encodePullState(agentStartPos, originalBoxPos);
+        visited.add(initState);
+        queue.add(new long[]{initState, 0});
+
+        while (!queue.isEmpty()) {
+            long[] entry = queue.poll();
+            long enc = entry[0];
+            int depth = (int) entry[1];
+            if (depth >= MAX_CHAIN_DEPTH) continue;
+
+            Position agentPos = decodeAgent(enc);
+            Position boxPos = decodeBox(enc);
+
+            int dr = boxPos.row - agentPos.row;
+            int dc = boxPos.col - agentPos.col;
+            if (Math.abs(dr) + Math.abs(dc) != 1) continue;
+
+            for (Direction agentDir : Direction.values()) {
+                Position newAgentPos = agentPos.move(agentDir);
+                if (level.isWall(newAgentPos)) continue;
+                if (newAgentPos.equals(boxPos)) continue;
+                // Agent can move through other barrier boxes (they'll be cleared)
+                if (state.hasBoxAt(newAgentPos) && !newAgentPos.equals(originalBoxPos)
+                        && !otherBarrierBoxes.contains(newAgentPos)) continue;
+
+                Position newBoxPos = agentPos;
+
+                // Barrier-aware bypass check
+                if (canBypassToTarget(newAgentPos, newBoxPos, originalBoxPos, state, level, otherBarrierBoxes)) {
+                    return true;
+                }
+
+                long nextState = encodePullState(newAgentPos, newBoxPos);
+                if (!visited.contains(nextState)) {
+                    visited.add(nextState);
+                    queue.add(new long[]{nextState, depth + 1});
+                }
             }
         }
         return false;
