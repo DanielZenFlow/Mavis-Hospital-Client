@@ -178,7 +178,7 @@ all applicable (Action, State) pairs respecting walls, box colors, and physics.
 | BFS True Distance | Pre-computed BFS from each goal | Yes | Default. Respects walls |
 
 Both **ignore box-blocking** (underestimate in congested levels).
-ARCHITECTURE.md suggests adding `h_conflicts` — not yet implemented.
+`h_conflicts` partially implemented: +2 penalty per wrong-type box occupying a goal.
 
 ## Common Patterns
 
@@ -206,14 +206,17 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 ### P0 — Must Fix
 - [x] Multi-strategy fallback: PortfolioController is now default entry point.
       CBS → PP → Greedy cascade with timeout budget.
-- [ ] Weighted A* fallback: w=1.0 first, timeout → w=1.5 retry
+- [x] Weighted A* fallback: BSP Round 4 uses w=3.0 when standard A* exhausts budget.
+- [x] Portfolio CBS/JointAStar: coupling-based strategy selection.
+      High coupling(≥0.7)+≤3 agents→JointAStar; medium(≥0.4)+≤5→CBS; else PP+CBS fallback.
 
 ### P1 — Should Fix
 - [ ] Agent-level dependency analysis: map goal deps → agent deps via color/reachability,
       detect cross-agent push-route conflicts, enable independent subproblem decomposition
-- [ ] Simple deadlock pruning: reject Push into corners/edges with no exit
-      (ARCHITECTURE.md: "don't push boxes into corners")
-- [ ] Conflict-aware heuristic: h += estimated conflict resolution cost
+- [x] Simple deadlock pruning: corner detection (L-shaped walls) pruning in BSP.
+      Boxes pushed into non-goal corners are pruned (can never be extracted).
+- [x] Conflict-aware heuristic: +2 penalty per wrong-type box on goal position.
+- [x] Dynamic barrier re-detection: re-runs CrossColorBarrierAnalyzer when stuck recovery fails.
 
 ### P2 — Nice to Have
 - [ ] Parking/buffer zones for high-density levels (DECrunchy-type)
