@@ -453,6 +453,82 @@ public class BoxSearchPlanner {
     }
 
     /**
+     * Plans a box displacement with explicit unfrozen positions and custom budget.
+     * Used by cross-color barrier clearing where some satisfied goals MUST be disturbed
+     * (they are the barrier boxes themselves).
+     * 
+     * @param unfreezePositions positions that would normally be frozen but should be allowed
+     *                          to be disturbed (e.g., barrier boxes that need to be moved)
+     * @param maxStatesOverride custom search budget (barrier clearing may need more states)
+     */
+    public List<Action> planBoxDisplacementWithUnfreeze(int agentId, Position boxPos, Position targetPos,
+            char boxType, State initialState, Level level,
+            Set<Position> unfreezePositions, int maxStatesOverride) {
+
+        Character actualBox = initialState.getBoxAt(boxPos);
+        if (actualBox == null || actualBox != boxType) {
+            return null;
+        }
+
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKey, Integer> bestG = new HashMap<>();
+
+        // Build frozen goals, but EXCLUDE the unfreezePositions
+        Set<Position> frozenGoals = new HashSet<>();
+        for (Position goalPosition : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPosition);
+            char currentBox = initialState.getBoxAt(goalPosition);
+            if (currentBox == goalType) {
+                frozenGoals.add(goalPosition);
+            }
+        }
+        frozenGoals.remove(targetPos);
+        frozenGoals.remove(boxPos);
+        if (unfreezePositions != null) {
+            frozenGoals.removeAll(unfreezePositions);
+        }
+
+        int h = getDistance(boxPos, targetPos, level);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxPos);
+        StateKey startKey = new StateKey(initialState, agentId, boxPos, boxType);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        int exploredCount = 0;
+
+        while (!openList.isEmpty() && exploredCount < maxStatesOverride) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            Position currentBoxPos = findBoxPosition(current.state, boxType, current.targetBoxPos);
+            if (currentBoxPos != null && currentBoxPos.equals(targetPos)) {
+                return reconstructPath(current);
+            }
+
+            for (Action action : PlanningUtils.getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) continue;
+                if (!current.state.isApplicable(action, agentId, level)) continue;
+                if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
+
+                State newState = current.state.apply(action, agentId);
+                Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
+                int newG = current.g + 1;
+
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) continue;
+                bestG.put(newKey, newG);
+
+                int newH = (newTargetBoxPos != null) ? getDistance(newTargetBoxPos, targetPos, level) : 0;
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos);
+                openList.add(newNode);
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Computes heuristic for subgoal.
      */
     public int computeSubgoalHeuristic(State state, Position goalPos, char boxType, Level level) {

@@ -3,6 +3,7 @@ package mapf.planning.strategy;
 import mapf.domain.*;
 import mapf.planning.SearchConfig;
 import mapf.planning.SearchStrategy;
+import mapf.planning.analysis.CrossColorBarrierAnalyzer;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.cbs.CBSStrategy;
@@ -244,6 +245,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // MAPF FIX: Compute subgoal order ONCE at start, then reuse
         cachedSubgoalOrder = null;
 
+        // Cross-color barrier clearing: detect if any agent is blocked from its goals
+        // by boxes of a different color, and pre-clear a path before the main loop.
+        currentState = detectAndExecuteClearingPhase(
+                currentState, initialState, level, fullPlan, numAgents, startTime);
+
         while (!currentState.isGoalState(level)) {
             // PRODUCT.md constraints: 3 minutes, 20,000 actions
             if (System.currentTimeMillis() - startTime > timeoutMs) {
@@ -318,7 +324,182 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         logMinimal(getName() + ": [FAIL] Could not reach goal state, no partial plan available");
         return null;
     }
-    
+
+    // ==================== Cross-Color Barrier Clearing ====================
+
+    /**
+     * Pre-pass: detects cross-color barriers and clears them before the main PP loop.
+     * 
+     * In pull-supporting Sokoban, a single agent can move any same-color box through
+     * arbitrarily narrow corridors using pull chains. When an agent is blocked by
+     * OTHER-color boxes, we identify the minimum set of boxes to clear, assign
+     * a same-color agent to clear each one via planBoxDisplacement, and execute.
+     * 
+     * After clearing, the displaced box-goals become unsatisfied. The normal PP loop
+     * will generate return subgoals automatically (cyan agents push A-boxes back).
+     * 
+     * @return updated state after clearing (or original state if no barriers)
+     */
+    private State detectAndExecuteClearingPhase(State currentState, State initialState,
+                                                  Level level, List<Action[]> fullPlan,
+                                                  int numAgents, long startTime) {
+        // Only analyze barriers if there are multiple colors of boxes
+        if (level.getNumAgents() < 2) return currentState;
+
+        // Build a minimal subgoal list for barrier analysis
+        List<Subgoal> checkSubgoals = subgoalManager.getUnsatisfiedSubgoals(currentState, level, completedBoxGoals);
+        if (checkSubgoals.isEmpty()) return currentState;
+
+        List<CrossColorBarrierAnalyzer.Barrier> barriers =
+                CrossColorBarrierAnalyzer.analyzeBarriers(currentState, level, checkSubgoals);
+
+        if (barriers.isEmpty()) return currentState;
+
+        logMinimal("[PP] Cross-color barriers detected: " + barriers.size());
+
+        for (CrossColorBarrierAnalyzer.Barrier barrier : barriers) {
+            if (System.currentTimeMillis() - startTime > timeoutMs / 2) {
+                logNormal("[PP] Clearing phase timeout — skipping remaining barriers");
+                break;
+            }
+
+            logMinimal("[PP] Clearing barrier for agent " + barrier.blockedAgentId
+                    + ": " + barrier.clearingOrder.size() + " " + barrier.blockingBoxType
+                    + "-boxes to clear");
+
+            // Find clearing agent (agent of the blocking color)
+            int clearingAgent = CrossColorBarrierAnalyzer.findClearingAgent(
+                    barrier.blockingColor, barrier.clearingOrder.get(0), currentState, level);
+            if (clearingAgent < 0) {
+                logNormal("[PP] No agent of color " + barrier.blockingColor + " found — skipping");
+                continue;
+            }
+
+            // Find parking positions for the cleared boxes
+            Set<Position> agentReachable = bfsReachableForClearing(
+                    currentState.getAgentPosition(clearingAgent), currentState, level);
+
+            // PRE-CHECK: Verify the first barrier box is physically extractable.
+            // If the closest box (accessible side of barrier) can't be moved,
+            // deeper boxes are certainly stuck too — skip entire barrier.
+            Position firstBox = barrier.clearingOrder.get(0);
+            if (!CrossColorBarrierAnalyzer.isBoxExtractable(firstBox, agentReachable, currentState, level)) {
+                logNormal("[PP] First barrier box " + firstBox + " is not extractable "
+                        + "(dead-end corridor, no bypass) — skipping barrier");
+                continue;
+            }
+
+            Set<Position> avoidPositions = new HashSet<>(barrier.clearingOrder);
+            // Also avoid the paths used by the barrier
+            List<Position> parking = CrossColorBarrierAnalyzer.findParkingPositions(
+                    barrier.clearingOrder.size(), agentReachable, currentState, level, avoidPositions);
+
+            if (parking.size() < barrier.clearingOrder.size()) {
+                logNormal("[PP] Not enough parking (" + parking.size() + "/" 
+                        + barrier.clearingOrder.size() + ") — attempting partial clear");
+            }
+
+            // Build the full set of barrier positions to unfreeze.
+            // BSP needs permission to disturb these positions since the boxes on them
+            // are the barrier itself (normally frozen because they're on satisfied goals).
+            Set<Position> unfreezePositions = new HashSet<>(barrier.clearingOrder);
+
+            int cleared = 0;
+            boolean earlyExit = false;
+            for (int i = 0; i < barrier.clearingOrder.size() && i < parking.size(); i++) {
+                Position boxPos = barrier.clearingOrder.get(i);
+                Position parkPos = parking.get(i);
+
+                // Verify box is still at the expected position
+                Character boxAtPos = currentState.getBoxes().get(boxPos);
+                if (boxAtPos == null || boxAtPos != barrier.blockingBoxType) {
+                    logVerbose("[PP] [CLEAR-BARRIER] Box at " + boxPos + " changed — skipping");
+                    continue;
+                }
+
+                // Check extractability for each box (reachability changes as boxes are cleared)
+                Set<Position> updatedReachable = bfsReachableForClearing(
+                        currentState.getAgentPosition(clearingAgent), currentState, level);
+                if (!CrossColorBarrierAnalyzer.isBoxExtractable(boxPos, updatedReachable, currentState, level)) {
+                    logNormal("[PP] [CLEAR-BARRIER] Box " + boxPos + " not extractable — stopping");
+                    break;
+                }
+
+                logNormal("[PP] [CLEAR-BARRIER] Moving " + barrier.blockingBoxType + " from "
+                        + boxPos + " to " + parkPos + " (agent " + clearingAgent + ")");
+
+                // Use moderate BSP budget — extractable boxes should be found quickly
+                int clearingBudget = SearchConfig.MIN_BSP_BUDGET * 2;
+                List<Action> displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
+                        clearingAgent, boxPos, parkPos, barrier.blockingBoxType,
+                        currentState, level, unfreezePositions, clearingBudget);
+
+                if (displacePath == null || displacePath.isEmpty()) {
+                    logNormal("[PP] [CLEAR-BARRIER] BSP failed for " + boxPos + " -> " + parkPos);
+                    // First box failure → deeper boxes are certainly harder. Abort this barrier.
+                    if (cleared == 0) {
+                        logNormal("[PP] [CLEAR-BARRIER] First box failed — aborting barrier");
+                        earlyExit = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                // Execute the displacement path
+                for (Action action : displacePath) {
+                    Action[] jointAction = planMerger.createJointActionWithMerging(
+                            clearingAgent, action, currentState, level, numAgents,
+                            false, completedBoxGoals);
+                    jointAction = conflictResolver.resolveConflicts(
+                            jointAction, currentState, level, clearingAgent);
+                    fullPlan.add(jointAction);
+                    currentState = applyJointAction(jointAction, currentState, level, numAgents);
+                    globalTimeStep++;
+                }
+
+                // Track the displaced goal position
+                char goalType = level.getBoxGoal(boxPos);
+                if (goalType != '\0') {
+                    displacedGoals.add(boxPos);
+                }
+
+                cleared++;
+                logNormal("[PP] [CLEAR-BARRIER] Cleared " + barrier.blockingBoxType + " from "
+                        + boxPos + " in " + displacePath.size() + " steps (total cleared: " + cleared + ")");
+            }
+
+            if (cleared > 0) {
+                logMinimal("[PP] Barrier clearing: " + cleared + "/" + barrier.clearingOrder.size()
+                        + " boxes cleared in " + fullPlan.size() + " steps");
+            }
+        }
+
+        return currentState;
+    }
+
+    /**
+     * BFS reachability for clearing agent (treats all boxes as obstacles).
+     */
+    private Set<Position> bfsReachableForClearing(Position start, State state, Level level) {
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(start);
+        visited.add(start);
+
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (state.hasBoxAt(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return visited;
+    }
+
     /**
      * MAPF FIX: Validates plan correctness and removes redundant actions.
      * 
