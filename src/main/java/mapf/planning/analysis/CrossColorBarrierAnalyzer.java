@@ -656,22 +656,29 @@ public class CrossColorBarrierAnalyzer {
      */
     public static int findClearingAgent(Color blockingColor, Position firstBoxPos,
                                          State state, Level level) {
-        int bestAgent = -1;
-        int bestDist = Integer.MAX_VALUE;
+        List<int[]> agents = findAllClearingAgents(blockingColor, firstBoxPos, state, level);
+        return agents.isEmpty() ? -1 : agents.get(0)[0];
+    }
 
+    /**
+     * Finds ALL agents of the matching color that could clear barrier boxes,
+     * sorted by BFS distance to the first barrier box (closest first).
+     *
+     * @return list of [agentId, distance] pairs, sorted by distance ascending
+     */
+    public static List<int[]> findAllClearingAgents(Color blockingColor, Position firstBoxPos,
+                                                      State state, Level level) {
+        List<int[]> agents = new ArrayList<>();
         for (int i = 0; i < state.getNumAgents(); i++) {
             if (level.getAgentColor(i) != blockingColor) continue;
             Position agentPos = state.getAgentPosition(i);
-
-            // BFS distance from agent to adjacent cells of the first box
-            // (agent needs to be adjacent to pull/push)
             int dist = bfsDistance(agentPos, firstBoxPos, state, level);
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestAgent = i;
+            if (dist < Integer.MAX_VALUE) {
+                agents.add(new int[]{i, dist});
             }
         }
-        return bestAgent;
+        agents.sort((a, b) -> Integer.compare(a[1], b[1]));
+        return agents;
     }
 
     /**

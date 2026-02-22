@@ -450,24 +450,31 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
-            // Find clearing agent FIRST — needed for per-agent permanent failure check
-            int clearingAgent = CrossColorBarrierAnalyzer.findClearingAgent(
+            // Find clearing agent: try all eligible agents in distance order.
+            // If the closest agent is permanently cached as failed, try the next.
+            List<int[]> allClearingAgents = CrossColorBarrierAnalyzer.findAllClearingAgents(
                     barrier.blockingColor, barrier.clearingOrder.get(0), currentState, level);
-            if (clearingAgent < 0) {
+            if (allClearingAgents.isEmpty()) {
                 logNormal("[PP] No agent of color " + barrier.blockingColor + " found — skipping");
                 continue;
             }
 
-            // Per-agent permanent failure check: skip if THIS agent already failed
-            // on a barrier containing these positions. A different agent may succeed
-            // via a different approach route.
             Set<Position> barrierPositionSet = new HashSet<>(barrier.clearingOrder);
-            Set<Set<Position>> agentFailures = permanentlyFailedBarriers.getOrDefault(
-                    clearingAgent, Collections.emptySet());
-            boolean isPermanentlyFailed = agentFailures.stream()
-                    .anyMatch(cached -> cached.containsAll(barrierPositionSet));
-            if (isPermanentlyFailed) {
-                logNormal("[PP] Barrier permanently failed for agent " + clearingAgent + " — skipping");
+            int clearingAgent = -1;
+            for (int[] agentEntry : allClearingAgents) {
+                int candidateAgent = agentEntry[0];
+                Set<Set<Position>> agentFailures = permanentlyFailedBarriers.getOrDefault(
+                        candidateAgent, Collections.emptySet());
+                boolean isPermanentlyFailed = agentFailures.stream()
+                        .anyMatch(cached -> cached.containsAll(barrierPositionSet));
+                if (!isPermanentlyFailed) {
+                    clearingAgent = candidateAgent;
+                    break;
+                }
+                logVerbose("[PP] Agent " + candidateAgent + " permanently failed for this barrier — trying next");
+            }
+            if (clearingAgent < 0) {
+                logNormal("[PP] All agents permanently failed for this barrier — skipping");
                 continue;
             }
 
@@ -559,9 +566,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // is a critical corridor. Boxes parked here block BSP routing and trap
             // the clearing agent. The approach path structure is:
             //   path = [..., gapExitCell, gapCell, firstBarrierBox]
-            // gapCell (path[-2]) is usually in the wall row with no other free cells;
-            // gapExitCell (path[-3]) is on the agent side — its ENTIRE row must be
-            // protected to keep the corridor clear for subsequent box extractions.
+            // Protect the entire continuous segment of the gap exit row.
+            // Pre-assignment ensures connectivity elsewhere; this protection prevents
+            // BSP collateral damage from blocking the approach corridor.
             if (approachPath.size() >= 3) {
                 Position gapExitCell = approachPath.get(approachPath.size() - 3);
                 int gapExitRow = gapExitCell.row;
@@ -594,8 +601,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 skippedBarrierClearingOrders.add(barrier.clearingOrder);
                 continue;
             }
+            // Request a large candidate pool for pre-assignment backtracking
             List<Position> allParking = CrossColorBarrierAnalyzer.findParkingPositions(
-                    barrier.clearingOrder.size(), agentReachable, currentState, level,
+                    Math.max(barrier.clearingOrder.size() * 3, 20), agentReachable, currentState, level,
                     baseAvoidPositions, firstBox);
             if (allParking.size() < barrier.clearingOrder.size()) {
                 logNormal("[PP] [CLEAR-BARRIER] Insufficient parking (" + allParking.size()
@@ -604,12 +612,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
+            // FULL-HORIZON PRE-ASSIGNMENT: Assign parking for ALL barrier boxes
+            // before clearing any. Uses greedy + backtracking to ensure agent
+            // maintains connectivity to the gap at every intermediate step.
+            // This prevents the "self-trapping" failure where per-box greedy
+            // parking fills narrow corridors and cuts off the return path.
+            List<Position> preAssignedSlots = preAssignParkingSlots(
+                    barrier.clearingOrder, allParking, currentState, level);
+            int maxSafeClears = preAssignedSlots.size();
+            if (maxSafeClears == 0) {
+                logNormal("[PP] [CLEAR-BARRIER] Pre-assignment found no safe parking — skipping barrier");
+                skippedBarrierClearingOrders.add(barrier.clearingOrder);
+                continue;
+            }
+            if (maxSafeClears < barrier.clearingOrder.size()) {
+                logNormal("[PP] [CLEAR-BARRIER] Pre-assignment: max " + maxSafeClears
+                        + "/" + barrier.clearingOrder.size() + " boxes safely clearable");
+            } else {
+                logNormal("[PP] [CLEAR-BARRIER] Pre-assignment: all " + maxSafeClears
+                        + " boxes have safe parking slots");
+            }
+
             // Track parking positions used so far — avoid them for subsequent boxes
             Set<Position> usedParkings = new HashSet<>();
 
             int cleared = 0;
             boolean earlyExit = false;
-            for (int i = 0; i < barrier.clearingOrder.size(); i++) {
+            for (int i = 0; i < Math.min(barrier.clearingOrder.size(), maxSafeClears); i++) {
                 Position boxPos = barrier.clearingOrder.get(i);
 
                 // Verify box is still at the expected position
@@ -649,47 +678,38 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     }
                 }
 
-                // Compute parking INCREMENTALLY: avoid previously used parkings
-                // so they don't block the pull-chain for subsequent boxes.
-                Set<Position> avoidPositions = new HashSet<>(baseAvoidPositions);
-                avoidPositions.addAll(usedParkings);
-                // Request multiple candidates for connectivity-aware selection
-                List<Position> parkingCandidates = CrossColorBarrierAnalyzer.findParkingPositions(
-                        Math.max(5, barrier.clearingOrder.size()), updatedReachable, currentState, level, avoidPositions, boxPos);
+                // Use pre-assigned parking slot (computed by full-horizon pre-assignment)
+                Position parkPos = preAssignedSlots.get(i);
 
-                if (parkingCandidates.isEmpty()) {
-                    logNormal("[PP] [CLEAR-BARRIER] No parking for " + boxPos + " — stopping");
-                    break;
-                }
-                
-                // CONNECTIVITY-AWARE PARKING SELECTION: For each candidate, check
-                // that after parking the box there, the agent can still reach the gap
-                // (and thus the next barrier box). Without this check, parking fills
-                // the corridor between gap and agent, cutting off the return path.
-                Position parkPos = null;
-                Position nextBarrierBox = (i + 1 < barrier.clearingOrder.size()) 
-                        ? barrier.clearingOrder.get(i + 1) : null;
-                for (Position candidate : parkingCandidates) {
-                    if (nextBarrierBox == null) {
-                        // Last box — any parking is fine
-                        parkPos = candidate;
+                // Dynamic verification: if state diverged (BSP collateral, conflict resolution),
+                // the pre-assigned slot may no longer be free. Fall back to per-box selection.
+                if (currentState.hasBoxAt(parkPos)) {
+                    logNormal("[PP] [CLEAR-BARRIER] Pre-assigned slot " + parkPos
+                            + " is now occupied — falling back to per-box selection");
+                    Set<Position> avoidPositions = new HashSet<>(baseAvoidPositions);
+                    avoidPositions.addAll(usedParkings);
+                    List<Position> fallbackCandidates = CrossColorBarrierAnalyzer.findParkingPositions(
+                            Math.max(5, barrier.clearingOrder.size()), updatedReachable, currentState, level,
+                            avoidPositions, boxPos);
+                    parkPos = null;
+                    Position nextBarrierBox = (i + 1 < maxSafeClears)
+                            ? barrier.clearingOrder.get(i + 1) : null;
+                    for (Position candidate : fallbackCandidates) {
+                        if (nextBarrierBox == null) {
+                            parkPos = candidate;
+                            break;
+                        }
+                        boolean gapOk = isGapStillAccessible(candidate, boxPos, usedParkings,
+                                barrier.clearingOrder, i, currentState, level);
+                        if (gapOk) {
+                            parkPos = candidate;
+                            break;
+                        }
+                    }
+                    if (parkPos == null) {
+                        logNormal("[PP] [CLEAR-BARRIER] No fallback parking for " + boxPos + " — stopping");
                         break;
                     }
-                    // Simulate: box removed from boxPos, box placed at candidate
-                    // Check if gap is still reachable from some cell adjacent to candidate
-                    boolean gapOk = isGapStillAccessible(candidate, boxPos, usedParkings, 
-                            barrier.clearingOrder, i, currentState, level);
-                    logVerbose("[PP] [CLEAR-BARRIER] Candidate " + candidate 
-                            + " connectivity=" + gapOk + " (next=" + nextBarrierBox + ")");
-                    if (gapOk) {
-                        parkPos = candidate;
-                        break;
-                    }
-                }
-                if (parkPos == null) {
-                    // Fallback: use best candidate anyway (might work via alternative routes)
-                    parkPos = parkingCandidates.get(0);
-                    logNormal("[PP] [CLEAR-BARRIER] No connectivity-safe parking found, using fallback: " + parkPos);
                 }
 
                 logNormal("[PP] [CLEAR-BARRIER] Moving " + barrier.blockingBoxType + " from "
@@ -819,17 +839,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         + " boxes cleared in " + fullPlan.size() + " steps");
             }
             
-            // If agent couldn't reach deeper boxes, permanently cache this barrier
-            // FOR THIS SPECIFIC AGENT. A different agent may approach from a different
-            // direction and succeed where this one failed.
-            if (earlyExit && cleared > 0 && cleared < barrier.clearingOrder.size()) {
+            // If we couldn't clear all barrier boxes (either pre-assignment limited us
+            // or agent got stuck), mark this barrier for this agent so a different
+            // agent can attempt the remainder.
+            if ((earlyExit || cleared < barrier.clearingOrder.size()) && cleared > 0) {
                 List<Position> remaining = barrier.clearingOrder.subList(cleared, barrier.clearingOrder.size());
                 skippedBarrierClearingOrders.add(new ArrayList<>(remaining));
                 permanentlyFailedBarriers
                         .computeIfAbsent(clearingAgent, k -> new HashSet<>())
                         .add(new HashSet<>(barrier.clearingOrder));
                 logNormal("[PP] [CLEAR-BARRIER] Permanently caching barrier for agent " + clearingAgent
-                        + " (" + barrier.clearingOrder.size() + " positions) — structural failure after " + cleared + " clears");
+                        + " (" + barrier.clearingOrder.size() + " positions) — "
+                        + (maxSafeClears < barrier.clearingOrder.size() 
+                            ? "pre-assignment limited to " + maxSafeClears 
+                            : "structural failure")
+                        + " after " + cleared + " clears");
             }
         }
 
@@ -934,6 +958,166 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         return false; // Agent can't reach next barrier box from parking area
     }
+
+    /**
+     * Pre-assigns parking positions for ALL barrier boxes using greedy search with
+     * backtracking. At each step, verifies that after placement, the agent can still
+     * reach the next barrier box through the gap.
+     *
+     * This prevents the "self-trapping" failure mode where greedy per-box parking
+     * fills narrow corridors, cutting off the agent's return path to the gap.
+     *
+     * @param clearingOrder barrier boxes in clearing order
+     * @param candidates    sorted list of ALL parking candidate positions
+     * @param currentState  current game state
+     * @param level         level definition
+     * @return list of parking assignments (may be shorter than clearingOrder if no full assignment exists)
+     */
+    private List<Position> preAssignParkingSlots(
+            List<Position> clearingOrder,
+            List<Position> candidates,
+            State currentState,
+            Level level) {
+
+        // Build obstacle set from current box positions
+        Set<Position> obstacles = new HashSet<>();
+        for (Position boxPos : currentState.getBoxes().keySet()) {
+            obstacles.add(boxPos);
+        }
+
+        // Try full assignment first
+        List<Position> assignment = new ArrayList<>();
+        if (doPreAssignRecursive(0, clearingOrder, candidates, assignment, obstacles, level)) {
+            return assignment; // Full assignment found
+        }
+
+        // Full assignment failed — find maximum feasible prefix
+        // Try decreasing sizes until one works
+        for (int maxBoxes = clearingOrder.size() - 1; maxBoxes >= 1; maxBoxes--) {
+            assignment.clear();
+            // Reset obstacles for each attempt
+            Set<Position> resetObstacles = new HashSet<>();
+            for (Position boxPos : currentState.getBoxes().keySet()) {
+                resetObstacles.add(boxPos);
+            }
+            List<Position> subOrder = clearingOrder.subList(0, maxBoxes);
+            if (doPreAssignRecursive(0, subOrder, candidates, assignment, resetObstacles, level)) {
+                logNormal("[PP] [CLEAR-BARRIER] Pre-assignment: safely clearing " + maxBoxes
+                        + "/" + clearingOrder.size() + " boxes");
+                return assignment;
+            }
+        }
+
+        return Collections.emptyList(); // Can't even clear 1 box safely
+    }
+
+    /**
+     * Recursive greedy search with backtracking for parking slot pre-assignment.
+     * For each box in clearingOrder, tries candidates in order; for each candidate,
+     * simulates placement and checks connectivity to the next barrier box.
+     * Backtracks when a candidate breaks future connectivity.
+     *
+     * @param idx          current box index in clearingOrder
+     * @param clearingOrder barrier boxes to clear
+     * @param candidates   all parking candidate positions (sorted)
+     * @param assigned     accumulator: assigned parking positions so far
+     * @param obstacles    simulated obstacle set (mutated in-place, restored on backtrack)
+     * @param level        level definition
+     * @return true if all remaining boxes can be assigned valid parking
+     */
+    private boolean doPreAssignRecursive(
+            int idx, List<Position> clearingOrder, List<Position> candidates,
+            List<Position> assigned, Set<Position> obstacles, Level level) {
+
+        if (idx >= clearingOrder.size()) return true; // All boxes assigned
+
+        Position boxPos = clearingOrder.get(idx);
+
+        for (Position candidate : candidates) {
+            // Skip if already occupied or assigned to an earlier box
+            if (obstacles.contains(candidate)) continue;
+            if (assigned.contains(candidate)) continue;
+
+            // Simulate: box moves from boxPos to candidate
+            obstacles.remove(boxPos);
+            obstacles.add(candidate);
+
+            // Connectivity check: can agent reach the next barrier box?
+            boolean connected;
+            if (idx + 1 < clearingOrder.size()) {
+                connected = bfsConnectedAfterParking(
+                        candidate, clearingOrder.get(idx + 1),
+                        obstacles, clearingOrder, idx, level);
+            } else {
+                connected = true; // Last box — no connectivity requirement
+            }
+
+            if (connected) {
+                assigned.add(candidate);
+                if (doPreAssignRecursive(idx + 1, clearingOrder, candidates,
+                        assigned, obstacles, level)) {
+                    return true;
+                }
+                assigned.remove(assigned.size() - 1);
+            }
+
+            // Undo simulation
+            obstacles.add(boxPos);
+            obstacles.remove(candidate);
+        }
+
+        return false;
+    }
+
+    /**
+     * BFS connectivity check for parking pre-assignment.
+     * After hypothetically parking a box at candidatePos (removed from boxPos),
+     * checks if the agent (assumed adjacent to candidatePos) can reach any cell
+     * adjacent to nextBox.
+     *
+     * Future barrier boxes (beyond current index) are treated as removable
+     * (they will be cleared in later steps).
+     */
+    private boolean bfsConnectedAfterParking(
+            Position candidatePos, Position nextBox,
+            Set<Position> obstacles, List<Position> clearingOrder,
+            int currentIdx, Level level) {
+
+        // Build effective obstacles: current obstacles minus future barrier boxes
+        Set<Position> effectiveObstacles = new HashSet<>(obstacles);
+        for (int j = currentIdx + 1; j < clearingOrder.size(); j++) {
+            effectiveObstacles.remove(clearingOrder.get(j));
+        }
+
+        // BFS from cells adjacent to candidatePos (where agent would be after parking)
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        for (Direction dir : Direction.values()) {
+            Position adj = candidatePos.move(dir);
+            if (!level.isWall(adj) && !effectiveObstacles.contains(adj)) {
+                visited.add(adj);
+                queue.add(adj);
+            }
+        }
+
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            // Check if we can reach any cell adjacent to nextBox
+            for (Direction dir : Direction.values()) {
+                if (current.move(dir).equals(nextBox)) return true;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (effectiveObstacles.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return false;
+    }
+
     private List<Position> computeApproachPath(Position start, Position targetBox,
                                                 State state, Level level) {
         Map<Position, Position> parent = new HashMap<>();
