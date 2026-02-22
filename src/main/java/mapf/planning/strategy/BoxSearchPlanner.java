@@ -117,7 +117,7 @@ public class BoxSearchPlanner {
 
                 State newState = current.state.apply(action, agentId);
 
-                Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 
                 // Corner deadlock pruning: if the target box was pushed/pulled into
                 // a corner (2 adjacent walls forming an L) and it's NOT the goal,
@@ -208,7 +208,7 @@ public class BoxSearchPlanner {
                     }
                     newState = current.state.apply(action, agentId);
                     newAgentPos = newState.getAgentPosition(agentId);
-                    newBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                    newBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 }
 
                 // Space-Time collision check: is agent's next position reserved?
@@ -453,7 +453,7 @@ public class BoxSearchPlanner {
 
                 State newState = current.state.apply(action, agentId);
 
-                Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int newG = current.g + 1;
 
@@ -532,7 +532,7 @@ public class BoxSearchPlanner {
                 if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
 
                 State newState = current.state.apply(action, agentId);
-                Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int newG = current.g + 1;
 
@@ -650,6 +650,43 @@ public class BoxSearchPlanner {
         }
 
         return null;
+    }
+
+    /**
+     * Computes the new position of the target box after an action, using
+     * deterministic action semantics instead of fuzzy adjacent-cell search.
+     * This avoids misidentifying same-type boxes in nearby cells.
+     *
+     * @param action          the action being applied
+     * @param agentId         the agent performing the action
+     * @param stateBefore     state BEFORE the action
+     * @param currentBoxPos   current tracked position of the target box
+     * @return new position of the target box after the action
+     */
+    private Position computeNewBoxPosition(Action action, int agentId,
+                                            State stateBefore, Position currentBoxPos) {
+        Position agentPos = stateBefore.getAgentPosition(agentId);
+
+        switch (action.type) {
+            case PUSH: {
+                // Push: box at agentPos.move(agentDir) moves in boxDir
+                Position boxOldPos = agentPos.move(action.agentDir);
+                if (boxOldPos.equals(currentBoxPos)) {
+                    return currentBoxPos.move(action.boxDir);
+                }
+                return currentBoxPos;
+            }
+            case PULL: {
+                // Pull: box at agentPos.move(boxDir.opposite()) slides to agentPos
+                Position boxOldPos = agentPos.move(action.boxDir.opposite());
+                if (boxOldPos.equals(currentBoxPos)) {
+                    return agentPos; // box goes to agent's vacated position
+                }
+                return currentBoxPos;
+            }
+            default:
+                return currentBoxPos; // Move/NoOp: box stays put
+        }
     }
 
     private Position findBoxPosition(State state, char boxType, Position hint) {

@@ -323,6 +323,27 @@ public class CrossColorBarrierAnalyzer {
                                                        Set<Position> accessibleArea,
                                                        State state, Level level,
                                                        Set<Position> avoidPositions) {
+        return findParkingPositions(numPositions, accessibleArea, state, level, avoidPositions, null);
+    }
+
+    /**
+     * Finds temporary parking positions for cleared boxes.
+     * When a reference position is given, sorts by proximity to it (so BSP
+     * has a shorter box displacement path). Falls back to free-neighbor count.
+     *
+     * @param numPositions   how many parking spots needed
+     * @param accessibleArea positions reachable by the clearing agent
+     * @param state          current state
+     * @param level          level definition
+     * @param avoidPositions positions to avoid (e.g., goals, barrier boxes)
+     * @param referencePos   optional reference position for proximity sorting
+     * @return list of parking positions
+     */
+    public static List<Position> findParkingPositions(int numPositions,
+                                                       Set<Position> accessibleArea,
+                                                       State state, Level level,
+                                                       Set<Position> avoidPositions,
+                                                       Position referencePos) {
         List<Position> parking = new ArrayList<>();
 
         // Score positions: prefer ones far from goals and congestion
@@ -339,9 +360,19 @@ public class CrossColorBarrierAnalyzer {
             candidates.add(pos);
         }
 
-        // Sort by distance from the barrier area (prefer peripheral positions)
-        // Simple heuristic: prefer cells with more free neighbors (less congested)
+        // Sort: moderate distance from reference — far enough to not block approach
+        // corridor, close enough for BSP to find a displacement path.
+        // Filter out positions within Manhattan 3 of reference (too close to gap).
+        final Position sortRef = referencePos;
+        if (sortRef != null) {
+            candidates.removeIf(pos -> pos.manhattanDistance(sortRef) < 4);
+        }
         candidates.sort((a, b) -> {
+            if (sortRef != null) {
+                int distA = a.manhattanDistance(sortRef);
+                int distB = b.manhattanDistance(sortRef);
+                if (distA != distB) return Integer.compare(distA, distB); // closer (but ≥4) first
+            }
             int freeA = countFreeNeighbors(a, state, level);
             int freeB = countFreeNeighbors(b, state, level);
             return Integer.compare(freeB, freeA); // more free neighbors = better
@@ -396,58 +427,136 @@ public class CrossColorBarrierAnalyzer {
         if (accessibleDirs.size() >= 2) return true; // Can push from one side to another
 
         // Single accessible direction: check if the agent can PUSH directly.
-        // Push: agent at adjPos pushes box toward the opposite side.
-        // If the opposite side is free, push is trivially possible.
         Direction accessDir = accessibleDirs.get(0);
-        Position pushTarget = boxPos.move(accessDir.opposite()); // opposite side of box
+        Position pushTarget = boxPos.move(accessDir.opposite());
         if (!level.isWall(pushTarget) && !state.hasBoxAt(pushTarget)) {
             return true; // Agent can push the box directly from this side
         }
 
-        // Can't push directly. Check if a PULL + bypass is feasible.
-        // After pulling: box moves to adjPos (agent's cell), agent moves one further.
-        // Agent must be able to reach the original boxPos via bypass to continue.
-        Position adjPos = boxPos.move(accessDir);       // box goes here after pull
-        Position agentAfter = adjPos.move(accessDir);   // agent ends up here after pull
+        // Can't push directly. Use pull-chain BFS: simulate a series of pulls
+        // to move the box away from boxPos, checking at each step whether the
+        // agent can bypass the box and return to boxPos. This handles narrow
+        // gap scenarios where the agent needs to pull the box through a 1-cell
+        // passage and then walk around via a longer route.
+        Position adjPos = boxPos.move(accessDir); // agent stands here to start
+        return canPullChainExtract(boxPos, adjPos, state, level);
+    }
 
-        // Can the agent actually complete the pull? (agentAfter must be free)
-        if (level.isWall(agentAfter) || state.hasBoxAt(agentAfter)) {
-            // Check other pull directions from adjPos
-            boolean canPull = false;
-            for (Direction d : Direction.values()) {
-                Position altAgent = adjPos.move(d);
-                if (d.opposite() == accessDir.opposite()) continue; // same as going toward box
-                if (!level.isWall(altAgent) && !state.hasBoxAt(altAgent) && !altAgent.equals(boxPos)) {
-                    agentAfter = altAgent;
-                    canPull = true;
-                    break;
-                }
-            }
-            if (!canPull) return false;
-        }
+    /**
+     * BFS in (agentPos, boxPos) state space to check whether a pull-chain can
+     * extract the box from its position through a narrow gap.
+     *
+     * Starting state: agent adjacent to box (at agentStartPos). Each BFS step
+     * is a valid Pull action: agent moves in some direction, box (which must be
+     * adjacent) slides into the agent's vacated cell. After each pull we run a
+     * bypass BFS to check whether the agent can walk back to originalBoxPos
+     * (now empty) without passing through the box.
+     *
+     * Bounded by MAX_CHAIN_DEPTH to keep the check fast.
+     *
+     * @param originalBoxPos where the box currently sits
+     * @param agentStartPos  where the clearing agent stands (adjacent to box)
+     * @param state          current world state (for wall/box checks)
+     * @param level          level definition
+     * @return true if a feasible pull-chain extraction exists
+     */
+    private static boolean canPullChainExtract(Position originalBoxPos, Position agentStartPos,
+                                                State state, Level level) {
+        final int MAX_CHAIN_DEPTH = 10;
 
-        // After pull: box at adjPos, agent at agentAfter, boxPos is now free.
-        // BFS from agentAfter: can agent reach boxPos without going through adjPos?
-        Set<Position> bypass = new HashSet<>();
-        Queue<Position> queue = new LinkedList<>();
-        bypass.add(agentAfter);
-        queue.add(agentAfter);
+        // Encode (agentPos, boxPos) as a single long for fast hashing
+        // Position row/col fit in 8 bits each (max grid 50×50)
+        Set<Long> visited = new HashSet<>();
+        Queue<long[]> queue = new LinkedList<>(); // [encoded state, depth]
+
+        long initState = encodePullState(agentStartPos, originalBoxPos);
+        visited.add(initState);
+        queue.add(new long[]{initState, 0});
 
         while (!queue.isEmpty()) {
-            Position current = queue.poll();
-            for (Direction dir : Direction.values()) {
-                Position next = current.move(dir);
-                if (bypass.contains(next)) continue;
-                if (level.isWall(next)) continue;
-                if (next.equals(adjPos)) continue;  // box is here, can't pass
-                // Other boxes still block EXCEPT boxPos which is now empty
-                if (state.hasBoxAt(next) && !next.equals(boxPos)) continue;
-                bypass.add(next);
-                queue.add(next);
+            long[] entry = queue.poll();
+            long enc = entry[0];
+            int depth = (int) entry[1];
+            if (depth >= MAX_CHAIN_DEPTH) continue;
+
+            Position agentPos = decodeAgent(enc);
+            Position boxPos = decodeBox(enc);
+
+            // Box must be adjacent to agent for a Pull
+            int dr = boxPos.row - agentPos.row;
+            int dc = boxPos.col - agentPos.col;
+            if (Math.abs(dr) + Math.abs(dc) != 1) continue;
+
+            // Try all 4 agent movement directions (Pull action)
+            for (Direction agentDir : Direction.values()) {
+                Position newAgentPos = agentPos.move(agentDir);
+
+                // Agent destination must be free
+                if (level.isWall(newAgentPos)) continue;
+                if (newAgentPos.equals(boxPos)) continue;
+                if (state.hasBoxAt(newAgentPos) && !newAgentPos.equals(originalBoxPos)) continue;
+
+                // After Pull: box slides into agent's vacated cell
+                Position newBoxPos = agentPos; // box moves to where agent was
+
+                // Check bypass: can agent at newAgentPos reach originalBoxPos
+                // without passing through newBoxPos (the box)?
+                if (canBypassToTarget(newAgentPos, newBoxPos, originalBoxPos, state, level)) {
+                    return true;
+                }
+
+                long nextState = encodePullState(newAgentPos, newBoxPos);
+                if (!visited.contains(nextState)) {
+                    visited.add(nextState);
+                    queue.add(new long[]{nextState, depth + 1});
+                }
             }
         }
 
-        return bypass.contains(boxPos);
+        return false;
+    }
+
+    /**
+     * BFS reachability check: can the agent walk from startPos to targetPos
+     * without passing through boxPos? Original-state boxes block except
+     * targetPos (which was emptied by the pull).
+     */
+    private static boolean canBypassToTarget(Position startPos, Position boxPos,
+                                              Position targetPos, State state, Level level) {
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> bfsQueue = new LinkedList<>();
+        visited.add(startPos);
+        bfsQueue.add(startPos);
+
+        while (!bfsQueue.isEmpty()) {
+            Position current = bfsQueue.poll();
+            if (current.equals(targetPos)) return true;
+
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (next.equals(boxPos)) continue; // current box position
+                // Original boxes block, except targetPos (emptied by extraction)
+                if (state.hasBoxAt(next) && !next.equals(targetPos)) continue;
+                visited.add(next);
+                bfsQueue.add(next);
+            }
+        }
+        return false;
+    }
+
+    private static long encodePullState(Position agent, Position box) {
+        return ((long) agent.row << 24) | ((long) agent.col << 16)
+             | ((long) box.row << 8) | (long) box.col;
+    }
+
+    private static Position decodeAgent(long enc) {
+        return Position.of((int) ((enc >> 24) & 0xFF), (int) ((enc >> 16) & 0xFF));
+    }
+
+    private static Position decodeBox(long enc) {
+        return Position.of((int) ((enc >> 8) & 0xFF), (int) (enc & 0xFF));
     }
 
     /**

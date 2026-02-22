@@ -78,6 +78,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Immovable boxes (treated as walls in pathfinding). */
     private Set<Position> immovableBoxes = Collections.emptySet();
+
+    /**
+     * Cache of barrier clearing orders that were found non-extractable.
+     * Prevents the infinite loop where dynamic barrier re-detection keeps
+     * finding the same non-extractable barrier every stuck iteration.
+     * Reset when genuine progress is made (completedBoxGoals changes).
+     */
+    private Set<List<Position>> skippedBarrierClearingOrders = new HashSet<>();
+
+    /**
+     * Counter for dynamic barrier re-detection rounds (in the stuck recovery loop).
+     * Limited to prevent wasting hundreds of steps on incomplete barrier clearing
+     * that doesn't produce additional goal solves.
+     */
+    private int dynamicBarrierRounds = 0;
+    private static final int MAX_DYNAMIC_BARRIER_ROUNDS = 5;
     
     /**
      * Ordering mode for subgoal execution. Different modes explore different
@@ -224,6 +240,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         globalTimeStep = 0;
         lastComputedState = null;
         lastComputedPlanSize = 0;
+        dynamicBarrierRounds = 0;
 
         return planWithSubgoals(initialState, level, startTime);
     }
@@ -287,6 +304,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // MAPF FIX: Clear displacement history on genuine progress
                     displacementHistory.clear();
                     displacementAttempts = 0;
+                    // Clear barrier cache — state changed, barriers may now be extractable
+                    skippedBarrierClearingOrders.clear();
+                    dynamicBarrierRounds = 0;
                 } else {
                     stuckCount++;
                 }
@@ -302,12 +322,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     } else {
                         // Dynamic barrier re-detection: state changes may have created
                         // new cross-color barriers. Run barrier analysis again.
-                        State afterBarrier = detectAndExecuteClearingPhase(
-                                currentState, initialState, level, fullPlan, numAgents, startTime);
-                        if (afterBarrier != currentState) {
-                            currentState = afterBarrier;
-                            stuckCount = 0;
-                            logVerbose("[PP] Dynamic barrier re-detection cleared new barriers");
+                        // Limited to prevent wasting steps on incomplete clearing.
+                        if (dynamicBarrierRounds < MAX_DYNAMIC_BARRIER_ROUNDS) {
+                            State afterBarrier = detectAndExecuteClearingPhase(
+                                    currentState, initialState, level, fullPlan, numAgents, startTime);
+                            dynamicBarrierRounds++;
+                            if (afterBarrier != currentState) {
+                                currentState = afterBarrier;
+                                stuckCount = 0;
+                                logVerbose("[PP] Dynamic barrier re-detection cleared new barriers (round "
+                                        + dynamicBarrierRounds + "/" + MAX_DYNAMIC_BARRIER_ROUNDS + ")");
+                            }
                         }
                     }
                 }
@@ -362,10 +387,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         logMinimal("[PP] Cross-color barriers detected: " + barriers.size());
 
+        // Sort barriers by clearing order size: solve small barriers first. 
+        // This opens up parking space (e.g., clearing Z opens left-right connection)
+        // before tackling large barriers that need many parking spots.
+        barriers.sort((a, b) -> Integer.compare(a.clearingOrder.size(), b.clearingOrder.size()));
+
         for (CrossColorBarrierAnalyzer.Barrier barrier : barriers) {
             if (System.currentTimeMillis() - startTime > timeoutMs / 2) {
                 logNormal("[PP] Clearing phase timeout — skipping remaining barriers");
                 break;
+            }
+
+            // Cache check: skip barriers that were already found non-extractable
+            if (skippedBarrierClearingOrders.contains(barrier.clearingOrder)) {
+                logVerbose("[PP] Barrier already cached as non-extractable — skipping");
+                continue;
             }
 
             logMinimal("[PP] Clearing barrier for agent " + barrier.blockedAgentId
@@ -385,23 +421,67 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     currentState.getAgentPosition(clearingAgent), currentState, level);
 
             // PRE-CHECK: Verify the first barrier box is physically extractable.
-            // If the closest box (accessible side of barrier) can't be moved,
-            // deeper boxes are certainly stuck too — skip entire barrier.
             Position firstBox = barrier.clearingOrder.get(0);
             if (!CrossColorBarrierAnalyzer.isBoxExtractable(firstBox, agentReachable, currentState, level)) {
                 logNormal("[PP] First barrier box " + firstBox + " is not extractable "
                         + "(dead-end corridor, no bypass) — skipping barrier");
+                skippedBarrierClearingOrders.add(barrier.clearingOrder);
                 continue;
             }
 
-            Set<Position> avoidPositions = new HashSet<>(barrier.clearingOrder);
-            // Also avoid the paths used by the barrier
-            List<Position> parking = CrossColorBarrierAnalyzer.findParkingPositions(
-                    barrier.clearingOrder.size(), agentReachable, currentState, level, avoidPositions);
+            Set<Position> baseAvoidPositions = new HashSet<>(barrier.clearingOrder);
+            // Avoid cells near barrier entry — the pull-chain approach path.
+            // Radius-1 around ALL barrier boxes + radius-2 around the gap entry point.
+            for (Position barrierPos : barrier.clearingOrder) {
+                for (Direction dir : Direction.values()) {
+                    Position adj = barrierPos.move(dir);
+                    if (!level.isWall(adj)) {
+                        baseAvoidPositions.add(adj);
+                    }
+                }
+            }
+            // Extended exclusion around gap entry (first box = closest to agent)
+            Position gapEntry = barrier.clearingOrder.get(0);
+            for (int dr = -2; dr <= 2; dr++) {
+                for (int dc = -2; dc <= 2; dc++) {
+                    if (Math.abs(dr) + Math.abs(dc) <= 2) {
+                        Position near = Position.of(gapEntry.row + dr, gapEntry.col + dc);
+                        if (!level.isWall(near)) {
+                            baseAvoidPositions.add(near);
+                        }
+                    }
+                }
+            }
 
-            if (parking.size() < barrier.clearingOrder.size()) {
-                logNormal("[PP] Not enough parking (" + parking.size() + "/" 
-                        + barrier.clearingOrder.size() + ") — attempting partial clear");
+            // APPROACH CORRIDOR: compute BFS shortest path from agent to the first
+            // barrier box. All cells on this path are critical for reaching the barrier;
+            // parking on them would block subsequent box extractions.
+            List<Position> approachPath = computeApproachPath(
+                    currentState.getAgentPosition(clearingAgent), firstBox, currentState, level);
+            baseAvoidPositions.addAll(approachPath);
+
+            // GAP EXIT ROW PROTECTION: the row connecting the maze to the gap is critical.
+            // BSP may chain-push parked boxes along this row, blocking the gap approach.
+            // Identify the gap exit row from the approach path end (near the barrier).
+            if (approachPath.size() >= 2) {
+                // Last cell = gap (adjacent to barrier), second-to-last = gap exit
+                Position gapCell = approachPath.get(approachPath.size() - 1);
+                Position preGapCell = approachPath.get(approachPath.size() - 2);
+                if (preGapCell.row != gapCell.row) {
+                    // Gap exit is on a different row — protect that entire row segment
+                    int gapExitRow = preGapCell.row;
+                    for (int c = preGapCell.col; c < level.getCols(); c++) {
+                        Position pos = Position.of(gapExitRow, c);
+                        if (level.isWall(pos)) break;
+                        baseAvoidPositions.add(pos);
+                    }
+                    for (int c = preGapCell.col - 1; c >= 0; c--) {
+                        Position pos = Position.of(gapExitRow, c);
+                        if (level.isWall(pos)) break;
+                        baseAvoidPositions.add(pos);
+                    }
+                    logNormal("[PP] [CLEAR-BARRIER] Gap exit row " + gapExitRow + " protected from parking");
+                }
             }
 
             // Build the full set of barrier positions to unfreeze.
@@ -409,11 +489,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // are the barrier itself (normally frozen because they're on satisfied goals).
             Set<Position> unfreezePositions = new HashSet<>(barrier.clearingOrder);
 
+            // PRE-CHECK: verify sufficient parking for ALL barrier boxes.
+            // Incomplete clearing wastes steps without enabling the blocked agent's goals.
+            // Also skip barriers where the clear count exceeds practical maze capacity:
+            // parking many boxes in a limited maze blocks internal paths.
+            if (barrier.clearingOrder.size() > 5) {
+                logNormal("[PP] [CLEAR-BARRIER] Barrier too large ("
+                        + barrier.clearingOrder.size() + " boxes) — skipping");
+                skippedBarrierClearingOrders.add(barrier.clearingOrder);
+                continue;
+            }
+            List<Position> allParking = CrossColorBarrierAnalyzer.findParkingPositions(
+                    barrier.clearingOrder.size(), agentReachable, currentState, level,
+                    baseAvoidPositions, firstBox);
+            if (allParking.size() < barrier.clearingOrder.size()) {
+                logNormal("[PP] [CLEAR-BARRIER] Insufficient parking (" + allParking.size()
+                        + "/" + barrier.clearingOrder.size() + ") — skipping barrier");
+                skippedBarrierClearingOrders.add(barrier.clearingOrder);
+                continue;
+            }
+
+            // Track parking positions used so far — avoid them for subsequent boxes
+            Set<Position> usedParkings = new HashSet<>();
+
             int cleared = 0;
             boolean earlyExit = false;
-            for (int i = 0; i < barrier.clearingOrder.size() && i < parking.size(); i++) {
+            for (int i = 0; i < barrier.clearingOrder.size(); i++) {
                 Position boxPos = barrier.clearingOrder.get(i);
-                Position parkPos = parking.get(i);
 
                 // Verify box is still at the expected position
                 Character boxAtPos = currentState.getBoxes().get(boxPos);
@@ -425,16 +527,51 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Check extractability for each box (reachability changes as boxes are cleared)
                 Set<Position> updatedReachable = bfsReachableForClearing(
                         currentState.getAgentPosition(clearingAgent), currentState, level);
-                if (!CrossColorBarrierAnalyzer.isBoxExtractable(boxPos, updatedReachable, currentState, level)) {
-                    logNormal("[PP] [CLEAR-BARRIER] Box " + boxPos + " not extractable — stopping");
+                if (cleared == 0) {
+                    // Full extractability pre-check for the first box
+                    if (!CrossColorBarrierAnalyzer.isBoxExtractable(boxPos, updatedReachable, currentState, level)) {
+                        logNormal("[PP] [CLEAR-BARRIER] Box " + boxPos + " not extractable — stopping");
+                        break;
+                    }
+                } else {
+                    // For subsequent boxes: skip the expensive extractability pre-check.
+                    // The first box's clearance confirms the gap is workable; parked boxes
+                    // may block the pull-chain bypass BFS but BSP can route around them.
+                    // Only verify the agent can physically reach an adjacent cell.
+                    boolean canReach = false;
+                    for (Direction dir : Direction.values()) {
+                        if (updatedReachable.contains(boxPos.move(dir))) {
+                            canReach = true;
+                            break;
+                        }
+                    }
+                    if (!canReach) {
+                        logNormal("[PP] [CLEAR-BARRIER] Box " + boxPos + " not reachable by agent — stopping");
+                        break;
+                    }
+                }
+
+                // Compute parking INCREMENTALLY: avoid previously used parkings
+                // so they don't block the pull-chain for subsequent boxes.
+                Set<Position> avoidPositions = new HashSet<>(baseAvoidPositions);
+                avoidPositions.addAll(usedParkings);
+                List<Position> parkingCandidates = CrossColorBarrierAnalyzer.findParkingPositions(
+                        1, updatedReachable, currentState, level, avoidPositions, boxPos);
+
+                if (parkingCandidates.isEmpty()) {
+                    logNormal("[PP] [CLEAR-BARRIER] No parking for " + boxPos + " — stopping");
                     break;
                 }
+                Position parkPos = parkingCandidates.get(0);
 
                 logNormal("[PP] [CLEAR-BARRIER] Moving " + barrier.blockingBoxType + " from "
                         + boxPos + " to " + parkPos + " (agent " + clearingAgent + ")");
 
-                // Use moderate BSP budget — extractable boxes should be found quickly
-                int clearingBudget = SearchConfig.MIN_BSP_BUDGET * 2;
+                int planSizeBefore = fullPlan.size();
+
+                // Use higher BSP budget — pull-chain paths through narrow gaps need more exploration
+                // Progressive budget: deeper boxes may need longer displacement paths
+                int clearingBudget = SearchConfig.MIN_BSP_BUDGET * (6 + cleared * 2);
                 List<Action> displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
                         clearingAgent, boxPos, parkPos, barrier.blockingBoxType,
                         currentState, level, unfreezePositions, clearingBudget);
@@ -444,6 +581,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // First box failure → deeper boxes are certainly harder. Abort this barrier.
                     if (cleared == 0) {
                         logNormal("[PP] [CLEAR-BARRIER] First box failed — aborting barrier");
+                        skippedBarrierClearingOrders.add(barrier.clearingOrder);
                         earlyExit = true;
                         break;
                     }
@@ -462,12 +600,45 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     globalTimeStep++;
                 }
 
+                // POST-DISPLACEMENT VERIFICATION: check if box actually left its position
+                // AND reached parking target. Joint action conflict resolution may have 
+                // converted some BSP actions to NoOp, leaving the box at an unexpected position.
+                Character boxStillThere = currentState.getBoxes().get(boxPos);
+                if (boxStillThere != null && boxStillThere == barrier.blockingBoxType) {
+                    logNormal("[PP] [CLEAR-BARRIER] Box still at " + boxPos
+                            + " after BSP execution (conflict resolution interference) — rolling back");
+                    // Rollback: remove the executed actions
+                    while (fullPlan.size() > planSizeBefore) {
+                        fullPlan.remove(fullPlan.size() - 1);
+                        globalTimeStep--;
+                    }
+                    currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                    continue; // Don't increment cleared, don't track parking
+                }
+                
+                // Verify box reached parking target (not stuck at intermediate position)
+                Character boxAtPark = currentState.getBoxes().get(parkPos);
+                if (boxAtPark == null || boxAtPark != barrier.blockingBoxType) {
+                    // Box left source but didn't reach target — it's stuck at an intermediate
+                    // position potentially blocking the approach corridor. Rollback.
+                    logNormal("[PP] [CLEAR-BARRIER] Box left " + boxPos + " but didn't reach "
+                            + parkPos + " — rolling back to avoid blocking corridor");
+                    while (fullPlan.size() > planSizeBefore) {
+                        fullPlan.remove(fullPlan.size() - 1);
+                        globalTimeStep--;
+                    }
+                    currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                    // Try next parking candidate
+                    continue;
+                }
+
                 // Track the displaced goal position
                 char goalType = level.getBoxGoal(boxPos);
                 if (goalType != '\0') {
                     displacedGoals.add(boxPos);
                 }
 
+                usedParkings.add(parkPos);
                 cleared++;
                 logNormal("[PP] [CLEAR-BARRIER] Cleared " + barrier.blockingBoxType + " from "
                         + boxPos + " in " + displacePath.size() + " steps (total cleared: " + cleared + ")");
@@ -503,6 +674,52 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return visited;
+    }
+
+    /**
+     * BFS shortest path from start to any cell adjacent to targetBox (treating 
+     * boxes as walls). Returns all cells on the path (start → adjacent-to-target),
+     * or empty list if unreachable. Used to compute the approach corridor that
+     * must be kept clear for subsequent barrier box clearing.
+     */
+    private List<Position> computeApproachPath(Position start, Position targetBox,
+                                                State state, Level level) {
+        Map<Position, Position> parent = new HashMap<>();
+        Queue<Position> queue = new LinkedList<>();
+        parent.put(start, null);
+        queue.add(start);
+
+        Position reached = null;
+        while (!queue.isEmpty() && reached == null) {
+            Position current = queue.poll();
+            // Check if current is adjacent to the target box
+            for (Direction dir : Direction.values()) {
+                if (current.move(dir).equals(targetBox)) {
+                    reached = current;
+                    break;
+                }
+            }
+            if (reached != null) break;
+
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (parent.containsKey(next)) continue;
+                if (level.isWall(next)) continue;
+                if (state.hasBoxAt(next)) continue;
+                parent.put(next, current);
+                queue.add(next);
+            }
+        }
+
+        if (reached == null) return Collections.emptyList();
+
+        // Reconstruct path
+        List<Position> path = new ArrayList<>();
+        for (Position p = reached; p != null; p = parent.get(p)) {
+            path.add(p);
+        }
+        Collections.reverse(path);
+        return path;
     }
 
     /**
@@ -588,8 +805,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Fail-safe: If ran out of goals but not at goal state, refresh!
         // This handles the transition from Box Goals (Phase 1) to Agent Goals (Phase 2)
+        // Also: re-enable barrier-displaced goals so CYAN can return A-boxes.
         if (remaining.isEmpty() && !currentState.isGoalState(level)) {
             logVerbose("[PP] Phase switch: refreshing subgoal list");
+            if (!displacedGoals.isEmpty()) {
+                logVerbose("[PP] Re-enabling " + displacedGoals.size() + " barrier-displaced goals for return phase");
+                displacedGoals.clear();
+            }
             computeAndCacheSubgoals(currentState, level);
             remaining = filterUnsatisfiedSubgoals(cachedSubgoalOrder, currentState, level);
         }
@@ -623,6 +845,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         for (Subgoal sg : source) {
             // Basic satisfaction check
             if (completedBoxGoals.contains(sg.goalPos)) continue;
+            // Barrier-displaced goals: boxes intentionally cleared to open a path
+            // for a blocked agent. Defer re-filling until the blocked agent's goals
+            // are achieved (Phase switch will clear displacedGoals).
+            if (!sg.isAgentGoal && displacedGoals.contains(sg.goalPos)) continue;
 
             boolean satisfied;
             if (sg.isAgentGoal) {
@@ -981,16 +1207,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
-                        
-                        // Clear displaced goals: a successful completion means the
-                        // displacement served its purpose. The displaced goal will be
-                        // detected as regressed by revalidateCompletedGoals below
-                        // and re-added to the unsatisfied list naturally.
-                        if (!displacedGoals.isEmpty()) {
-                            logVerbose("[PP] Clearing " + displacedGoals.size() 
-                                    + " displaced goal(s) after progress: " + displacedGoals);
-                            displacedGoals.clear();
-                        }
+                        // NOTE: displacedGoals NOT cleared here. Barrier-displaced goals
+                        // stay deferred until the phase switch (all non-displaced goals
+                        // satisfied) to prevent PP from undoing barrier clearing.
                         
                         // Goal-level cycle detection: track completion count
                         int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
@@ -1103,7 +1322,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (reached) {
                         if (!subgoal.isAgentGoal) {
                             completedBoxGoals.add(subgoal.goalPos);
-                            if (!displacedGoals.isEmpty()) { displacedGoals.clear(); }
+                            // NOTE: displacedGoals NOT cleared here — see phase switch.
                             int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
                             goalCompletionCount.put(subgoal.goalPos, count);
                             subgoalManager.invalidateHungarianCache();
