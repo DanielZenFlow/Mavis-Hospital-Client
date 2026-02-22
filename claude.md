@@ -93,18 +93,24 @@ mapf/
 Client.searchWithFallback()
     → PortfolioController.search()  (default, USE_PORTFOLIO=true)
         → LevelAnalyzer.analyze() → LevelFeatures
-        → buildStrategySequence() → ordered list of (StrategyType, weight)
+        → Independence Detection (if >1 agent)
+            → detectIndependentGroups() via BFS+union-find
+            → if >1 group: project State/Level per group, solve independently, merge
+            → if ALL groups solved → return merged plan immediately
+            → if partial → save as fallback, continue to normal portfolio
+        → buildStrategySequence() → ordered list of (StrategyConfig)
         → try each strategy with timeout budget, return first success
 
-Fallback sequences by recommendation:
-    SINGLE_AGENT  → [A*(w=1), A*(w=5)]
-    CBS           → [CBS(w=1), PP(w=1), PP(w=2)]
-    JOINT_SEARCH  → [JointA*(w=1), CBS(w=1), PP(w=1)]
-    STRICT_ORDER  → [PP(w=1), PP(w=2), Greedy(w=5)]
-    CYCLE_BREAKER → [PP(w=1), JointA*(w=2)¹, Greedy(w=5)]
-    GREEDY        → [Greedy(w=1), Greedy(w=2), Greedy(w=5)]
+Strategy sequences (all use STRICT_ORDER/PP with different ordering modes):
+    SINGLE_AGENT     → [A*(w=1, 40%), A*(w=5, 60%)]
+    Cyclic deps      → [RANDOM#42(25%), RANDOM#137(25%), DISTANCE_GREEDY(25%), TOPOLOGICAL(25%)]
+    No cycles        → [TOPOLOGICAL(40%), DISTANCE_GREEDY(30%), RANDOM#42(30%)]
 
-    ¹ Only if ≤4 agents
+Design principles:
+    - CBS/JointAStar removed from top-level sequences (CBS models MAPF not Sokoban;
+      JointAStar is O(5^n)). CBS retained as PP-internal cycle fallback.
+    - Multi-seed RANDOM is primary cycle-breaking: different seeds shuffle subgoal order.
+    - StrategyConfig: (type, weight, orderingMode, randomSeed, timeBudgetFraction)
 ```
 
 Legacy path: `USE_PORTFOLIO=false` env var → StrategySelector (single strategy, no fallback).
@@ -147,6 +153,17 @@ Moved boxes identified by comparing current state vs initial state (t=0).
 
 **Subgoal decomposition**: Uses LevelAnalyzer's topological order.
 Plans one box-to-goal at a time using BoxSearchPlanner (A*).
+
+**Ordering modes**: SubgoalManager supports multiple ordering strategies:
+- `TOPOLOGICAL`: dependency-respecting topological sort (default for acyclic)
+- `DISTANCE_GREEDY`: nearest-box-first ordering
+- `RANDOM`: seeded shuffle ordering (primary cycle-breaker)
+- Each ordering mode is tried as a separate portfolio attempt with time budget
+
+**REGRESS tolerance**: When a previously completed goal regresses (box displaced):
+- If ≤1 goal regressed AND current subgoal succeeded AND it's a box goal →
+  accept the regression, remove regressed goal from completedBoxGoals for re-planning
+- If 2+ regressions or agent goal regressed → full rollback + REGRESS-UNPROTECT
 
 **Conflict handling**: Multi-layered:
 1. ConflictResolver for joint action validation
@@ -209,6 +226,8 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
 - [x] Weighted A* fallback: BSP Round 4 uses w=3.0 when standard A* exhausts budget.
 - [x] Portfolio CBS/JointAStar: coupling-based strategy selection.
       High coupling(≥0.7)+≤3 agents→JointAStar; medium(≥0.4)+≤5→CBS; else PP+CBS fallback.
+- [x] Portfolio simplification: removed CBS/JointAStar from top-level sequences,
+      multi-seed RANDOM ordering for cycle-breaking, REVERSE_TOPOLOGICAL removed.
 
 ### P1 — Should Fix
 - [ ] Agent-level dependency analysis: map goal deps → agent deps via color/reachability,
@@ -217,10 +236,14 @@ java -jar server.jar -l complevels/DECrunchy.lvl -c "java -Xmx4g -cp target/clas
       Boxes pushed into non-goal corners are pruned (can never be extracted).
 - [x] Conflict-aware heuristic: +2 penalty per wrong-type box on goal position.
 - [x] Dynamic barrier re-detection: re-runs CrossColorBarrierAnalyzer when stuck recovery fails.
+- [x] REGRESS tolerance: accept ≤1 box goal regression when current subgoal succeeded,
+      remove from completedBoxGoals for re-planning instead of full rollback.
+- [x] Independence detection: BFS+union-find detects disconnected agent groups,
+      projects State/Level per group, solves independently, merges plans.
+      Falls back to normal portfolio if any group fails.
 
 ### P2 — Nice to Have
 - [ ] Parking/buffer zones for high-density levels (DECrunchy-type)
-- [ ] Independence detection: split disconnected agent groups into subproblems
 
 ### Not Needed (per project scope)
 - Reverse/Pull search (pure Sokoban technique, not in requirements)
