@@ -617,8 +617,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // maintains connectivity to the gap at every intermediate step.
             // This prevents the "self-trapping" failure where per-box greedy
             // parking fills narrow corridors and cuts off the return path.
+            // TRANSIT PROTECTION: also verifies the blocked agent can still reach
+            // the gap area after all boxes are parked. Without this, parking fills
+            // all vertical corridors and traps the blocked agent in the lower area.
+            Position blockedAgentPos = currentState.getAgentPosition(barrier.blockedAgentId);
+            Position gapExitCell = (approachPath.size() >= 3) 
+                    ? approachPath.get(approachPath.size() - 3) : null;
             List<Position> preAssignedSlots = preAssignParkingSlots(
-                    barrier.clearingOrder, allParking, currentState, level);
+                    barrier.clearingOrder, allParking, currentState, level,
+                    blockedAgentPos, gapExitCell);
             int maxSafeClears = preAssignedSlots.size();
             if (maxSafeClears == 0) {
                 logNormal("[PP] [CLEAR-BARRIER] Pre-assignment found no safe parking — skipping barrier");
@@ -740,8 +747,155 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             currentState, level, fullUnfreeze, clearingBudget);
                 }
 
+                // RETRY WITH ALTERNATIVE PARKING TARGETS
+                // Pre-assigned target may be in a congested area (e.g., deep in finger corridor
+                // behind parked boxes). Try simpler targets: row 10 (relaxed for last box),
+                // upper-left corridor, etc.
                 if (displacePath == null || displacePath.isEmpty()) {
-                    logNormal("[PP] [CLEAR-BARRIER] BSP failed for " + boxPos + " -> " + parkPos);
+                    logNormal("[PP] [CLEAR-BARRIER] BSP failed for " + boxPos + " -> " + parkPos
+                            + " — trying alternative targets");
+                    
+                    boolean isLastBox = (i == barrier.clearingOrder.size() - 1);
+                    
+                    // Build relaxed avoidSet for alternative candidates:
+                    // - Always exclude barrier positions and used parkings
+                    // - For last box: DROP gap exit row protection (no subsequent boxes need it)
+                    //   and DROP approach corridor protection
+                    // - For non-last box: keep full baseAvoidPositions
+                    Set<Position> retryAvoid = new HashSet<>();
+                    retryAvoid.addAll(barrier.clearingOrder);
+                    retryAvoid.addAll(usedParkings);
+                    if (!isLastBox) {
+                        retryAvoid.addAll(baseAvoidPositions);
+                    }
+                    
+                    Set<Position> updReach = bfsReachableForClearing(
+                            currentState.getAgentPosition(clearingAgent), currentState, level);
+                    // Sort by distance to the BOX (not the gap reference) — closer = simpler BSP path
+                    List<Position> retryCandidates = CrossColorBarrierAnalyzer.findParkingPositions(
+                            30, updReach, currentState, level, retryAvoid, boxPos);
+                    
+                    // BARRIER EXTENSION CANDIDATES: cells beyond the last barrier box
+                    // along the corridor direction are not walkable (the box blocks the
+                    // path) but ARE reachable via BSP pushing. Add them as candidates.
+                    if (barrier.clearingOrder.size() >= 2) {
+                        Position lastBox = barrier.clearingOrder.get(barrier.clearingOrder.size() - 1);
+                        Position prevBox = barrier.clearingOrder.get(barrier.clearingOrder.size() - 2);
+                        int bdr = lastBox.row - prevBox.row;
+                        int bdc = lastBox.col - prevBox.col;
+                        Position ext = lastBox;
+                        for (int step = 0; step < 20; step++) {
+                            ext = Position.of(ext.row + bdr, ext.col + bdc);
+                            if (level.isWall(ext)) break;
+                            if (retryAvoid.contains(ext)) continue;
+                            if (retryCandidates.contains(ext)) continue;
+                            if (level.getBoxGoal(ext) != '\0') continue;
+                            if (level.getAgentGoal(ext.row, ext.col) != -1) continue;
+                            // Add if not already a box (it will be free after push)
+                            if (!currentState.hasBoxAt(ext) || ext.equals(boxPos)) {
+                                retryCandidates.add(ext);
+                            }
+                        }
+                    }
+                    
+                    // Build simulated obstacle set for transit checks:
+                    // post-clearing state = current boxes - all barrier positions + used parkings
+                    Set<Position> baseRetryObs = new HashSet<>();
+                    for (Position bp : currentState.getBoxes().keySet()) {
+                        baseRetryObs.add(bp);
+                    }
+                    for (Position bp : barrier.clearingOrder) {
+                        baseRetryObs.remove(bp); // barrier boxes will be removed
+                    }
+                    // usedParkings are already reflected in currentState
+                    
+                    Position blockedPos = currentState.getAgentPosition(barrier.blockedAgentId);
+                    
+                    // Compute barrier extension direction for corridor-bypass check.
+                    // Cells on the barrier extension (past the last barrier box) that have
+                    // walls on BOTH perpendicular sides are "no-bypass bottlenecks" —
+                    // parking there permanently blocks the blocked agent.
+                    Set<Position> noBypassCells = new HashSet<>();
+                    if (barrier.clearingOrder.size() >= 2) {
+                        Position lastBox = barrier.clearingOrder.get(barrier.clearingOrder.size() - 1);
+                        Position prevBox = barrier.clearingOrder.get(barrier.clearingOrder.size() - 2);
+                        int dr = lastBox.row - prevBox.row;
+                        int dc = lastBox.col - prevBox.col;
+                        Position ext = lastBox;
+                        for (int step = 0; step < 20; step++) {
+                            ext = Position.of(ext.row + dr, ext.col + dc);
+                            if (level.isWall(ext)) break;
+                            // Check perpendicular bypass
+                            boolean hasBypass;
+                            if (dr == 0) { // horizontal extension → check north/south
+                                hasBypass = !level.isWall(Position.of(ext.row - 1, ext.col))
+                                         || !level.isWall(Position.of(ext.row + 1, ext.col));
+                            } else { // vertical extension → check east/west
+                                hasBypass = !level.isWall(Position.of(ext.row, ext.col - 1))
+                                         || !level.isWall(Position.of(ext.row, ext.col + 1));
+                            }
+                            if (!hasBypass) {
+                                noBypassCells.add(ext);
+                            } else {
+                                break; // First cell with bypass → corridor opens up
+                            }
+                        }
+                    }
+                    
+                    Set<Position> tried = new HashSet<>();
+                    tried.add(parkPos);
+                    int maxRetries = 8;
+                    int retryCount = 0;
+                    
+                    for (Position altTarget : retryCandidates) {
+                        if (tried.contains(altTarget)) continue;
+                        if (retryCount >= maxRetries) break;
+                        tried.add(altTarget);
+                        
+                        // CORRIDOR BYPASS CHECK: reject cells on barrier extension
+                        // that are no-bypass bottlenecks (walls on both sides)
+                        if (noBypassCells.contains(altTarget)) {
+                            logVerbose("[PP] [CLEAR-BARRIER] BSP retry skip " + altTarget
+                                    + " — no-bypass corridor bottleneck");
+                            continue;
+                        }
+                        
+                        // TRANSIT CHECK: verify blocked agent can still reach the gap
+                        // exit cell after parking at this position. We check gap-exit
+                        // (not individual goals) because goals may be behind pushable
+                        // boxes that the walk-only BFS can't traverse.
+                        if (blockedPos != null && gapExitCell != null) {
+                            Set<Position> simObs = new HashSet<>(baseRetryObs);
+                            simObs.add(altTarget); // box parked here
+                            simObs.remove(boxPos); // current box position freed
+                            if (!bfsCanReach(blockedPos, gapExitCell, simObs, level)) {
+                                logVerbose("[PP] [CLEAR-BARRIER] BSP retry skip " + altTarget
+                                        + " — blocks agent " + barrier.blockedAgentId + " transit to gap");
+                                continue;
+                            }
+                        }
+                        
+                        retryCount++;
+                        logNormal("[PP] [CLEAR-BARRIER] BSP retry " + retryCount
+                                + ": " + boxPos + " -> " + altTarget);
+                        
+                        Set<Position> retryUnfreeze = new HashSet<>(barrier.clearingOrder);
+                        displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
+                                clearingAgent, boxPos, altTarget, barrier.blockingBoxType,
+                                currentState, level, retryUnfreeze, clearingBudget);
+                        
+                        if (displacePath != null && !displacePath.isEmpty()) {
+                            parkPos = altTarget;
+                            logNormal("[PP] [CLEAR-BARRIER] BSP retry succeeded: "
+                                    + boxPos + " -> " + altTarget);
+                            break;
+                        }
+                    }
+                }
+
+                if (displacePath == null || displacePath.isEmpty()) {
+                    logNormal("[PP] [CLEAR-BARRIER] BSP failed for " + boxPos
+                            + " (all targets exhausted)");
                     // First box failure → deeper boxes are certainly harder. Abort this barrier.
                     if (cleared == 0) {
                         logNormal("[PP] [CLEAR-BARRIER] First box failed — aborting barrier");
@@ -971,13 +1125,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * @param candidates    sorted list of ALL parking candidate positions
      * @param currentState  current game state
      * @param level         level definition
+     * @param blockedAgentPos position of the blocked agent (null to skip transit check)
+     * @param gapExitCell   cell the blocked agent must reach (null to skip transit check)
      * @return list of parking assignments (may be shorter than clearingOrder if no full assignment exists)
      */
     private List<Position> preAssignParkingSlots(
             List<Position> clearingOrder,
             List<Position> candidates,
             State currentState,
-            Level level) {
+            Level level,
+            Position blockedAgentPos,
+            Position gapExitCell) {
 
         // Build obstacle set from current box positions
         Set<Position> obstacles = new HashSet<>();
@@ -987,7 +1145,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         // Try full assignment first
         List<Position> assignment = new ArrayList<>();
-        if (doPreAssignRecursive(0, clearingOrder, candidates, assignment, obstacles, level)) {
+        if (doPreAssignRecursive(0, clearingOrder, candidates, assignment, obstacles, level,
+                blockedAgentPos, gapExitCell)) {
             return assignment; // Full assignment found
         }
 
@@ -1001,7 +1160,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 resetObstacles.add(boxPos);
             }
             List<Position> subOrder = clearingOrder.subList(0, maxBoxes);
-            if (doPreAssignRecursive(0, subOrder, candidates, assignment, resetObstacles, level)) {
+            if (doPreAssignRecursive(0, subOrder, candidates, assignment, resetObstacles, level,
+                    blockedAgentPos, gapExitCell)) {
                 logNormal("[PP] [CLEAR-BARRIER] Pre-assignment: safely clearing " + maxBoxes
                         + "/" + clearingOrder.size() + " boxes");
                 return assignment;
@@ -1027,9 +1187,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     private boolean doPreAssignRecursive(
             int idx, List<Position> clearingOrder, List<Position> candidates,
-            List<Position> assigned, Set<Position> obstacles, Level level) {
+            List<Position> assigned, Set<Position> obstacles, Level level,
+            Position blockedAgentPos, Position gapExitCell) {
 
-        if (idx >= clearingOrder.size()) return true; // All boxes assigned
+        if (idx >= clearingOrder.size()) {
+            // All boxes assigned — verify blocked agent can still reach the gap.
+            // After clearing, parked boxes must not cut off the blocked agent's only
+            // path to the gap area. Without this check, parking fills all vertical
+            // corridors and traps the blocked agent in the lower area.
+            if (blockedAgentPos != null && gapExitCell != null) {
+                // Build effective obstacles: current + remove all barrier boxes (they'll be cleared)
+                Set<Position> effectiveObs = new HashSet<>(obstacles);
+                for (Position bp : clearingOrder) {
+                    effectiveObs.remove(bp);
+                }
+                return bfsCanReach(blockedAgentPos, gapExitCell, effectiveObs, level);
+            }
+            return true;
+        }
 
         Position boxPos = clearingOrder.get(idx);
 
@@ -1055,7 +1230,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (connected) {
                 assigned.add(candidate);
                 if (doPreAssignRecursive(idx + 1, clearingOrder, candidates,
-                        assigned, obstacles, level)) {
+                        assigned, obstacles, level,
+                        blockedAgentPos, gapExitCell)) {
                     return true;
                 }
                 assigned.remove(assigned.size() - 1);
@@ -1111,6 +1287,41 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (visited.contains(next)) continue;
                 if (level.isWall(next)) continue;
                 if (effectiveObstacles.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Simple BFS reachability check: can we walk from 'start' to any cell adjacent
+     * to 'target' without passing through walls or obstacles?
+     * Used to verify that the blocked agent can still reach the gap area after
+     * all barrier boxes are parked.
+     */
+    private boolean bfsCanReach(Position start, Position target,
+                                 Set<Position> obstacles, Level level) {
+        if (start.equals(target)) return true;
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        visited.add(start);
+        queue.add(start);
+
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (next.equals(target)) return true;
+                // Also check adjacency to target (agent needs to be NEAR gap, not ON it)
+                for (Direction d2 : Direction.values()) {
+                    if (next.move(d2).equals(target)) {
+                        if (!level.isWall(next) && !obstacles.contains(next)) return true;
+                    }
+                }
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (obstacles.contains(next)) continue;
                 visited.add(next);
                 queue.add(next);
             }
