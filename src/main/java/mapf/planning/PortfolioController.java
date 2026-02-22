@@ -204,10 +204,21 @@ public class PortfolioController implements SearchStrategy {
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.25));
         } else {
             // General multi-agent: PP with different ordering modes (default)
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.35));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.10));
+            if (f.hasCircularDependency) {
+                // Cyclic dependencies: deterministic orderings often get stuck on the cycle.
+                // RANDOM breaks cycles by shuffling, so it gets top priority.
+                // Standard practice in Prioritized Planning literature for cyclic deps.
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.30));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.25));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.25));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.20));
+            } else {
+                // No cycles: topological order is well-founded, use it first.
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.35));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.25));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.10));
+            }
             // Last resort: CBS as final fallback for loosely coupled levels
             if (f.numAgents <= 6) {
                 strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.10));

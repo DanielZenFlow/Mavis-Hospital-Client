@@ -94,6 +94,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     private int dynamicBarrierRounds = 0;
     private static final int MAX_DYNAMIC_BARRIER_ROUNDS = 5;
+
+    /**
+     * TRAP blacklist: goal positions where wouldTrapAgent returned true.
+     * Within a single PP run, once a goal triggers TRAP rollback, it won't be
+     * re-attempted (different ordering modes will reset this).
+     */
+    private Set<Position> trapBlacklist = new HashSet<>();
+
+    /**
+     * REGRESS blacklist: counts how many times each completed goal has been
+     * disturbed (by any subgoal). After MAX_REGRESS_PER_GOAL disturbances,
+     * that completed goal is marked as "unprotectable" and removed from
+     * completedBoxGoals, allowing future paths to go through it.
+     */
+    private Map<Position, Integer> regressDisturbCount = new HashMap<>();
+    private static final int MAX_REGRESS_PER_GOAL = 3;
+
+    /** Timestamp of last successful subgoal execution, for early termination. */
+    private long lastProgressTime = 0;
     
     /**
      * Ordering mode for subgoal execution. Different modes explore different
@@ -241,6 +260,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         lastComputedState = null;
         lastComputedPlanSize = 0;
         dynamicBarrierRounds = 0;
+        trapBlacklist.clear();
+        regressDisturbCount.clear();
+        lastProgressTime = System.currentTimeMillis();
 
         return planWithSubgoals(initialState, level, startTime);
     }
@@ -282,6 +304,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 break;
             }
 
+            // Early termination: if no genuine progress for 40% of timeout,
+            // return partial plan and let portfolio try next strategy.
+            // This prevents burning the entire budget on repeated failures.
+            long noProgressMs = System.currentTimeMillis() - lastProgressTime;
+            if (noProgressMs > timeoutMs * 0.4 && !fullPlan.isEmpty()) {
+                logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
+                break;
+            }
+
             // Try CBS fallback on cyclic dependency detection
             if (stuckCount == SearchConfig.DEPENDENCY_CHECK_THRESHOLD && SearchConfig.USE_CBS_ON_CYCLE) {
                 List<Action[]> cbsResult = tryCBSFallback(currentState, level, initialState, fullPlan, startTime, numAgents);
@@ -301,6 +332,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Only reset stuckCount for genuine progress (not re-solving same agent goal)
                 if (!lastProgressWasPhantom) {
                     stuckCount = 0;
+                    lastProgressTime = System.currentTimeMillis();
                     // MAPF FIX: Clear displacement history on genuine progress
                     displacementHistory.clear();
                     displacementAttempts = 0;
@@ -1123,6 +1155,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
 
+            // TRAP blacklist: skip goals that previously triggered agent-trap detection.
+            // This prevents the infinite TRAP→rollback→retry→TRAP cycle.
+            if (!subgoal.isAgentGoal && trapBlacklist.contains(subgoal.goalPos)) {
+                logVerbose("[PP] [TRAP-SKIP] " + subgoal.boxType + " -> " + subgoal.goalPos
+                        + " — blacklisted from prior TRAP rollback");
+                continue;
+            }
+
+            // REGRESS blacklist: skip subgoals that repeatedly cause regression rollbacks.
+            // After MAX_REGRESS_RETRIES failures for the same subgoal, the path through completed goals is
+            // structurally unavoidable for this ordering — stop wasting time.
+            // (Kept for future use, currently handled by unprotectable goal approach below)
+
             // Task-Aware: Pass the full list of subgoals for global allocation checking
             List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);
             
@@ -1166,6 +1211,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
                                 + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
                                 + " completed goal(s): " + regressedGoals + " — rollback");
+                        // Track disturbance count per completed goal.
+                        // If a completed goal is disturbed too many times, it's structurally
+                        // in a chokepoint — remove it from completedBoxGoals so future
+                        // paths aren't blocked by trying to protect it.
+                        for (Position rg : regressedGoals) {
+                            int count = regressDisturbCount.merge(rg, 1, Integer::sum);
+                            if (count >= MAX_REGRESS_PER_GOAL) {
+                                logNormal(getName() + ": [REGRESS-UNPROTECT] Goal " + rg 
+                                        + " disturbed " + count + " times — marking unprotectable");
+                                completedBoxGoals.remove(rg);
+                            }
+                        }
                         // Rollback: remove the executed actions from fullPlan
                         while (fullPlan.size() > planSizeBefore) {
                             fullPlan.remove(fullPlan.size() - 1);
@@ -1192,7 +1249,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         // Agent would be trapped — skip this subgoal, let PP try alternatives
                         logNormal(getName() + ": [TRAP] Skipping " + subgoal.boxType + " -> " + subgoal.goalPos
                                 + " — agent " + subgoal.agentId + " would be trapped after filling");
-                        // Rollback: remove the executed actions from fullPlan
+                        // Blacklist this goal to prevent repeated TRAP→rollback→retry cycles
+                        trapBlacklist.add(subgoal.goalPos);
                         // Rollback: remove the executed actions from fullPlan
                         while (fullPlan.size() > planSizeBefore) {
                             fullPlan.remove(fullPlan.size() - 1);
