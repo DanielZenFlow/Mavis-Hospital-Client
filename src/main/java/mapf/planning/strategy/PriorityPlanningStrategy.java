@@ -1202,41 +1202,61 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 
                 // POST-PLAN REGRESSION GUARD: Check if executing this path disturbed
-                // any previously completed box goals. If so, rollback — the cure is worse
-                // than the disease. This is the primary defense against push-then-pull cycles.
-                // Only applies when we had completed goals to protect (Round 2b/3 may have
-                // relaxed frozen protections, allowing BSP to disturb them).
+                // any previously completed box goals. If so, either accept or rollback.
+                // "Break-then-rebuild" tolerance: if only 1 goal regressed and the current
+                // subgoal was successfully placed, accept the regression — the regressed goal
+                // will be re-planned in a later iteration. This enables progress through
+                // chokepoints where temporarily displacing a completed goal is unavoidable.
+                // If 2+ goals regressed or the subgoal wasn't reached, rollback as before.
                 if (!completedBoxGoals.isEmpty()) {
                     List<Position> regressedGoals = detectRegressedGoals(tempState, level);
                     // Exclude goals that were intentionally displaced by tryRecovery.
                     // Those positions are expected to be empty — not a regression.
                     regressedGoals.removeAll(displacedGoals);
                     if (!regressedGoals.isEmpty()) {
-                        logNormal(getName() + ": [REGRESS] Path for " 
-                                + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
-                                + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
-                                + " completed goal(s): " + regressedGoals + " — rollback");
-                        // Track disturbance count per completed goal.
-                        // If a completed goal is disturbed too many times, it's structurally
-                        // in a chokepoint — remove it from completedBoxGoals so future
-                        // paths aren't blocked by trying to protect it.
-                        for (Position rg : regressedGoals) {
-                            int count = regressDisturbCount.merge(rg, 1, Integer::sum);
-                            if (count >= MAX_REGRESS_PER_GOAL) {
-                                logNormal(getName() + ": [REGRESS-UNPROTECT] Goal " + rg 
-                                        + " disturbed " + count + " times — marking unprotectable");
-                                completedBoxGoals.remove(rg);
+                        // Check if we can accept this regression (break-then-rebuild)
+                        boolean subgoalReached = !subgoal.isAgentGoal && verifyGoalReached(subgoal, tempState, level);
+                        if (regressedGoals.size() <= 1 && subgoalReached) {
+                            // REGRESS-ACCEPT: 1 goal regressed but current subgoal succeeded.
+                            // Accept the trade-off — remove regressed goal from completed set
+                            // so it gets re-planned in a future iteration.
+                            Position regressedPos = regressedGoals.get(0);
+                            logNormal(getName() + ": [REGRESS-ACCEPT] " 
+                                    + subgoal.boxType + " -> " + subgoal.goalPos
+                                    + " disturbed " + regressedPos + " — accepting (will re-plan)");
+                            completedBoxGoals.remove(regressedPos);
+                            regressDisturbCount.merge(regressedPos, 1, Integer::sum);
+                            cachedSubgoalOrder = null;
+                            subgoalManager.invalidateHungarianCache();
+                            // Fall through to normal goal verification and completion
+                        } else {
+                            // Original rollback: 2+ regressions or subgoal not reached
+                            logNormal(getName() + ": [REGRESS] Path for " 
+                                    + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                                    + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
+                                    + " completed goal(s): " + regressedGoals + " — rollback");
+                            // Track disturbance count per completed goal.
+                            // If a completed goal is disturbed too many times, it's structurally
+                            // in a chokepoint — remove it from completedBoxGoals so future
+                            // paths aren't blocked by trying to protect it.
+                            for (Position rg : regressedGoals) {
+                                int count = regressDisturbCount.merge(rg, 1, Integer::sum);
+                                if (count >= MAX_REGRESS_PER_GOAL) {
+                                    logNormal(getName() + ": [REGRESS-UNPROTECT] Goal " + rg 
+                                            + " disturbed " + count + " times — marking unprotectable");
+                                    completedBoxGoals.remove(rg);
+                                }
                             }
+                            // Rollback: remove the executed actions from fullPlan
+                            while (fullPlan.size() > planSizeBefore) {
+                                fullPlan.remove(fullPlan.size() - 1);
+                                globalTimeStep--;
+                            }
+                            // Invalidate stored plans — state rolled back
+                            planMerger.clearAllPlans();
+                            storedPlanSubgoals.clear();
+                            continue; // try next subgoal in priority order
                         }
-                        // Rollback: remove the executed actions from fullPlan
-                        while (fullPlan.size() > planSizeBefore) {
-                            fullPlan.remove(fullPlan.size() - 1);
-                            globalTimeStep--;
-                        }
-                        // Invalidate stored plans — state rolled back
-                        planMerger.clearAllPlans();
-                        storedPlanSubgoals.clear();
-                        continue; // try next subgoal in priority order
                     }
                 }
                 
