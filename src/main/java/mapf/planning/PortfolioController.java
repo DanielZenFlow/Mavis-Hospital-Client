@@ -189,12 +189,29 @@ public class PortfolioController implements SearchStrategy {
             // Simple case: just A* with increasing weights
             strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0.40));
             strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0.60));
+        } else if (f.numAgents <= SearchConfig.JOINT_ASTAR_AGENT_THRESHOLD 
+                   && f.couplingDegree >= 0.7) {
+            // Very tightly coupled, few agents: JointAStar first, then CBS, then PP
+            strategies.add(new StrategyConfig(StrategyType.JOINT_SEARCH, 1.0, null, 0.30));
+            strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
+        } else if (f.couplingDegree >= 0.4 && f.numAgents <= 5) {
+            // Medium coupling, moderate agents: CBS then PP
+            strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.25));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.30));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.20));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.25));
         } else {
-            // Multi-agent: PP with different ordering modes
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.40));
+            // General multi-agent: PP with different ordering modes (default)
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0.35));
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.REVERSE_TOPOLOGICAL, 0.25));
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0.20));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.15));
+            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 0.10));
+            // Last resort: CBS as final fallback for loosely coupled levels
+            if (f.numAgents <= 6) {
+                strategies.add(new StrategyConfig(StrategyType.CBS, 1.0, null, 0.10));
+            }
         }
         
         return strategies;

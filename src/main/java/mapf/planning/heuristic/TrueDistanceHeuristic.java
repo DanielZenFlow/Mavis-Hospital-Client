@@ -181,6 +181,20 @@ public class TrueDistanceHeuristic implements Heuristic {
             }
         }
         
+        // Conflict penalty: boxes occupying wrong-type goals must be displaced
+        // Each misplaced box on a goal needs at least 2 extra moves to clear
+        // (move box off goal + surrounding rearrangement). This is admissible.
+        for (Map.Entry<Character, List<Position>> goalEntry : boxGoalPositions.entrySet()) {
+            char goalType = goalEntry.getKey();
+            for (Position goalPos : goalEntry.getValue()) {
+                Character boxAtGoal = state.getBoxes().get(goalPos);
+                if (boxAtGoal != null && boxAtGoal != goalType) {
+                    // Wrong box type blocking this goal — penalty of 2 (admissible lower bound)
+                    totalDistance += 2;
+                }
+            }
+        }
+        
         return totalDistance;
     }
     

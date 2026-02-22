@@ -298,12 +298,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     boolean recovered = tryRecovery(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
                     if (recovered) {
                         currentState = recomputeState(initialState, fullPlan, level, numAgents);
-                        // Do NOT call revalidateCompletedGoals here.
-                        // Displaced goals stay in completedBoxGoals (satisfying dependency checks)
-                        // but are tracked in displacedGoals (excluded from frozen set in planSubgoal).
-                        // revalidateCompletedGoals will run after the NEXT successful goal completes,
-                        // naturally detecting and cleaning up the displaced goals.
                         stuckCount = 0;
+                    } else {
+                        // Dynamic barrier re-detection: state changes may have created
+                        // new cross-color barriers. Run barrier analysis again.
+                        State afterBarrier = detectAndExecuteClearingPhase(
+                                currentState, initialState, level, fullPlan, numAgents, startTime);
+                        if (afterBarrier != currentState) {
+                            currentState = afterBarrier;
+                            stuckCount = 0;
+                            logVerbose("[PP] Dynamic barrier re-detection cleared new barriers");
+                        }
                     }
                 }
             }
@@ -2120,6 +2125,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     logVerbose("[PP] Round 3 (no frozen) for " + subgoal.boxType + " -> " + subgoal.goalPos);
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
+                    if (path != null) return path;
+                }
+                
+                // Round 4: Weighted A* escalation — use w=3 for faster (suboptimal) search
+                // This trades solution quality for search speed when standard A* exhausts budget
+                if (boxSearchPlanner.getWeight() < 2.0) {
+                    double savedWeight = boxSearchPlanner.getWeight();
+                    boxSearchPlanner.setWeight(3.0);
+                    logVerbose("[PP] Round 4 (weighted A* w=3) for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, frozen);
+                    if (path == null && !frozen.isEmpty()) {
+                        path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
+                                subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
+                    }
+                    boxSearchPlanner.setWeight(savedWeight);
                     if (path != null) return path;
                 }
                 

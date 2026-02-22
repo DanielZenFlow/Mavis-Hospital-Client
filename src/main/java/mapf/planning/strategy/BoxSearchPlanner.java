@@ -23,8 +23,20 @@ public class BoxSearchPlanner {
     private final Heuristic heuristic;
     private int maxStatesOverride = -1;
 
+    /** Weight for Weighted A*: 1.0 = standard A*, higher = faster but less optimal. */
+    private double weight = 1.0;
+
     public BoxSearchPlanner(Heuristic heuristic) {
         this.heuristic = heuristic;
+    }
+
+    /** Set A* weight. w>1 trades optimality for speed (Weighted A*). */
+    public void setWeight(double weight) {
+        this.weight = Math.max(1.0, weight);
+    }
+
+    public double getWeight() {
+        return weight;
     }
 
     /**
@@ -69,7 +81,7 @@ public class BoxSearchPlanner {
         Map<StateKey, Integer> bestG = new HashMap<>();
 
         int h = computeBoxSubgoalHeuristic(initialState, agentId, boxStart, goalPos, level);
-        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart, 0, this.weight);
         StateKey startKey = new StateKey(initialState, agentId, boxStart, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
@@ -106,6 +118,15 @@ public class BoxSearchPlanner {
                 State newState = current.state.apply(action, agentId);
 
                 Position newTargetBoxPos = findTargetBoxPosition(newState, boxType, current.targetBoxPos);
+                
+                // Corner deadlock pruning: if the target box was pushed/pulled into
+                // a corner (2 adjacent walls forming an L) and it's NOT the goal,
+                // this box can never reach the goal — prune this branch.
+                if (newTargetBoxPos != null && !newTargetBoxPos.equals(current.targetBoxPos) 
+                        && !newTargetBoxPos.equals(goalPos) && isCornerDeadlock(newTargetBoxPos, level)) {
+                    continue;
+                }
+                
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
                 int newG = current.g + 1 + penalty;
@@ -118,7 +139,7 @@ public class BoxSearchPlanner {
                 bestG.put(newKey, newG);
 
                 int newH = (newTargetBoxPos != null) ? computeBoxSubgoalHeuristic(newState, agentId, newTargetBoxPos, goalPos, level) : 0;
-                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos);
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos, 0, this.weight);
                 openList.add(newNode);
             }
         }
@@ -148,7 +169,7 @@ public class BoxSearchPlanner {
         Map<StateKeyWithTime, Integer> bestG = new HashMap<>();
 
         int h = computeBoxSubgoalHeuristic(initialState, agentId, boxStart, goalPos, level);
-        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart, startTime);
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxStart, startTime, this.weight);
         StateKeyWithTime startKey = new StateKeyWithTime(initialState, agentId, boxStart, startTime, boxType);
         openList.add(startNode);
         bestG.put(startKey, 0);
@@ -213,7 +234,7 @@ public class BoxSearchPlanner {
                 bestG.put(newKey, newG);
 
                 int newH = (newBoxPos != null) ? computeBoxSubgoalHeuristic(newState, agentId, newBoxPos, goalPos, level) : 0;
-                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newBoxPos, nextTime);
+                SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newBoxPos, nextTime, this.weight);
                 openList.add(newNode);
             }
         }
@@ -813,6 +834,23 @@ public class BoxSearchPlanner {
         }
     }
 
+    /**
+     * Corner deadlock detection: a box is in a corner deadlock if it has two
+     * adjacent walls forming an L-shape. Such a box can never be moved (no agent
+     * can get behind it to push it out), so pushing a box into a corner is
+     * futile unless that corner IS the goal.
+     * 
+     * Checks the four L-shaped wall pairs: NW, NE, SW, SE.
+     */
+    private static boolean isCornerDeadlock(Position boxPos, Level level) {
+        boolean wallN = !level.isFree(boxPos.move(Direction.N));
+        boolean wallS = !level.isFree(boxPos.move(Direction.S));
+        boolean wallE = !level.isFree(boxPos.move(Direction.E));
+        boolean wallW = !level.isFree(boxPos.move(Direction.W));
+        
+        return (wallN && wallW) || (wallN && wallE) || (wallS && wallW) || (wallS && wallE);
+    }
+
     private static class SearchNode implements Comparable<SearchNode> {
         final State state;
         final SearchNode parent;
@@ -827,11 +865,15 @@ public class BoxSearchPlanner {
         }
         
         SearchNode(State state, SearchNode parent, Action action, int g, int h, Position targetBoxPos, int time) {
+            this(state, parent, action, g, h, targetBoxPos, time, 1.0);
+        }
+
+        SearchNode(State state, SearchNode parent, Action action, int g, int h, Position targetBoxPos, int time, double weight) {
             this.state = state;
             this.parent = parent;
             this.action = action;
             this.g = g;
-            this.f = g + h;
+            this.f = g + (int)(weight * h);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
         }
