@@ -69,6 +69,37 @@ public class PortfolioController implements SearchStrategy {
             System.err.println(features.analysisReport);
         }
         
+        // Step 1b: Independence detection — solve independent groups separately
+        // This is a shortcut: if all groups solve, return immediately.
+        // If any group fails (partial), fall through to normal portfolio as fallback.
+        List<Action[]> bestPartialPlan = null;
+        
+        if (initialState.getNumAgents() > 1) {
+            List<List<Integer>> independentGroups = detectIndependentGroups(initialState, level);
+            if (independentGroups.size() > 1) {
+                if (SearchConfig.isMinimal()) {
+                    System.err.println("[Portfolio] Detected " + independentGroups.size() + 
+                        " independent agent groups: " + independentGroups);
+                }
+                List<Action[]> mergedPlan = solveIndependentGroups(independentGroups, initialState, level, startTime);
+                if (mergedPlan != null && !mergedPlan.isEmpty()) {
+                    State finalState = replayPlan(mergedPlan, initialState, level);
+                    if (finalState != null && finalState.isGoalState(level)) {
+                        if (SearchConfig.isMinimal()) {
+                            System.err.println("[Portfolio] Independence detection: SOLVED (" + mergedPlan.size() + " steps)");
+                        }
+                        return mergedPlan;
+                    }
+                    // Partial — save as fallback, continue with normal portfolio
+                    bestPartialPlan = mergedPlan;
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] Independence detection: partial (" + mergedPlan.size() + 
+                            " steps) — falling back to normal portfolio");
+                    }
+                }
+            }
+        }
+        
         // Step 2: Build strategy sequence based on analysis
         List<StrategyConfig> strategies = buildStrategySequence(features, initialState);
         
@@ -80,7 +111,6 @@ public class PortfolioController implements SearchStrategy {
         }
         
         // Step 3: Try strategies in sequence, keeping the best result
-        List<Action[]> bestPartialPlan = null;
         
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
@@ -316,6 +346,330 @@ public class PortfolioController implements SearchStrategy {
      */
     public LevelFeatures getFeatures() {
         return features;
+    }
+    
+    // ========== Independence Detection ==========
+    
+    /**
+     * Detects independent agent groups using BFS reachability.
+     * Two agents are in the same group if their reachable areas overlap
+     * (i.e., they can physically reach each other's positions).
+     * Immovable boxes (pre-satisfied boxes that shouldn't be moved) are treated as walls
+     * because pushing them would unsatisfy goals. This matches PPS's componentization.
+     */
+    private List<List<Integer>> detectIndependentGroups(State state, Level level) {
+        int numAgents = state.getNumAgents();
+        Set<Position> immovable = features != null && features.taskFilter != null 
+            ? features.taskFilter.immovableBoxes : Collections.emptySet();
+        
+        // BFS reachability per agent
+        Map<Integer, Set<Position>> reachable = new HashMap<>();
+        for (int a = 0; a < numAgents; a++) {
+            Set<Position> area = new HashSet<>();
+            Queue<Position> queue = new LinkedList<>();
+            Position start = state.getAgentPosition(a);
+            queue.add(start);
+            area.add(start);
+            while (!queue.isEmpty()) {
+                Position current = queue.poll();
+                for (Direction dir : Direction.values()) {
+                    Position next = current.move(dir);
+                    if (!level.isWall(next) && !immovable.contains(next) && !area.contains(next)) {
+                        area.add(next);
+                        queue.add(next);
+                    }
+                }
+            }
+            reachable.put(a, area);
+        }
+        
+        // Union-Find: agents whose reachable sets overlap
+        int[] parent = new int[numAgents];
+        for (int i = 0; i < numAgents; i++) parent[i] = i;
+        for (int a = 0; a < numAgents; a++) {
+            for (int b = a + 1; b < numAgents; b++) {
+                if (reachable.get(a).contains(state.getAgentPosition(b))) {
+                    ufUnion(parent, a, b);
+                }
+            }
+        }
+        
+        // Group by root
+        Map<Integer, List<Integer>> groups = new LinkedHashMap<>();
+        for (int a = 0; a < numAgents; a++) {
+            groups.computeIfAbsent(ufFind(parent, a), k -> new ArrayList<>()).add(a);
+        }
+        return new ArrayList<>(groups.values());
+    }
+    
+    private int ufFind(int[] parent, int x) {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    }
+    
+    private void ufUnion(int[] parent, int a, int b) {
+        parent[ufFind(parent, a)] = ufFind(parent, b);
+    }
+    
+    /**
+     * Solves independent groups separately and merges results.
+     * Each group gets a projected State+Level with remapped agent IDs (0..k-1),
+     * an independent strategy sequence, and its own timeout budget.
+     */
+    private List<Action[]> solveIndependentGroups(List<List<Integer>> groups,
+            State initialState, Level level, long startTime) {
+        int numAgents = level.getNumAgents();
+        Set<Position> immovable = features != null && features.taskFilter != null 
+            ? features.taskFilter.immovableBoxes : Collections.emptySet();
+        List<GroupResult> results = new ArrayList<>();
+        
+        for (List<Integer> group : groups) {
+            long remaining = timeoutMs - (System.currentTimeMillis() - startTime);
+            if (remaining <= 0) break;
+            
+            // Compute reachable area for this group
+            Set<Position> reachableArea = computeReachableArea(group, initialState, level, immovable);
+            
+            // Project State and Level to this group
+            int[] originalIds = group.stream().sorted().mapToInt(Integer::intValue).toArray();
+            Map<Integer, Integer> newIdMap = new HashMap<>();
+            for (int i = 0; i < originalIds.length; i++) newIdMap.put(originalIds[i], i);
+            
+            State projState = projectState(originalIds, initialState, reachableArea);
+            Level projLevel = projectLevel(originalIds, newIdMap, level, reachableArea);
+            
+            if (SearchConfig.isMinimal()) {
+                System.err.println("[Portfolio] Solving group " + group + " (" + group.size() + 
+                    " agents, timeout=" + remaining + "ms)");
+            }
+            
+            // Solve this group independently
+            List<Action[]> groupPlan = solveGroup(projState, projLevel, remaining);
+            
+            // Check if group subproblem was fully solved
+            boolean groupSolved = false;
+            if (groupPlan != null && !groupPlan.isEmpty()) {
+                State finalState = replayPlan(groupPlan, projState, projLevel);
+                groupSolved = finalState != null && finalState.isGoalState(projLevel);
+            }
+            results.add(new GroupResult(originalIds, groupPlan));
+            
+            if (SearchConfig.isMinimal()) {
+                System.err.println("[Portfolio] Group " + group + ": " + 
+                    (groupPlan != null ? groupPlan.size() + " steps" + (groupSolved ? " SOLVED" : " PARTIAL") : "FAILED"));
+            }
+        }
+        
+        return mergeGroupPlans(results, numAgents);
+    }
+    
+    /**
+     * BFS reachability from all agents in the group.
+     * Movable boxes are passable, immovable boxes and walls are not.
+     */
+    private Set<Position> computeReachableArea(List<Integer> agentIds, State state, 
+            Level level, Set<Position> immovable) {
+        Set<Position> area = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        for (int agentId : agentIds) {
+            Position start = state.getAgentPosition(agentId);
+            if (area.add(start)) queue.add(start);
+        }
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (level.isWall(next)) continue;
+                if (immovable.contains(next)) {
+                    area.add(next); // Include boundary immovable box but don't expand through
+                    continue;
+                }
+                if (area.add(next)) {
+                    queue.add(next);
+                }
+            }
+        }
+        return area;
+    }
+    
+    /**
+     * Projects a State to contain only the group's agents (remapped 0..k-1)
+     * and boxes within the reachable area.
+     */
+    private State projectState(int[] originalIds, State state, Set<Position> reachableArea) {
+        Position[] newAgentPositions = new Position[originalIds.length];
+        for (int i = 0; i < originalIds.length; i++) {
+            newAgentPositions[i] = state.getAgentPosition(originalIds[i]);
+        }
+        Map<Position, Character> newBoxes = new HashMap<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (reachableArea.contains(entry.getKey())) {
+                newBoxes.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return new State(newAgentPositions, newBoxes);
+    }
+    
+    /**
+     * Projects a Level for an independent group:
+     * - Walls: unchanged (immovable boxes are included as boxes in the projected state;
+     *   the group's TaskFilter will naturally detect them as immovable)
+     * - Box goals: only those in the reachable area
+     * - Agent goals: remapped to new IDs, only active agents
+     * - Agent colors: remapped to new IDs
+     * - Box colors: unchanged (unused types are harmless)
+     */
+    private Level projectLevel(int[] originalIds, Map<Integer, Integer> newIdMap,
+            Level level, Set<Position> reachableArea) {
+        int rows = level.getRows();
+        int cols = level.getCols();
+        
+        boolean[][] walls = new boolean[rows][cols];
+        char[][] boxGoals = new char[rows][cols];
+        int[][] agentGoals = new int[rows][cols];
+        
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                walls[r][c] = level.isWall(r, c);
+                agentGoals[r][c] = -1; // default: no agent goal
+                
+                // Keep box goals only in reachable area
+                char bg = level.getBoxGoal(r, c);
+                if (bg != '\0' && reachableArea.contains(Position.of(r, c))) {
+                    boxGoals[r][c] = bg;
+                }
+                
+                // Remap agent goals to new IDs
+                int ag = level.getAgentGoal(r, c);
+                if (ag >= 0 && newIdMap.containsKey(ag)) {
+                    agentGoals[r][c] = newIdMap.get(ag);
+                }
+            }
+        }
+        
+        Map<Integer, Color> agentColors = new HashMap<>();
+        for (int i = 0; i < originalIds.length; i++) {
+            agentColors.put(i, level.getAgentColor(originalIds[i]));
+        }
+        
+        return new Level(level.getName() + "_g" + originalIds[0], rows, cols,
+                         walls, boxGoals, agentGoals, level.getBoxColors(), agentColors);
+    }
+    
+    /**
+     * Runs the full strategy sequence for a projected group subproblem.
+     */
+    private List<Action[]> solveGroup(State projState, Level projLevel, long timeout) {
+        LevelFeatures groupFeatures = LevelAnalyzer.analyze(projLevel, projState);
+        List<StrategyConfig> strategies = buildStrategySequence(groupFeatures, projState);
+        
+        Heuristic heuristic;
+        try {
+            heuristic = new TrueDistanceHeuristic(projLevel);
+        } catch (Exception e) {
+            heuristic = new ManhattanHeuristic();
+        }
+        
+        if (SearchConfig.isMinimal()) {
+            System.err.println("  Strategy sequence: " + 
+                strategies.stream().map(s -> s.type.name() + 
+                    (s.orderingMode != null ? "(" + s.orderingMode + 
+                        (s.orderingMode == OrderingMode.RANDOM ? "#" + s.randomSeed : "") + ")" : "")).toList());
+        }
+        
+        long groupStart = System.currentTimeMillis();
+        long remaining = timeout;
+        List<Action[]> bestPartial = null;
+        
+        mapf.planning.strategy.SubgoalManager groupSubgoalManager = 
+            new mapf.planning.strategy.SubgoalManager(heuristic);
+        
+        for (StrategyConfig sc : strategies) {
+            if (remaining <= 0) break;
+            long attemptTimeout = Math.min((long)(timeout * sc.timeBudgetFraction), remaining);
+            
+            SearchConfig strategyConfig = new SearchConfig(
+                timeout, this.config.getMaxStates(), sc.weight);
+            
+            SearchStrategy strategy;
+            if (sc.type == StrategyType.SINGLE_AGENT) {
+                SingleAgentStrategy sa = new SingleAgentStrategy(heuristic, strategyConfig);
+                sa.setWeight(sc.weight);
+                strategy = sa;
+            } else {
+                PriorityPlanningStrategy pp = new PriorityPlanningStrategy(
+                    heuristic, strategyConfig, groupSubgoalManager);
+                if (groupFeatures.executionOrder != null) pp.setGoalExecutionOrder(groupFeatures.executionOrder);
+                if (groupFeatures.goalDependsOn != null) pp.setGoalDependencies(groupFeatures.goalDependsOn);
+                if (groupFeatures.taskFilter != null) pp.setImmovableBoxes(groupFeatures.taskFilter.immovableBoxes);
+                if (sc.orderingMode != null) pp.setOrderingMode(sc.orderingMode);
+                if (sc.orderingMode == OrderingMode.RANDOM && sc.randomSeed != 0) pp.setRandomSeed(sc.randomSeed);
+                strategy = pp;
+            }
+            strategy.setTimeout(attemptTimeout);
+            
+            List<Action[]> result = null;
+            try {
+                result = strategy.search(projState, projLevel);
+            } catch (Exception e) {
+                System.err.println("[Portfolio] Group strategy " + sc.type + " threw: " + e.getMessage());
+            }
+            
+            if (result != null && !result.isEmpty()) {
+                State finalState = replayPlan(result, projState, projLevel);
+                if (finalState != null && finalState.isGoalState(projLevel)) {
+                    return result;
+                }
+                if (bestPartial == null || result.size() > bestPartial.size()) {
+                    bestPartial = result;
+                }
+            }
+            
+            remaining = timeout - (System.currentTimeMillis() - groupStart);
+        }
+        
+        return bestPartial;
+    }
+    
+    /**
+     * Merges per-group plans into a single joint action plan.
+     * Each group's actions are remapped from projected agent IDs (0..k-1) back to
+     * original agent IDs. Non-active agents get NoOp at each timestep.
+     */
+    private List<Action[]> mergeGroupPlans(List<GroupResult> results, int numAgents) {
+        int maxLen = 0;
+        for (GroupResult gr : results) {
+            if (gr.plan != null) maxLen = Math.max(maxLen, gr.plan.size());
+        }
+        if (maxLen == 0) return null;
+        
+        List<Action[]> merged = new ArrayList<>(maxLen);
+        for (int t = 0; t < maxLen; t++) {
+            Action[] joint = new Action[numAgents];
+            Arrays.fill(joint, Action.NOOP);
+            for (GroupResult gr : results) {
+                if (gr.plan != null && t < gr.plan.size()) {
+                    Action[] groupAction = gr.plan.get(t);
+                    for (int newId = 0; newId < gr.originalIds.length; newId++) {
+                        int origId = gr.originalIds[newId];
+                        if (newId < groupAction.length && groupAction[newId] != null) {
+                            joint[origId] = groupAction[newId];
+                        }
+                    }
+                }
+            }
+            merged.add(joint);
+        }
+        return merged;
+    }
+    
+    private static class GroupResult {
+        final int[] originalIds;
+        final List<Action[]> plan;
+        GroupResult(int[] originalIds, List<Action[]> plan) {
+            this.originalIds = originalIds;
+            this.plan = plan;
+        }
     }
     
     // ========== Helper Classes ==========
