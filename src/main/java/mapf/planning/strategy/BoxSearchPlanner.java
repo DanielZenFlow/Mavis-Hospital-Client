@@ -119,14 +119,6 @@ public class BoxSearchPlanner {
 
                 Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 
-                // Corner deadlock pruning: if the target box was pushed/pulled into
-                // a corner (2 adjacent walls forming an L) and it's NOT the goal,
-                // this box can never reach the goal — prune this branch.
-                if (newTargetBoxPos != null && !newTargetBoxPos.equals(current.targetBoxPos) 
-                        && !newTargetBoxPos.equals(goalPos) && isCornerDeadlock(newTargetBoxPos, level)) {
-                    continue;
-                }
-                
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
                 int newG = current.g + 1 + penalty;
@@ -921,23 +913,6 @@ public class BoxSearchPlanner {
         public int hashCode() {
             return Objects.hash(agentPos, boxHash);
         }
-    }
-
-    /**
-     * Corner deadlock detection: a box is in a corner deadlock if it has two
-     * adjacent walls forming an L-shape. Such a box can never be moved (no agent
-     * can get behind it to push it out), so pushing a box into a corner is
-     * futile unless that corner IS the goal.
-     * 
-     * Checks the four L-shaped wall pairs: NW, NE, SW, SE.
-     */
-    private static boolean isCornerDeadlock(Position boxPos, Level level) {
-        boolean wallN = !level.isFree(boxPos.move(Direction.N));
-        boolean wallS = !level.isFree(boxPos.move(Direction.S));
-        boolean wallE = !level.isFree(boxPos.move(Direction.E));
-        boolean wallW = !level.isFree(boxPos.move(Direction.W));
-        
-        return (wallN && wallW) || (wallN && wallE) || (wallS && wallW) || (wallS && wallE);
     }
 
     private static class SearchNode implements Comparable<SearchNode> {
