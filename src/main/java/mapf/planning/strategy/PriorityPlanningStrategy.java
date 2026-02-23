@@ -353,6 +353,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Clear barrier cache — state changed, barriers may now be extractable
                     skippedBarrierClearingOrders.clear();
                     dynamicBarrierRounds = 0;
+                    // Decay regress disturbance counts on genuine progress.
+                    // Goals disturbed by earlier exploration get credit for progress,
+                    // preventing premature REGRESS-UNPROTECT marking from early-phase
+                    // disturbances that were resolved by subsequent subgoal success.
+                    if (!regressDisturbCount.isEmpty()) {
+                        regressDisturbCount.replaceAll((pos, count) -> Math.max(0, count - 1));
+                        regressDisturbCount.values().removeIf(c -> c <= 0);
+                    }
                 } else {
                     stuckCount++;
                 }
@@ -3033,19 +3041,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 
                 // Round 3: No frozen at all (desperate — allows disturbing any completed goal)
+                // Progressive budget: increase by 50% for desperate search (harder subgoal)
                 if (!frozen.isEmpty()) {
-                    logVerbose("[PP] Round 3 (no frozen) for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    boxSearchPlanner.setMaxStatesOverride(Math.min(dynamicBudget * 3 / 2, SearchConfig.MAX_BSP_BUDGET * 2));
+                    logVerbose("[PP] Round 3 (no frozen, budget=" + (dynamicBudget * 3 / 2) + ") for " + subgoal.boxType + " -> " + subgoal.goalPos);
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, Collections.emptySet());
                     if (path != null) return path;
                 }
                 
                 // Round 4: Weighted A* escalation — use w=3 for faster (suboptimal) search
-                // This trades solution quality for search speed when standard A* exhausts budget
+                // Progressive budget: double budget for weighted A* (consumes states faster)
                 if (boxSearchPlanner.getWeight() < 2.0) {
+                    boxSearchPlanner.setMaxStatesOverride(Math.min(dynamicBudget * 2, SearchConfig.MAX_BSP_BUDGET * 2));
                     double savedWeight = boxSearchPlanner.getWeight();
                     boxSearchPlanner.setWeight(3.0);
-                    logVerbose("[PP] Round 4 (weighted A* w=3) for " + subgoal.boxType + " -> " + subgoal.goalPos);
+                    logVerbose("[PP] Round 4 (weighted A* w=3, budget=" + (dynamicBudget * 2) + ") for " + subgoal.boxType + " -> " + subgoal.goalPos);
                     path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, frozen);
                     if (path == null && !frozen.isEmpty()) {

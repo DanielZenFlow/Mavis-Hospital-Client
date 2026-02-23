@@ -328,7 +328,8 @@ public class BoxSearchPlanner {
         bestG.put(startKey, 0);
 
         int exploredCount = 0;
-        int maxExplore = 2000;
+        // Scale displacement budget with effective search budget (min 2000, up to 1/4 of effective max)
+        int maxExplore = Math.max(2000, getEffectiveMaxStates() / 4);
 
         while (!openList.isEmpty() && exploredCount < maxExplore) {
             if (exploredCount % 100 == 0 && System.currentTimeMillis() - startTime > timeLimitMs) {
