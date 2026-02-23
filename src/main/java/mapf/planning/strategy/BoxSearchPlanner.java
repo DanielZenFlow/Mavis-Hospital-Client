@@ -891,14 +891,25 @@ public class BoxSearchPlanner {
         }
     }
     
-    /** State key for agent goal search: tracks agent position + all box positions
-     *  since Push/Pull changes box layout. */
+    /**
+     * State key for agent goal search: tracks only agent position.
+     * 
+     * Previous version tracked all box positions (state.getBoxes().hashCode()),
+     * which caused state space explosion on levels with many boxes (e.g. 45+ boxes
+     * in pacMAn). Every incidental push/pull created a unique state key, exhausting
+     * the search budget before the agent could reach its goal.
+     * 
+     * In pull-enabled Sokoban, the agent can always push/pull same-color boxes
+     * out of the way. Tracking only agent position is safe because:
+     * - A* guarantees the shortest path (lowest g) reaches each position first
+     * - If two paths reach the same position with different box layouts, the
+     *   shorter one is preferred regardless of box arrangement
+     * - Box displacement is a side-effect of pathfinding, not the goal
+     */
     private static class AgentGoalStateKey extends StateKey {
-        private final int boxHash;
         
         AgentGoalStateKey(State state, int agentId) {
             super(state, agentId, null);
-            this.boxHash = state.getBoxes().hashCode();
         }
         
         @Override
@@ -906,12 +917,12 @@ public class BoxSearchPlanner {
             if (this == obj) return true;
             if (!(obj instanceof AgentGoalStateKey)) return false;
             AgentGoalStateKey other = (AgentGoalStateKey) obj;
-            return agentPos.equals(other.agentPos) && boxHash == other.boxHash;
+            return agentPos.equals(other.agentPos);
         }
         
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, boxHash);
+            return agentPos.hashCode();
         }
     }
 

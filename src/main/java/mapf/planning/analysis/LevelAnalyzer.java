@@ -1011,7 +1011,7 @@ public class LevelAnalyzer {
         Set<Position> visited = new HashSet<>();
         Set<Position> obstacles = new HashSet<>(immovableBoxes);
         obstacles.addAll(blockedPositions);
-        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        // FIXED: Movable boxes are NOT permanent obstacles (see existsPushPath fix).
         obstacles.remove(start);
         
         q.add(start);
@@ -1100,10 +1100,13 @@ public class LevelAnalyzer {
         Set<Position> obstacles = new HashSet<>(immovableBoxes);
         if (blockedPos != null) obstacles.add(blockedPos);
         
-        // Also add movableBoxPositions to obstacles, because if we are testing a specific box path,
-        // other boxes are obstacles unless we recursively solve them (too complex).
-        // Since this is for dependency analysis, assuming other boxes are obstacles is safer.
-        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        // FIXED: Movable boxes are NOT treated as permanent obstacles.
+        // In pull-enabled Sokoban, agents can push/pull movable boxes out of the way.
+        // Treating them as obstacles caused massive false dependencies → spurious
+        // cycles → topological sort failure → RANDOM ordering on levels like
+        // BigSplit, Spiraling, ISO, TheGate. This is consistent with
+        // isReachableWithHypotheticalBlock() which already correctly ignores
+        // movable boxes for agent reachability.
         
         // Start position cannot be an obstacle (it's where the box is)
         obstacles.remove(start); 
