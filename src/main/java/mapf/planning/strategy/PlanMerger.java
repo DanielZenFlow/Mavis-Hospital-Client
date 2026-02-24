@@ -253,6 +253,9 @@ public class PlanMerger {
 
     /**
      * Updates plan indexes after applying a joint action.
+     * If conflict resolution changed the action (e.g., Move→NoOp), the plan
+     * is now invalid because the agent didn't move as expected. In that case,
+     * we clear the stale plan to force re-planning on the next step.
      */
     public void updatePlanIndexes(Action[] jointAction, int numAgents, int primaryAgent) {
         for (int agentId = 0; agentId < numAgents; agentId++) {
@@ -269,7 +272,15 @@ public class PlanMerger {
                         jointAction[agentId].type == expectedAction.type &&
                         jointAction[agentId].agentDir == expectedAction.agentDir &&
                         jointAction[agentId].boxDir == expectedAction.boxDir) {
+                    // Action executed as planned — advance index
                     planIndexes.put(agentId, index + 1);
+                } else if (jointAction[agentId] != null && 
+                           jointAction[agentId].type != expectedAction.type) {
+                    // Action was modified by conflict resolution (e.g., Move→NoOp).
+                    // The agent didn't move as expected, so the rest of the plan
+                    // is now invalid. Clear it to force re-planning.
+                    storedPlans.remove(agentId);
+                    planIndexes.remove(agentId);
                 }
             }
         }

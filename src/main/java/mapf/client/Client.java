@@ -245,7 +245,11 @@ public class Client {
         if (USE_PORTFOLIO) {
             debugOut.println("[Client] Using Portfolio Controller");
             PortfolioController portfolio = new PortfolioController(config);
-            portfolio.setTimeout(config.getTimeoutMs());
+            // Reserve 5s safety buffer for action serialization and transmission
+            // Without this, the planner may use the full server timeout, leaving
+            // no time to actually send the plan, causing 0-action submissions.
+            long planningTimeout = Math.max(config.getTimeoutMs() - 5_000, config.getTimeoutMs() / 2);
+            portfolio.setTimeout(planningTimeout);
             return portfolio.search(currentState, level);
         }
 

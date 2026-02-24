@@ -813,11 +813,10 @@ public class BoxSearchPlanner {
             this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
         }
         
+        /** 4-arg constructor: tracks same-type box positions for obstacle-aware dedup. */
         StateKey(State state, int agentId, Position targetBoxPos, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            // Collect and sort all positions of boxes with the same type
-            // Sorted list provides deterministic, collision-free equality comparison
             List<Position> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
                 if (e.getValue() == boxType) {

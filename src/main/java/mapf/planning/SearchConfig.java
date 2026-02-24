@@ -83,8 +83,12 @@ public class SearchConfig {
     /** Minimum BSP search budget (states) — even very short subgoals get this much */
     public static final int MIN_BSP_BUDGET = 8_000;
 
-    /** Maximum BSP search budget (states) — cap for very long distance subgoals */
-    public static final int MAX_BSP_BUDGET = 40_000;
+    /** Maximum BSP search budget (states) — cap for very long distance subgoals.
+     *  Adaptive: use getEffectiveMaxBspBudget() for level-aware cap. */
+    public static final int MAX_BSP_BUDGET = 80_000;
+    
+    /** Max BSP budget for large levels (freeSpaces > 500) to prevent OOM */
+    public static final int MAX_BSP_BUDGET_LARGE = 25_000;
 
     /** States budget added per unit of estimated distance */
     public static final int BSP_BUDGET_PER_DISTANCE = 2_000;

@@ -100,6 +100,10 @@ public class PortfolioController implements SearchStrategy {
             }
         }
         
+        // Hint GC before full portfolio — independence detection may have accumulated
+        // significant garbage from projected levels/states/heuristics.
+        System.gc();
+        
         // Step 2: Build strategy sequence based on analysis
         List<StrategyConfig> strategies = buildStrategySequence(features, initialState);
         
@@ -221,27 +225,63 @@ public class PortfolioController implements SearchStrategy {
      *   not Sokoban push/pull; JointAStar is O(5^n) unusable above 3 agents).
      *   CBS is retained as PP-internal cycle fallback (tryCBSFallback).
      * - REVERSE_TOPOLOGICAL is removed (never solved any competition level in testing).
-     * - Multi-seed RANDOM is the primary cycle-breaking mechanism: different seeds
-     *   produce different shuffle orderings, multiplying the chance of finding a
-     *   subgoal order that avoids TRAP/REGRESS deadlocks.
+     * - Multi-seed RANDOM is last-resort diversification with minimal budget.
+     * 
+     * Feature-aware branching:
+     * - corridorRatio distinguishes spiral/maze (>0.5) from open-room (<= 0.5) topologies.
+     *   Spiral levels need DISTANCE_FARTHEST (outer goals first); open levels need GREEDY.
+     * - hasCircularDependency gates whether dependency-aware ordering is possible.
+     * - Single-agent threshold (activeBoxGoals > 8) routes large levels to PP decomposition.
      */
     private List<StrategyConfig> buildStrategySequence(LevelFeatures f, State state) {
         List<StrategyConfig> strategies = new ArrayList<>();
         
         if (f.recommendedStrategy == StrategyType.SINGLE_AGENT) {
-            // Single agent: A* with increasing weights
-            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0, 0.40));
-            strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0, 0.60));
+            // Count active box goals (total goals minus already-satisfied minus agent goals)
+            int activeBoxGoals = f.numGoals;
+            if (f.taskFilter != null) {
+                activeBoxGoals -= f.taskFilter.satisfiedGoals.size();
+            }
+            
+            if (activeBoxGoals > 8) {
+                // Many box goals: SingleAgentStrategy's full-state closed list causes 
+                // state explosion (e.g., pacMAn with 45+ same-type boxes).
+                // Use PriorityPlanningStrategy which decomposes into one-box-at-a-time subgoals.
+                System.err.println("[Portfolio] Single agent with " + activeBoxGoals + 
+                    " active goals → using PP decomposition instead of full-state A*");
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.40));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.35));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.25));
+            } else {
+                // Few box goals: SingleAgentStrategy A* is efficient
+                strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 1.0, null, 0, 0.40));
+                strategies.add(new StrategyConfig(StrategyType.SINGLE_AGENT, 5.0, null, 0, 0.60));
+            }
         } else if (f.hasCircularDependency) {
-            // Cyclic dependencies: multi-seed RANDOM is primary strategy.
-            // Each seed produces a different subgoal shuffle, breaking different cycles.
-            // TOPOLOGICAL retained as backup — still produces good partial plans even with cycles.
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 137, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.25));
-            strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.25));
+            // Cyclic dependencies: strategy depends on topology.
+            if (f.corridorRatio > 0.5) {
+                // Spiral/maze topology (high corridor ratio): outer goals must be filled
+                // before inner goals block narrow corridors with cross-color boxes.
+                // DISTANCE_FARTHEST is the primary strategy.
+                System.err.println("[Portfolio] Cyclic + spiral topology (corridorRatio=" + 
+                    String.format("%.2f", f.corridorRatio) + ") → FARTHEST-first");
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_FARTHEST, 0, 0.40));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.30));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.15));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 137, 0.15));
+            } else {
+                // Open-room cyclic topology (low corridor ratio): TOPO uses partial
+                // ordering from dependency analysis (valuable even with cycles).
+                // GREEDY nearest-first is a good fallback for coordination-heavy levels.
+                System.err.println("[Portfolio] Cyclic + open topology (corridorRatio=" + 
+                    String.format("%.2f", f.corridorRatio) + ") → TOPO-first");
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.35));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.35));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.15));
+                strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 137, 0.15));
+            }
         } else {
-            // No cycles: topological order is well-founded, use it first.
+            // No cycles: topological order is well-founded, give it the most budget.
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.40));
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.30));
             strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.RANDOM, 42, 0.30));
@@ -415,6 +455,10 @@ public class PortfolioController implements SearchStrategy {
      * Solves independent groups separately and merges results.
      * Each group gets a projected State+Level with remapped agent IDs (0..k-1),
      * an independent strategy sequence, and its own timeout budget.
+     * 
+     * Time management: independence detection phase is capped at 50% of total timeout
+     * to reserve budget for the full portfolio fallback. Within that cap, time is
+     * distributed fairly across remaining groups (remaining / groupsLeft).
      */
     private List<Action[]> solveIndependentGroups(List<List<Integer>> groups,
             State initialState, Level level, long startTime) {
@@ -423,9 +467,17 @@ public class PortfolioController implements SearchStrategy {
             ? features.taskFilter.immovableBoxes : Collections.emptySet();
         List<GroupResult> results = new ArrayList<>();
         
-        for (List<Integer> group : groups) {
-            long remaining = timeoutMs - (System.currentTimeMillis() - startTime);
+        // Cap independence detection at 50% of total timeout, reserving 50% for fallback
+        long independenceDeadline = startTime + (long)(timeoutMs * 0.5);
+        
+        for (int gi = 0; gi < groups.size(); gi++) {
+            List<Integer> group = groups.get(gi);
+            long remaining = independenceDeadline - System.currentTimeMillis();
             if (remaining <= 0) break;
+            
+            // Fair share: distribute remaining time evenly across unsolved groups
+            int groupsLeft = groups.size() - gi;
+            long groupTimeout = remaining / groupsLeft;
             
             // Compute reachable area for this group
             Set<Position> reachableArea = computeReachableArea(group, initialState, level, immovable);
@@ -440,11 +492,11 @@ public class PortfolioController implements SearchStrategy {
             
             if (SearchConfig.isMinimal()) {
                 System.err.println("[Portfolio] Solving group " + group + " (" + group.size() + 
-                    " agents, timeout=" + remaining + "ms)");
+                    " agents, timeout=" + groupTimeout + "ms)");
             }
             
             // Solve this group independently
-            List<Action[]> groupPlan = solveGroup(projState, projLevel, remaining);
+            List<Action[]> groupPlan = solveGroup(projState, projLevel, groupTimeout);
             
             // Check if group subproblem was fully solved
             boolean groupSolved = false;
