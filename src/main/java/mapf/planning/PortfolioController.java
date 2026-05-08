@@ -125,6 +125,39 @@ public class PortfolioController implements SearchStrategy {
                         + independentGroups.size() + " -> " + refinedGroups.size() + " groups");
             }
             independentGroups = refinedGroups;
+
+            // P3: cross-group goal-dependency merge.
+            // refineGroupsByFootprint considers PHYSICAL coupling (shared cells/boxes/goals)
+            // but ignores LOGICAL coupling encoded in features.goalDependsOn. If goal A
+            // (serviced by group X) depends on goal B (serviced by group Y), then solving
+            // X in isolation necessarily produces a partial plan because B is invisible
+            // after projection. Merging X and Y eliminates the wasted attempt + fallback.
+            // Per qanda.txt 2.2: dependency analysis identifies "must-do-before" edges;
+            // those edges constrain which groups can truly act independently.
+            if (features != null && features.goalDependsOn != null
+                    && !features.goalDependsOn.isEmpty() && independentGroups.size() > 1) {
+                List<List<Integer>> mergedGroups = mergeGroupsByGoalDependencies(
+                        independentGroups, level, features.goalDependsOn);
+                // Only ACCEPT the merge if it leaves at least 2 groups. A collapse to 1
+                // means "everyone is logically coupled" — but in that case the existing
+                // per-group attempts (each runs a short PP) provide cache warm-up and
+                // fast feedback that the cold full-portfolio fallback cannot match.
+                // Empirical: ClosedAI 5→1 collapse REGRESSED (60s timeout); 5→2 BigSplit
+                // is the sweet spot. Keep merge effective when it preserves parallelism.
+                if (mergedGroups.size() < independentGroups.size() && mergedGroups.size() >= 2) {
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] P3 cross-group dependency merge: "
+                                + independentGroups.size() + " -> " + mergedGroups.size() + " groups");
+                    }
+                    independentGroups = mergedGroups;
+                } else if (mergedGroups.size() == 1 && independentGroups.size() > 1
+                        && SearchConfig.isMinimal()) {
+                    System.err.println("[Portfolio] P3: dependency analysis suggests full coupling ("
+                            + independentGroups.size() + " -> 1); keeping original "
+                            + independentGroups.size() + " groups for warm-up + fallback path");
+                }
+            }
+
             if (independentGroups.size() > 1) {
                 if (SearchConfig.isMinimal()) {
                     System.err.println("[Portfolio] Detected " + independentGroups.size() + 
@@ -563,9 +596,130 @@ public class PortfolioController implements SearchStrategy {
     private void ufUnion(int[] parent, int a, int b) {
         parent[ufFind(parent, a)] = ufFind(parent, b);
     }
-    
+
+    // ========== P3: Cross-Group Goal-Dependency Merge ==========
+
+    /**
+     * Merges groups whose goals have dependencies crossing group boundaries.
+     *
+     * Motivation (qanda.txt 2.2 / claudeopus47.txt 5.2):
+     * Independence detection (BFS reachability + footprint refinement) identifies
+     * spatial / physical coupling but does NOT consult the goal dependency graph.
+     * If goalDependsOn says "goal A (in group X) depends on goal B (in group Y)",
+     * projecting X in isolation drops B from the level entirely \u2014 making A
+     * unsolvable as an isolated subproblem. The result is a wasted partial-plan
+     * attempt plus a forced fallback to full-portfolio solve.
+     *
+     * This merge step uses union-find: for every dependency edge whose endpoints
+     * lie in DIFFERENT current groups, union those groups. Conservative by design:
+     * only ever merges (reduces group count); never splits.
+     *
+     * Mapping rule (goal -> candidate groups):
+     *   - Agent-goal at p: the unique agent that owns that goal -> its group.
+     *   - Box-goal at p of color c: every group containing at least one agent of
+     *     color c (any of them could service that goal). If multiple groups match,
+     *     they all become candidates and pairwise dependency edges merge them.
+     */
+    private List<List<Integer>> mergeGroupsByGoalDependencies(
+            List<List<Integer>> groups, Level level,
+            Map<Position, Set<Position>> goalDependsOn) {
+
+        int numAgents = level.getNumAgents();
+        int[] agentGroup = new int[numAgents];
+        Arrays.fill(agentGroup, -1);
+        for (int gi = 0; gi < groups.size(); gi++) {
+            for (int aid : groups.get(gi)) {
+                if (aid >= 0 && aid < numAgents) agentGroup[aid] = gi;
+            }
+        }
+
+        // Pre-compute color -> set of group indices that contain at least one agent of that color.
+        Map<Color, Set<Integer>> colorToGroups = new HashMap<>();
+        for (int aid = 0; aid < numAgents; aid++) {
+            if (agentGroup[aid] < 0) continue;
+            Color c = level.getAgentColor(aid);
+            if (c == null) continue;
+            colorToGroups.computeIfAbsent(c, k -> new HashSet<>()).add(agentGroup[aid]);
+        }
+
+        int[] parent = new int[groups.size()];
+        for (int i = 0; i < parent.length; i++) parent[i] = i;
+
+        // Cache resolved goal -> candidate groups so we don't rescan per edge.
+        Map<Position, Set<Integer>> goalGroupsCache = new HashMap<>();
+        java.util.function.Function<Position, Set<Integer>> resolve = goalPos -> {
+            Set<Integer> cached = goalGroupsCache.get(goalPos);
+            if (cached != null) return cached;
+            Set<Integer> resolved = resolveGoalGroups(goalPos, level, agentGroup, colorToGroups);
+            goalGroupsCache.put(goalPos, resolved);
+            return resolved;
+        };
+
+        int crossEdges = 0;
+        for (Map.Entry<Position, Set<Position>> entry : goalDependsOn.entrySet()) {
+            Position src = entry.getKey();
+            Set<Position> deps = entry.getValue();
+            if (deps == null || deps.isEmpty()) continue;
+            Set<Integer> srcGroups = resolve.apply(src);
+            if (srcGroups.isEmpty()) continue;
+            for (Position dst : deps) {
+                Set<Integer> dstGroups = resolve.apply(dst);
+                if (dstGroups.isEmpty()) continue;
+                // Edge crosses if there is at least one (s, d) pair in different groups.
+                boolean crossed = false;
+                for (int s : srcGroups) {
+                    for (int d : dstGroups) {
+                        if (ufFind(parent, s) != ufFind(parent, d)) {
+                            ufUnion(parent, s, d);
+                            crossed = true;
+                        }
+                    }
+                }
+                if (crossed) crossEdges++;
+            }
+        }
+
+        if (crossEdges == 0) return groups;
+
+        // Re-bucket groups by their union-find roots.
+        Map<Integer, List<Integer>> merged = new LinkedHashMap<>();
+        for (int gi = 0; gi < groups.size(); gi++) {
+            merged.computeIfAbsent(ufFind(parent, gi), k -> new ArrayList<>()).addAll(groups.get(gi));
+        }
+        // Sort agent ids inside each merged group for deterministic logging.
+        List<List<Integer>> result = new ArrayList<>(merged.values());
+        for (List<Integer> g : result) Collections.sort(g);
+        return result;
+    }
+
+    /**
+     * Resolves the candidate group set that could service a given goal position.
+     * Returns empty set if the goal has no servicing agents (treated as orphan).
+     */
+    private Set<Integer> resolveGoalGroups(Position goalPos, Level level,
+                                            int[] agentGroup,
+                                            Map<Color, Set<Integer>> colorToGroups) {
+        // Agent-goal: unique owner.
+        int agentId = level.getAgentGoal(goalPos);
+        if (agentId >= 0 && agentId < agentGroup.length && agentGroup[agentId] >= 0) {
+            Set<Integer> single = new HashSet<>();
+            single.add(agentGroup[agentId]);
+            return single;
+        }
+        // Box-goal: any group with a same-color agent could service.
+        char boxType = level.getBoxGoal(goalPos);
+        if (boxType != '\0') {
+            Color c = level.getBoxColor(boxType);
+            if (c != null) {
+                Set<Integer> grps = colorToGroups.get(c);
+                if (grps != null) return grps;
+            }
+        }
+        return Collections.emptySet();
+    }
+
     // ========== Footprint-Based Group Refinement (P1) ==========
-    
+
     /**
      * Refines physical-reachability groups by per-agent "footprint" disjointness.
      * 
