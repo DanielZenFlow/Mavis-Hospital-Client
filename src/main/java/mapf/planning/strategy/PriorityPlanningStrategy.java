@@ -88,6 +88,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> deprioritizedGoals = Collections.emptySet();
 
     /**
+     * P4 (conflict-driven PP): goals to PROMOTE to the front of the order.
+     * Populated by PortfolioController from prior FailureReport blockers (goals that
+     * the failed subgoal logically depends on but were still unsatisfied at failure).
+     * Per claudeopus47.txt §3.2.2: subgoal-level reorder is the cheapest CBS-lite repair.
+     * Complementary to deprioritizedGoals (failed goal goes LAST, its blockers go FIRST).
+     */
+    private Set<Position> prioritizedGoals = Collections.emptySet();
+
+    /**
      * P1: synthetic escape subgoals to PREPEND to the order (highest priority).
      * Produced by EscapeSubgoalSynthesizer when LevelFeatures.hasCircularDependency=true:
      * a 2-cycle (A,B) where box-on-A blocks goal-B is broken by first moving box-on-A
@@ -103,6 +112,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** P2: Iterated Width(1) planner (lazy init); used for escape subgoals only. */
     private IW1Planner iw1Planner = null;
+
+    /**
+     * P4 (subtask classifier): box-to-goal Manhattan distance gate for trying IW(1)
+     * on non-escape subgoals. Below MIN: A* with Manhattan is trivially fast — IW(1)
+     * is wasteful. Above MAX: IW(1) state explosion likely; trust BSP/A*+TrueDistance.
+     * Per qanda.txt §3.3 / §4.4 (IW(1) sweet spot for moderate find-route paths).
+     */
+    private static final int IW1_FINDROUTE_MIN_MANHATTAN = 10;
+    private static final int IW1_FINDROUTE_MAX_MANHATTAN = 35;
+
+    // === Diagnostics (reset per search() call) ===
+    private int diagIw1Invoked = 0;
+    private int diagIw1Succeeded = 0;
+    private int diagPlanSubgoalNull = 0;
+    private int diagPathClearingRescued = 0;
 
     /**
      * Cache of barrier clearing orders that were found non-extractable.
@@ -219,6 +243,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (SearchConfig.isVerbose()) System.err.println(msg);
     }
 
+    private void printDiagSummary(String outcome) {
+        System.err.println("[PP][DIAG][" + outcome + "] IW1: invoked=" + diagIw1Invoked
+                + " succeeded=" + diagIw1Succeeded
+                + " | planSubgoalNull=" + diagPlanSubgoalNull
+                + " pathClearingRescued=" + diagPathClearingRescued
+                + " | conflictResolver: calls=" + conflictResolver.getCallCount()
+                + " withConflicts=" + conflictResolver.getConflictingCallCount());
+    }
+
     public PriorityPlanningStrategy(Heuristic heuristic, SearchConfig config) {
         this(heuristic, config, new SubgoalManager(heuristic));
     }
@@ -277,6 +310,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     public void setDeprioritizedGoals(Set<Position> goals) {
         this.deprioritizedGoals = goals != null ? goals : Collections.emptySet();
+    }
+
+    /**
+     * P4 (conflict-driven PP): set goals to promote to the front of the order.
+     * PortfolioController fills this from the previous FailureReport's blocker set
+     * (the unsatisfied goals that the failed subgoal depends on). Has higher priority
+     * than TOPOLOGICAL/RANDOM ordering for these specific goals; other goals retain
+     * their normal sort order behind them.
+     */
+    public void setPrioritizedGoals(Set<Position> goals) {
+        this.prioritizedGoals = goals != null ? goals : Collections.emptySet();
     }
 
     /**
@@ -364,6 +408,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         lastProgressTime = System.currentTimeMillis();
         lastFailureReport = null;
         lastAttemptedSubgoalForReport = null;
+        diagIw1Invoked = 0;
+        diagIw1Succeeded = 0;
+        diagPlanSubgoalNull = 0;
+        diagPathClearingRescued = 0;
+        conflictResolver.resetCounts();
 
         return planWithSubgoals(initialState, level, startTime);
     }
@@ -499,6 +548,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // MAPF FIX: Validate and optimize the plan before returning
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
             lastFailureReport = null; // success clears any prior failure signal
+            printDiagSummary("SUCCESS");
             return fullPlan.isEmpty() ? null : fullPlan;
         }
         // Goal not fully reached — return partial plan for use as fallback
@@ -512,6 +562,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         FailureReport.snapshot(cachedSubgoalOrder),
                         "plan size=" + fullPlan.size());
             }
+            printDiagSummary("PARTIAL");
             return fullPlan.isEmpty() ? null : fullPlan;
         }
         logMinimal(getName() + ": [FAIL] Could not reach goal state, no partial plan available");
@@ -521,6 +572,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     FailureReport.snapshot(cachedSubgoalOrder),
                     "no partial plan");
         }
+        printDiagSummary("FAIL");
         return null;
     }
 
@@ -1635,6 +1687,29 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
 
+        // P4 (conflict-driven PP): stable-partition prioritized goals to the FRONT.
+        // These are blockers identified from the previous attempt's FailureReport —
+        // goals that must be satisfied before the failed subgoal can succeed.
+        // Applied AFTER deprioritization so a goal can't be both (rare; if so, FRONT wins).
+        if (!prioritizedGoals.isEmpty()) {
+            List<Subgoal> front = new ArrayList<>();
+            List<Subgoal> rest = new ArrayList<>(cachedSubgoalOrder.size());
+            for (Subgoal sg : cachedSubgoalOrder) {
+                if (prioritizedGoals.contains(sg.goalPos)) front.add(sg);
+                else rest.add(sg);
+            }
+            if (!front.isEmpty()) {
+                List<Subgoal> reordered = new ArrayList<>(cachedSubgoalOrder.size());
+                reordered.addAll(front);
+                reordered.addAll(rest);
+                cachedSubgoalOrder = reordered;
+                if (mapf.planning.SearchConfig.isMinimal()) {
+                    System.err.println("[PP] P4: promoted " + front.size()
+                            + " blocker goal(s) to front (from prior FailureReport blockers)");
+                }
+            }
+        }
+
         // P1: prepend synthetic escape subgoals (highest priority). These break
         // 2-cycles by parking a blocking box at a P_temp before normal subgoals.
         if (!escapeSubgoals.isEmpty()) {
@@ -2159,6 +2234,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     return true;
                 }
             } else {
+                diagPlanSubgoalNull++;
                 // PATH CLEARING: When BSP fails for a box subgoal, other boxes may
                 // physically block the path. Try to identify and move them.
                 // Example: In MADS, box C at (10,3) blocks box A's path to (10,1).
@@ -2171,6 +2247,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         // Clearing moved some blocking boxes. Retry planSubgoal.
                         path = planSubgoal(subgoal, clearedState, level, subgoals);
                         if (path != null && !path.isEmpty()) {
+                            diagPathClearingRescued++;
                             logNormal("[PP] [CLEAR] Path found after clearing: " + path.size() + " steps");
                             currentState = clearedState;
                             // Fall through to the execution block below
@@ -3280,14 +3357,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // P2: Round 0 — IW(1) for escape subgoals only.
                 // Per qanda.txt 75: "escape subgoal is exactly the sweet spot for IW(1):
                 // no need for a good heuristic, only need to reach any reachable P_temp."
-                // Cheap to try (small budget) and skipped entirely for non-escape subgoals.
-                if (escapeGoalPositions.contains(subgoal.goalPos)) {
+                boolean isEscapeSg = escapeGoalPositions.contains(subgoal.goalPos);
+                int boxToGoalManhattan = boxPos.manhattanDistance(subgoal.goalPos);
+                if (isEscapeSg) {
+                    diagIw1Invoked++;
+                    int iwBudget = Math.min(2000, dynamicBudget);
                     if (iw1Planner == null) {
-                        iw1Planner = new IW1Planner(Math.min(2000, dynamicBudget));
+                        iw1Planner = new IW1Planner(iwBudget);
                     }
                     List<Action> iwPath = iw1Planner.search(subgoal.agentId, boxPos,
                             subgoal.goalPos, subgoal.boxType, state, level, frozen);
                     if (iwPath != null) {
+                        diagIw1Succeeded++;
                         if (mapf.planning.SearchConfig.isMinimal()) {
                             System.err.println("[PP] P2: IW(1) solved escape subgoal "
                                     + subgoal.boxType + " -> " + subgoal.goalPos
@@ -3309,6 +3390,34 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 if (path != null) return path;
                 logVerbose("[PP] Round 1 (frozen) failed for " + subgoal.boxType + " -> " + subgoal.goalPos);
+
+                // P4b: Round 1.5 — IW(1) fallback for moderate-distance find-route subgoals
+                // when A*/BSP failed under frozen. Per qanda.txt §3.3 / §4.4: IW(1) is the
+                // sweet spot for single-box find-route where A*+Manhattan badly underestimates
+                // (long detours around walls). Used as a FALLBACK (not Round 0 speculation)
+                // to preserve the fast A* path on simple subgoals. Skip very short paths
+                // (A* trivially solves them) and very long paths (IW(1) state explosion).
+                if (!isEscapeSg
+                        && boxToGoalManhattan >= IW1_FINDROUTE_MIN_MANHATTAN
+                        && boxToGoalManhattan <= IW1_FINDROUTE_MAX_MANHATTAN) {
+                    diagIw1Invoked++;
+                    int iwBudget = Math.min(800, dynamicBudget);
+                    if (iw1Planner == null) {
+                        iw1Planner = new IW1Planner(iwBudget);
+                    }
+                    List<Action> iwPath = iw1Planner.search(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, frozen);
+                    if (iwPath != null) {
+                        diagIw1Succeeded++;
+                        if (mapf.planning.SearchConfig.isMinimal()) {
+                            System.err.println("[PP] P4b: IW(1) fallback solved find-route(d="
+                                    + boxToGoalManhattan + ") subgoal "
+                                    + subgoal.boxType + " -> " + subgoal.goalPos
+                                    + " in " + iwPath.size() + " steps");
+                        }
+                        return iwPath;
+                    }
+                }
                 
                 // Round 2a: Same-color self-blocking recovery — find frozen goals of the
                 // same color that block the agent's path to the target box.

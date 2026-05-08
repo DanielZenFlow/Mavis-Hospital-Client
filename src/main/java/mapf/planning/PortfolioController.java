@@ -209,6 +209,14 @@ public class PortfolioController implements SearchStrategy {
         // giving other goals a chance to physically clear blockers first.
         Set<Position> deprioritizedGoals = new HashSet<>();
 
+        // P4 (conflict-driven PP): accumulate blocker goals derived from prior
+        // FailureReports. A blocker is an unsatisfied goal G' such that the failed
+        // subgoal G has G in goalDependsOn[G'] (i.e. G' must come before G).
+        // PP promotes these to the front of the next attempt's order.
+        // Per claudeopus47.txt 3.2.2 (subgoal-level reorder is the cheapest CBS-lite
+        // repair) and qanda.txt 5.2 (failure-signal-driven repair).
+        Set<Position> prioritizedGoals = new HashSet<>();
+
         // P1: synthetic escape subgoals to break 2-cycles. Computed lazily once,
         // when the first PP attempt has failed on a level with hasCircularDependency.
         // Per qanda.txt 3 / claudeopus47.txt 3.2.2.
@@ -254,6 +262,11 @@ public class PortfolioController implements SearchStrategy {
                 ((PriorityPlanningStrategy) strategy).setDeprioritizedGoals(deprioritizedGoals);
             }
 
+            // P4: pass accumulated blocker goals (promote to front).
+            if (!prioritizedGoals.isEmpty() && strategy instanceof PriorityPlanningStrategy) {
+                ((PriorityPlanningStrategy) strategy).setPrioritizedGoals(prioritizedGoals);
+            }
+
             // P1: pass escape subgoals (synthesized lazily on first failure for cyclic levels).
             if (escapeSubgoals != null && !escapeSubgoals.isEmpty()
                     && strategy instanceof PriorityPlanningStrategy) {
@@ -283,11 +296,42 @@ public class PortfolioController implements SearchStrategy {
                                 + ": " + report.summary());
                     }
                     if (report.lastAttemptedSubgoal != null && report.lastAttemptedSubgoal.goalPos != null) {
-                        if (deprioritizedGoals.add(report.lastAttemptedSubgoal.goalPos)
+                        Position failedGoal = report.lastAttemptedSubgoal.goalPos;
+                        if (deprioritizedGoals.add(failedGoal)
                                 && SearchConfig.isMinimal()) {
                             System.err.println("[Portfolio] P0b: deprioritize goal "
-                                    + report.lastAttemptedSubgoal.goalPos
+                                    + failedGoal
                                     + " for next attempt (now " + deprioritizedGoals.size() + " total)");
+                        }
+
+                        // P4 (conflict-driven PP): identify the BLOCKERS of the failed
+                        // subgoal and promote them to the front of the next attempt.
+                        // goalDependsOn[src] = {dst : src must come BEFORE dst}.
+                        // Inverse: blockers of failedGoal = {src : failedGoal in goalDependsOn[src]
+                        //                                          AND src is still unsatisfied}.
+                        // This is the CBS-lite ordering branch complementary to deprioritization.
+                        if (features != null && features.goalDependsOn != null
+                                && !report.unsatisfiedAtFailure.isEmpty()) {
+                            Set<Position> stillUnsatisfied = new HashSet<>();
+                            for (mapf.planning.strategy.PriorityPlanningStrategy.Subgoal sg
+                                    : report.unsatisfiedAtFailure) {
+                                if (sg.goalPos != null) stillUnsatisfied.add(sg.goalPos);
+                            }
+                            int promotedThisRound = 0;
+                            for (Map.Entry<Position, Set<Position>> e
+                                    : features.goalDependsOn.entrySet()) {
+                                Position src = e.getKey();
+                                if (src.equals(failedGoal)) continue;
+                                if (!stillUnsatisfied.contains(src)) continue;
+                                if (e.getValue() != null && e.getValue().contains(failedGoal)) {
+                                    if (prioritizedGoals.add(src)) promotedThisRound++;
+                                }
+                            }
+                            if (promotedThisRound > 0 && SearchConfig.isMinimal()) {
+                                System.err.println("[Portfolio] P4: promote " + promotedThisRound
+                                        + " blocker goal(s) of " + failedGoal
+                                        + " for next attempt (now " + prioritizedGoals.size() + " total)");
+                            }
                         }
                     }
 
@@ -521,9 +565,20 @@ public class PortfolioController implements SearchStrategy {
         if (!SearchConfig.isMinimal()) return;
         
         System.err.println("\n=== Portfolio Attempt Summary ===");
-        for (AttemptRecord record : attempts) {
-            System.err.println(String.format("  %s: %dms, %s",
-                record.strategy, record.durationMs, record.success ? "SUCCESS" : "FAILED"));
+        int successAttempt = -1;
+        int ppAttempts = 0;
+        for (int i = 0; i < attempts.size(); i++) {
+            AttemptRecord record = attempts.get(i);
+            System.err.println(String.format("  [%d] %s: %dms, %s",
+                i + 1, record.strategy, record.durationMs, record.success ? "SUCCESS" : "FAILED"));
+            if (record.success && successAttempt < 0) successAttempt = i + 1;
+            ppAttempts++;
+        }
+        if (successAttempt > 0) {
+            System.err.println("[Portfolio][DIAG] Solved on attempt " + successAttempt + "/" + ppAttempts
+                    + (successAttempt == 1 ? " (no reordering needed)" : " (reordering rescued)"));
+        } else {
+            System.err.println("[Portfolio][DIAG] All " + ppAttempts + " attempts FAILED — action-layer fix needed");
         }
     }
     
