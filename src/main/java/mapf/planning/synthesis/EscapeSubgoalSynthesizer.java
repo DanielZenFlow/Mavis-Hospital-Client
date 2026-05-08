@@ -34,10 +34,13 @@ import java.util.*;
 public final class EscapeSubgoalSynthesizer {
 
     /** Maximum number of escape subgoals to emit per call (bounded analysis). */
-    private static final int MAX_ESCAPE_SUBGOALS = 4;
+    private static final int MAX_ESCAPE_SUBGOALS = 6;
 
     /** BFS expansion cap for P_temp search (per cycle). */
     private static final int PTEMP_BFS_CAP = 400;
+
+    /** Maximum SCC size to attempt (very large SCCs likely indicate analysis noise). */
+    private static final int MAX_SCC_SIZE = 12;
 
     private EscapeSubgoalSynthesizer() {}
 
@@ -85,7 +88,101 @@ public final class EscapeSubgoalSynthesizer {
                 break; // one cycle per gA
             }
         }
+
+        // ---- D3: k≥3 cycles via SCC detection ---------------------------------
+        // Beyond 2-cycles, ANY box in a strongly connected component can be
+        // temporarily moved aside to convert the cycle into a chain. We compute
+        // SCCs of the goalDependsOn graph and try opening each goal in the SCC
+        // until one yields a valid P_temp. Goals already handled by the 2-cycle
+        // pass are skipped to avoid duplicates.
+        if (escapes.size() < MAX_ESCAPE_SUBGOALS) {
+            List<List<Position>> sccs = computeSCCs(goalDependsOn);
+            for (List<Position> scc : sccs) {
+                if (escapes.size() >= MAX_ESCAPE_SUBGOALS) break;
+                if (scc.size() < 3) continue;          // 2-cycles already handled
+                if (scc.size() > MAX_SCC_SIZE) continue;
+                // Skip if any node in the SCC is already handled (treat as covered).
+                boolean alreadyTouched = false;
+                for (Position g : scc) if (handledGoals.contains(g)) { alreadyTouched = true; break; }
+                if (alreadyTouched) continue;
+
+                // Try opening each goal in the SCC; first success wins.
+                Position picked = null;
+                Subgoal escape = null;
+                for (Position gA : scc) {
+                    // Use the next node in the cycle as gB placeholder (unused inside).
+                    Position gB = scc.get((scc.indexOf(gA) + 1) % scc.size());
+                    escape = trySynthesizeForCycle(gA, gB, state, level, immovableBoxes, usedTemps);
+                    if (escape != null) { picked = gA; break; }
+                }
+                if (escape != null && picked != null) {
+                    escapes.add(escape);
+                    usedTemps.add(escape.goalPos);
+                    // Mark all SCC members handled — one escape breaks the whole cycle.
+                    handledGoals.addAll(scc);
+                }
+            }
+        }
+
         return escapes;
+    }
+
+    /**
+     * Iterative Tarjan SCC over the goalDependsOn graph. Returns each SCC as a
+     * list of positions; trivial single-node SCCs (no self-loop) are still emitted
+     * but get filtered by the size&lt;3 check at the call site.
+     */
+    private static List<List<Position>> computeSCCs(Map<Position, Set<Position>> graph) {
+        List<List<Position>> result = new ArrayList<>();
+        Map<Position, Integer> index = new HashMap<>();
+        Map<Position, Integer> lowlink = new HashMap<>();
+        Set<Position> onStack = new HashSet<>();
+        Deque<Position> stack = new ArrayDeque<>();
+        int[] counter = {0};
+
+        // Iterative DFS frame: (node, iterator over successors)
+        for (Position v0 : graph.keySet()) {
+            if (index.containsKey(v0)) continue;
+            Deque<Object[]> dfs = new ArrayDeque<>();
+            index.put(v0, counter[0]); lowlink.put(v0, counter[0]); counter[0]++;
+            stack.push(v0); onStack.add(v0);
+            dfs.push(new Object[]{v0, new ArrayList<>(graph.getOrDefault(v0, Collections.emptySet())).iterator()});
+
+            while (!dfs.isEmpty()) {
+                Object[] frame = dfs.peek();
+                Position v = (Position) frame[0];
+                @SuppressWarnings("unchecked")
+                Iterator<Position> it = (Iterator<Position>) frame[1];
+                if (it.hasNext()) {
+                    Position w = it.next();
+                    if (!index.containsKey(w)) {
+                        index.put(w, counter[0]); lowlink.put(w, counter[0]); counter[0]++;
+                        stack.push(w); onStack.add(w);
+                        dfs.push(new Object[]{w, new ArrayList<>(graph.getOrDefault(w, Collections.emptySet())).iterator()});
+                    } else if (onStack.contains(w)) {
+                        lowlink.put(v, Math.min(lowlink.get(v), index.get(w)));
+                    }
+                } else {
+                    // post-order: pop frame, update parent lowlink, root check
+                    dfs.pop();
+                    if (lowlink.get(v).equals(index.get(v))) {
+                        List<Position> scc = new ArrayList<>();
+                        Position w;
+                        do {
+                            w = stack.pop();
+                            onStack.remove(w);
+                            scc.add(w);
+                        } while (!w.equals(v));
+                        result.add(scc);
+                    }
+                    if (!dfs.isEmpty()) {
+                        Position parent = (Position) dfs.peek()[0];
+                        lowlink.put(parent, Math.min(lowlink.get(parent), lowlink.get(v)));
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     /**

@@ -37,8 +37,11 @@ import java.util.*;
  */
 public final class BlockerReliefSynthesizer {
 
-    /** Maximum relief subgoals to emit per invocation. */
-    private static final int MAX_RELIEF_SUBGOALS = 6;
+    /** Maximum relief subgoals to emit per invocation (incl. recursive sub-reliefs). */
+    private static final int MAX_RELIEF_SUBGOALS = 10;
+
+    /** Maximum recursion depth for cascade NAMO (helper-of-helper-of...). */
+    private static final int MAX_RECURSION_DEPTH = 3;
 
     /** BFS expansion cap for reachability searches. */
     private static final int REACH_BFS_CAP = 4000;
@@ -62,7 +65,11 @@ public final class BlockerReliefSynthesizer {
 
         Set<Position> emittedTemps = new HashSet<>();
         Set<Position> handledBlockerPositions = new HashSet<>();
-        List<Subgoal> reliefs = new ArrayList<>();
+        // Tree nodes: each carries the emitted Subgoal, the original blocker position
+        // (so we can later re-check helper reachability), and a recursion depth so we
+        // can output deepest-first (sub-reliefs must execute before their parents).
+        List<ReliefNode> nodes = new ArrayList<>();
+        Deque<ReliefNode> toExpand = new ArrayDeque<>();
 
         // Pre-compute set of all goal cells (to forbid as P_temp targets).
         Set<Position> allGoalCells = new HashSet<>();
@@ -79,7 +86,7 @@ public final class BlockerReliefSynthesizer {
         }
 
         for (int agentId = 0; agentId < numAgents; agentId++) {
-            if (reliefs.size() >= MAX_RELIEF_SUBGOALS) break;
+            if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
 
             Color agentColor = level.getAgentColor(agentId);
             Position agentPos = state.getAgentPosition(agentId);
@@ -92,13 +99,13 @@ public final class BlockerReliefSynthesizer {
             Set<Position> rThrough = null; // computed lazily
 
             for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
-                if (reliefs.size() >= MAX_RELIEF_SUBGOALS) break;
+                if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
                 char goalType = entry.getKey();
                 Color boxColor = level.getBoxColor(goalType);
                 if (boxColor != agentColor) continue;
 
                 for (Position goalPos : entry.getValue()) {
-                    if (reliefs.size() >= MAX_RELIEF_SUBGOALS) break;
+                    if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
 
                     // Skip already-satisfied goal.
                     Character boxOnGoal = boxes.get(goalPos);
@@ -130,38 +137,174 @@ public final class BlockerReliefSynthesizer {
                     if (blockerPath == null || blockerPath.isEmpty()) continue;
 
                     for (Position blockerPos : blockerPath) {
-                        if (reliefs.size() >= MAX_RELIEF_SUBGOALS) break;
-                        if (handledBlockerPositions.contains(blockerPos)) continue;
-
-                        Character blockerType = boxes.get(blockerPos);
-                        if (blockerType == null) continue;
-                        Color blockerColor = level.getBoxColor(blockerType);
-                        if (blockerColor == null || blockerColor == agentColor) continue;
-
-                        List<Integer> helpers = agentsByColor.get(blockerColor);
-                        if (helpers == null || helpers.isEmpty()) continue;
-
-                        // Pick helper closest to blocker (Manhattan; cheap heuristic).
-                        int bestHelper = -1;
-                        int bestDist = Integer.MAX_VALUE;
-                        for (int h : helpers) {
-                            int d = state.getAgentPosition(h).manhattanDistance(blockerPos);
-                            if (d < bestDist) { bestDist = d; bestHelper = h; }
+                        if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
+                        ReliefNode n = tryEmitRelief(blockerPos, /*depth*/ 0,
+                                state, level, immovableBoxes, allGoalCells,
+                                agentsByColor, emittedTemps, handledBlockerPositions);
+                        if (n != null) {
+                            nodes.add(n);
+                            toExpand.add(n);
                         }
-                        if (bestHelper < 0) continue;
-
-                        Position pTemp = findPTempBFS(blockerPos, state, level, immovableBoxes,
-                                allGoalCells, emittedTemps);
-                        if (pTemp == null) continue;
-
-                        reliefs.add(new Subgoal(bestHelper, blockerType, pTemp, false));
-                        emittedTemps.add(pTemp);
-                        handledBlockerPositions.add(blockerPos);
                     }
                 }
             }
         }
+
+        // ----- D11: Recursive NAMO -----------------------------------------
+        // For each emitted relief (helper, blockerType, P_temp), verify the helper
+        // can geometrically reach the assigned blocker. If not, find what blocks
+        // the helper and synthesize a sub-relief. Sub-reliefs are tagged with a
+        // higher depth and will be output BEFORE parent reliefs in the final list.
+        while (!toExpand.isEmpty() && nodes.size() < MAX_RELIEF_SUBGOALS) {
+            ReliefNode parent = toExpand.poll();
+            if (parent.depth >= MAX_RECURSION_DEPTH) continue;
+
+            int helperId = parent.subgoal.agentId;
+            Color helperColor = level.getAgentColor(helperId);
+            Position helperPos = state.getAgentPosition(helperId);
+            Position parentBlocker = parent.blockerPos;
+
+            Set<Position> hReach = bfsReachable(helperPos, state, level, immovableBoxes,
+                    /*treatBoxesAsWalls*/ true, helperColor);
+            if (anyAdjacentInSet(parentBlocker, hReach, level)) continue; // helper OK
+
+            // Confirm theoretical reachability through boxes, else give up (wall problem).
+            Set<Position> hThrough = bfsReachable(helperPos, state, level, immovableBoxes,
+                    /*treatBoxesAsWalls*/ false, helperColor);
+            if (!anyAdjacentInSet(parentBlocker, hThrough, level)) continue;
+
+            List<Position> subBlockers = findBlockerPath(helperPos, parentBlocker, state, level,
+                    immovableBoxes, helperColor);
+            for (Position sb : subBlockers) {
+                if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
+                ReliefNode child = tryEmitRelief(sb, parent.depth + 1,
+                        state, level, immovableBoxes, allGoalCells,
+                        agentsByColor, emittedTemps, handledBlockerPositions);
+                if (child != null) {
+                    nodes.add(child);
+                    toExpand.add(child);
+                }
+            }
+        }
+
+        // Output deepest-first so sub-reliefs precede their parent reliefs.
+        nodes.sort((a, b) -> Integer.compare(b.depth, a.depth));
+        List<Subgoal> reliefs = new ArrayList<>(nodes.size());
+        for (ReliefNode n : nodes) reliefs.add(n.subgoal);
         return reliefs;
+    }
+
+    /**
+     * Try to emit a single relief Subgoal for {@code blockerPos}.
+     * Returns null if blocker is already handled, has no valid helper, or no P_temp.
+     */
+    private static ReliefNode tryEmitRelief(Position blockerPos, int depth,
+                                            State state, Level level,
+                                            Set<Position> immovableBoxes,
+                                            Set<Position> allGoalCells,
+                                            Map<Color, List<Integer>> agentsByColor,
+                                            Set<Position> emittedTemps,
+                                            Set<Position> handledBlockerPositions) {
+        if (handledBlockerPositions.contains(blockerPos)) return null;
+        Character blockerType = state.getBoxes().get(blockerPos);
+        if (blockerType == null) return null;
+        Color blockerColor = level.getBoxColor(blockerType);
+        if (blockerColor == null) return null;
+
+        List<Integer> helpers = agentsByColor.get(blockerColor);
+        if (helpers == null || helpers.isEmpty()) return null;
+
+        // Pick helper closest to blocker (Manhattan; cheap heuristic).
+        int bestHelper = -1;
+        int bestDist = Integer.MAX_VALUE;
+        for (int h : helpers) {
+            int d = state.getAgentPosition(h).manhattanDistance(blockerPos);
+            if (d < bestDist) { bestDist = d; bestHelper = h; }
+        }
+        if (bestHelper < 0) return null;
+
+        Position pTemp = findPTempBFS(blockerPos, state, level, immovableBoxes,
+                allGoalCells, emittedTemps);
+        if (pTemp == null) return null;
+
+        emittedTemps.add(pTemp);
+        handledBlockerPositions.add(blockerPos);
+        return new ReliefNode(new Subgoal(bestHelper, blockerType, pTemp, false),
+                blockerPos, depth);
+    }
+
+    /** Internal tree node carrying recursion depth + original blocker position. */
+    private static final class ReliefNode {
+        final Subgoal subgoal;
+        final Position blockerPos;
+        final int depth;
+        ReliefNode(Subgoal s, Position b, int d) {
+            subgoal = s; blockerPos = b; depth = d;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // D13: NAMO coupling probe (used by PortfolioController for group merging)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Probe NAMO (cross-color blocker) coupling without synthesizing subgoals.
+     *
+     * <p>For each agent A: detect whether A is geometrically blocked from any
+     * of its same-color box-goals by other-color boxes, and if so report the
+     * COLOR of those blocker boxes. The caller (typically independence
+     * detection) can then merge groups whose agents are NAMO-coupled — even
+     * when they have no entry in the goal-dependency graph.
+     *
+     * <p>Returns a map: {@code agentColor -> set of blocker colors}. Only
+     * cross-color edges (color != color) are reported. Empty if no blocking.
+     */
+    public static Map<Color, Set<Color>> probeNAMOCoupling(State state, Level level,
+                                                           Set<Position> immovableBoxes) {
+        if (immovableBoxes == null) immovableBoxes = Collections.emptySet();
+        Map<Color, Set<Color>> coupling = new EnumMap<>(Color.class);
+        Map<Position, Character> boxes = state.getBoxes();
+        int numAgents = state.getNumAgents();
+
+        for (int agentId = 0; agentId < numAgents; agentId++) {
+            Color agentColor = level.getAgentColor(agentId);
+            if (agentColor == null) continue;
+            Position agentPos = state.getAgentPosition(agentId);
+            Set<Position> rActual = bfsReachable(agentPos, state, level, immovableBoxes,
+                    true, agentColor);
+            Set<Position> rThrough = null;
+
+            for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+                char goalType = entry.getKey();
+                Color boxColor = level.getBoxColor(goalType);
+                if (boxColor != agentColor) continue;
+                for (Position goalPos : entry.getValue()) {
+                    Character boxOnGoal = boxes.get(goalPos);
+                    if (boxOnGoal != null && boxOnGoal == goalType) continue;
+                    Position boxPos = findNearestSameTypeBox(goalType, goalPos, state, level);
+                    if (boxPos == null || boxPos.equals(goalPos)) continue;
+                    if (anyAdjacentInSet(boxPos, rActual, level)) continue;
+                    if (anyAdjacentInSet(goalPos, rActual, level)) continue;
+                    if (rThrough == null) {
+                        rThrough = bfsReachable(agentPos, state, level, immovableBoxes,
+                                false, agentColor);
+                    }
+                    if (!anyAdjacentInSet(boxPos, rThrough, level)
+                            && !anyAdjacentInSet(goalPos, rThrough, level)) continue;
+                    List<Position> blockers = findBlockerPath(agentPos, boxPos, state, level,
+                            immovableBoxes, agentColor);
+                    for (Position bp : blockers) {
+                        Character bt = boxes.get(bp);
+                        if (bt == null) continue;
+                        Color bc = level.getBoxColor(bt);
+                        if (bc == null || bc == agentColor) continue;
+                        coupling.computeIfAbsent(agentColor, k -> EnumSet.noneOf(Color.class))
+                                .add(bc);
+                    }
+                }
+            }
+        }
+        return coupling;
     }
 
     // ---------------------------------------------------------------------------

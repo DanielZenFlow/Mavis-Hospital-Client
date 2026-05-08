@@ -158,6 +158,24 @@ public class PortfolioController implements SearchStrategy {
                 }
             }
 
+            // D13: NAMO-coupling merge.
+            // Goal-dependency merge (P3) only sees the goalDependsOn graph. NAMO
+            // coupling — agent A is geometrically blocked from its same-color box by
+            // other-color boxes that only group Y can move — produces no edge in
+            // goalDependsOn but still makes A's group dependent on Y. Merge those.
+            // Conservative: only accept merges that leave ≥2 groups (same rule as P3).
+            if (independentGroups.size() > 1) {
+                List<List<Integer>> namoMerged = mergeGroupsByNAMOCoupling(
+                        independentGroups, initialState, level);
+                if (namoMerged.size() < independentGroups.size() && namoMerged.size() >= 2) {
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] D13 NAMO-coupling merge: "
+                                + independentGroups.size() + " -> " + namoMerged.size() + " groups");
+                    }
+                    independentGroups = namoMerged;
+                }
+            }
+
             if (independentGroups.size() > 1) {
                 if (SearchConfig.isMinimal()) {
                     System.err.println("[Portfolio] Detected " + independentGroups.size() + 
@@ -779,6 +797,78 @@ public class PortfolioController implements SearchStrategy {
         List<List<Integer>> result = new ArrayList<>(merged.values());
         for (List<Integer> g : result) Collections.sort(g);
         return result;
+    }
+
+    // ========== D13: NAMO-Coupling Group Merge ==========
+
+    /**
+     * Merges groups whose agents are NAMO-coupled (one needs another's color
+     * to clear blockers from its push path). Complements
+     * {@link #mergeGroupsByGoalDependencies}: that one consults goalDependsOn,
+     * this one consults the actual geometry of cross-color blockers.
+     *
+     * <p>Uses {@link mapf.planning.synthesis.BlockerReliefSynthesizer#probeNAMOCoupling}
+     * to obtain a {@code agentColor -> blockerColors} map. For each entry, unions
+     * every group containing an agent of {@code agentColor} with every group
+     * containing an agent of any {@code blockerColor}.
+     *
+     * <p>Conservative: only ever merges, never splits. Returns the input list
+     * unchanged if no NAMO coupling is detected.
+     */
+    private List<List<Integer>> mergeGroupsByNAMOCoupling(
+            List<List<Integer>> groups, State state, Level level) {
+        int numAgents = level.getNumAgents();
+        Set<Position> immovable = features != null && features.taskFilter != null
+                ? features.taskFilter.immovableBoxes : Collections.emptySet();
+        Map<Color, Set<Color>> coupling =
+                mapf.planning.synthesis.BlockerReliefSynthesizer.probeNAMOCoupling(
+                        state, level, immovable);
+        if (coupling.isEmpty()) return groups;
+
+        // Build agent -> group index and color -> set-of-groups map.
+        int[] agentGroup = new int[numAgents];
+        Arrays.fill(agentGroup, -1);
+        for (int gi = 0; gi < groups.size(); gi++) {
+            for (int aid : groups.get(gi)) {
+                if (aid >= 0 && aid < numAgents) agentGroup[aid] = gi;
+            }
+        }
+        Map<Color, Set<Integer>> colorToGroups = new HashMap<>();
+        for (int aid = 0; aid < numAgents; aid++) {
+            if (agentGroup[aid] < 0) continue;
+            Color c = level.getAgentColor(aid);
+            if (c == null) continue;
+            colorToGroups.computeIfAbsent(c, k -> new HashSet<>()).add(agentGroup[aid]);
+        }
+
+        int[] parent = new int[groups.size()];
+        for (int i = 0; i < parent.length; i++) parent[i] = i;
+        int unions = 0;
+        for (Map.Entry<Color, Set<Color>> e : coupling.entrySet()) {
+            Set<Integer> srcGroups = colorToGroups.get(e.getKey());
+            if (srcGroups == null || srcGroups.isEmpty()) continue;
+            for (Color blockerColor : e.getValue()) {
+                Set<Integer> dstGroups = colorToGroups.get(blockerColor);
+                if (dstGroups == null || dstGroups.isEmpty()) continue;
+                for (int s : srcGroups) {
+                    for (int d : dstGroups) {
+                        if (ufFind(parent, s) != ufFind(parent, d)) {
+                            ufUnion(parent, s, d);
+                            unions++;
+                        }
+                    }
+                }
+            }
+        }
+        if (unions == 0) return groups;
+
+        Map<Integer, List<Integer>> bucketed = new LinkedHashMap<>();
+        for (int gi = 0; gi < groups.size(); gi++) {
+            bucketed.computeIfAbsent(ufFind(parent, gi), k -> new ArrayList<>()).addAll(groups.get(gi));
+        }
+        List<List<Integer>> out = new ArrayList<>(bucketed.values());
+        for (List<Integer> g : out) Collections.sort(g);
+        return out;
     }
 
     /**
