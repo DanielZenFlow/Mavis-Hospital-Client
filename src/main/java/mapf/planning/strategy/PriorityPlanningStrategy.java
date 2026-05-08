@@ -8,6 +8,7 @@ import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
+import mapf.planning.signal.FailureReport;
 import mapf.planning.spacetime.ReservationTable;
 import java.util.*;
 
@@ -121,6 +122,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** Timestamp of last successful subgoal execution, for early termination. */
     private long lastProgressTime = 0;
+
+    /**
+     * P0a (cheapest path, see qanda.txt §5.2 / claudeopus47.txt §3.2.2):
+     * Structured failure signal for the most recent search() call.
+     * Producers (this class) populate it at every non-success exit; consumers
+     * (PortfolioController for now, SubgoalManager later in P0b) read it via
+     * getLastFailureReport(). Null when last call returned a full solution.
+     */
+    private FailureReport lastFailureReport = null;
+
+    /** Tracks which subgoal tryExecuteSubgoals last touched, for failure reporting. */
+    private Subgoal lastAttemptedSubgoalForReport = null;
+
+    /** Read-only access to the most recent failure signal. May be null. */
+    public FailureReport getLastFailureReport() {
+        return lastFailureReport;
+    }
     
     /** Effective max BSP budget after level-size adaptation. 
      *  Large levels (freeSpaces > 500) use a lower cap to prevent OOM. */
@@ -293,6 +311,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         trapBlacklist.clear();
         regressDisturbCount.clear();
         lastProgressTime = System.currentTimeMillis();
+        lastFailureReport = null;
+        lastAttemptedSubgoalForReport = null;
 
         return planWithSubgoals(initialState, level, startTime);
     }
@@ -350,6 +370,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 } else {
                     logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — yielding to next strategy (empty plan)");
                 }
+                lastFailureReport = FailureReport.stuck(
+                        lastAttemptedSubgoalForReport,
+                        FailureReport.snapshot(cachedSubgoalOrder),
+                        "early-exit noProgressMs=" + noProgressMs + " stuckCount=" + stuckCount);
                 break;
             }
 
@@ -423,15 +447,29 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             logMinimal(getName() + ": [OK] Goal state reached!");
             // MAPF FIX: Validate and optimize the plan before returning
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
+            lastFailureReport = null; // success clears any prior failure signal
             return fullPlan.isEmpty() ? null : fullPlan;
         }
         // Goal not fully reached — return partial plan for use as fallback
         if (!fullPlan.isEmpty()) {
             logMinimal(getName() + ": [PARTIAL] Partial plan (" + fullPlan.size() + " steps) — goal not reached");
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
+            // Only set if a more specific report wasn't already attached at break-time.
+            if (lastFailureReport == null) {
+                lastFailureReport = FailureReport.partial(
+                        lastAttemptedSubgoalForReport,
+                        FailureReport.snapshot(cachedSubgoalOrder),
+                        "plan size=" + fullPlan.size());
+            }
             return fullPlan.isEmpty() ? null : fullPlan;
         }
         logMinimal(getName() + ": [FAIL] Could not reach goal state, no partial plan available");
+        if (lastFailureReport == null) {
+            lastFailureReport = FailureReport.noPlan(
+                    lastAttemptedSubgoalForReport,
+                    FailureReport.snapshot(cachedSubgoalOrder),
+                    "no partial plan");
+        }
         return null;
     }
 
@@ -1856,6 +1894,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // After MAX_REGRESS_RETRIES failures for the same subgoal, the path through completed goals is
             // structurally unavoidable for this ordering — stop wasting time.
             // (Kept for future use, currently handled by unprotectable goal approach below)
+
+            // P0a: record the subgoal currently being attempted for the failure-report path.
+            lastAttemptedSubgoalForReport = subgoal;
 
             // Task-Aware: Pass the full list of subgoals for global allocation checking
             List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);

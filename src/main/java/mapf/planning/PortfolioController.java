@@ -216,7 +216,18 @@ public class PortfolioController implements SearchStrategy {
                 e.printStackTrace(System.err);
             }
             long attemptDuration = System.currentTimeMillis() - attemptStart;
-            
+
+            // P0a: log structured failure signal when present (PP nulls it on success).
+            // Pure logging \u2014 no decision-making yet (P0b will consume this).
+            if (strategy instanceof PriorityPlanningStrategy) {
+                mapf.planning.signal.FailureReport report =
+                        ((PriorityPlanningStrategy) strategy).getLastFailureReport();
+                if (report != null && SearchConfig.isMinimal()) {
+                    System.err.println("[Portfolio] FailureReport from " + strategyConfig.type
+                            + ": " + report.summary());
+                }
+            }
+
             // Record attempt
             attempts.add(new AttemptRecord(strategyConfig.type, attemptDuration, 
                                           result != null && !result.isEmpty()));
