@@ -83,8 +83,6 @@ public class LevelAnalyzer {
     
     public enum StrategyType {
         SINGLE_AGENT,           // 1 agent: simple A*
-        CBS,                    // 2-10 agents, medium coupling: Conflict-Based Search
-        JOINT_SEARCH,           // 2-3 agents, very high coupling: joint A*
         STRICT_ORDER,           // Strong dependencies: execute in order
         GREEDY_WITH_RETRY,      // General case: greedy + retry on failure
         CYCLE_BREAKER           // Circular dependencies: break cycle first
@@ -1720,11 +1718,9 @@ public class LevelAnalyzer {
     
     /**
      * Strategy recommendation: all multi-agent levels use Priority Planning (PP).
-     * 
-     * Rationale: CBS and JointAStar waste time budget on most competition levels.
-     * PP with different ordering modes (topological, reverse, greedy, random) is more
-     * effective than switching between fundamentally different algorithms.
-     * CBS is retained only as an internal PP fallback for cyclic dependencies.
+     *
+     * Rationale: PP with different ordering modes (topological, distance-greedy, random)
+     * is more effective than switching between fundamentally different algorithms.
      */
     private static StrategyType recommendStrategy(int numAgents, int maxDepth, 
                                                    boolean hasCycle, double couplingDegree,

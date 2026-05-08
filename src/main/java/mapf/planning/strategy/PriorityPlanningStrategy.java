@@ -6,7 +6,6 @@ import mapf.planning.SearchStrategy;
 import mapf.planning.analysis.CrossColorBarrierAnalyzer;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer;
-import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.spacetime.ReservationTable;
@@ -346,10 +345,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 break;
             }
 
-            // Try CBS fallback on cyclic dependency detection
-            if (stuckCount == SearchConfig.DEPENDENCY_CHECK_THRESHOLD && SearchConfig.USE_CBS_ON_CYCLE) {
-                List<Action[]> cbsResult = tryCBSFallback(currentState, level, initialState, fullPlan, startTime, numAgents);
-                if (cbsResult != null) return cbsResult;
+            // Try displacement-based cycle recovery on cyclic dependency detection
+            if (stuckCount == SearchConfig.DEPENDENCY_CHECK_THRESHOLD) {
+                tryCycleRecovery(currentState, level, fullPlan, numAgents);
+                currentState = recomputeState(initialState, fullPlan, level, numAgents);
             }
 
             // MAPF FIX: Use cached order, only filter out completed goals
@@ -3446,43 +3445,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return regressed;
     }
 
-    /** Try CBS fallback when stuck with cyclic dependencies. */
-    private List<Action[]> tryCBSFallback(State currentState, Level level, State initialState,
-            List<Action[]> fullPlan, long startTime, int numAgents) {
-        
+    /** Try displacement-based recovery when stuck with cyclic dependencies. */
+    private void tryCycleRecovery(State currentState, Level level,
+            List<Action[]> fullPlan, int numAgents) {
+
         DependencyAnalyzer.AnalysisResult analysis = DependencyAnalyzer.analyze(currentState, level);
-        
-        if (analysis.hasCycle) {
+
+        if (analysis.hasCycle && displacementAttempts < MAX_DISPLACEMENT_ATTEMPTS) {
             logVerbose("[PP] Cyclic dependency detected, trying displacement...");
-            
-            if (displacementAttempts < MAX_DISPLACEMENT_ATTEMPTS) {
-                displacementAttempts++;
-                List<Action[]> displacementPlan = new ArrayList<>();
-                boolean success = deadlockBreaker.attemptCycleBreaking(
-                    displacementPlan, currentState, level, numAgents,
-                    analysis.cycles.isEmpty() ? new ArrayList<>() : analysis.cycles.get(0),
-                    pathAnalyzer, conflictResolver);
-                
-                if (success && !displacementPlan.isEmpty()) {
-                    logVerbose("[PP] Displacement succeeded with " + displacementPlan.size() + " steps");
-                    fullPlan.addAll(displacementPlan);
-                    return null; // Continue with PP
-                }
-            }
-            
-            // Try CBS as last resort
-            logVerbose("[PP] Trying CBS fallback...");
-            CBSStrategy cbs = new CBSStrategy(heuristic, config);
-            cbs.setTimeout(timeoutMs - (System.currentTimeMillis() - startTime));
-            List<Action[]> cbsPlan = cbs.search(currentState, level);
-            
-            if (cbsPlan != null && !cbsPlan.isEmpty()) {
-                logMinimal("[PP] CBS solved with " + cbsPlan.size() + " steps");
-                fullPlan.addAll(cbsPlan);
-                return fullPlan;
+            displacementAttempts++;
+            List<Action[]> displacementPlan = new ArrayList<>();
+            boolean success = deadlockBreaker.attemptCycleBreaking(
+                displacementPlan, currentState, level, numAgents,
+                analysis.cycles.isEmpty() ? new ArrayList<>() : analysis.cycles.get(0),
+                pathAnalyzer, conflictResolver);
+
+            if (success && !displacementPlan.isEmpty()) {
+                logVerbose("[PP] Displacement succeeded with " + displacementPlan.size() + " steps");
+                fullPlan.addAll(displacementPlan);
             }
         }
-        return null;
     }
 
     /** Try recovery mechanisms when stuck. */

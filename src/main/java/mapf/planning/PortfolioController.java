@@ -4,11 +4,9 @@ import mapf.domain.*;
 import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer.LevelFeatures;
 import mapf.planning.analysis.LevelAnalyzer.StrategyType;
-import mapf.planning.cbs.CBSStrategy;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
-import mapf.planning.strategy.JointAStarStrategy;
 import mapf.planning.strategy.PriorityPlanningStrategy;
 import mapf.planning.strategy.PriorityPlanningStrategy.OrderingMode;
 import mapf.planning.strategy.SingleAgentStrategy;
@@ -221,9 +219,9 @@ public class PortfolioController implements SearchStrategy {
      * Builds strategy sequence based on level features.
      * 
      * Pull-Sokoban portfolio design principles:
-     * - CBS/JointAStar are NOT used as top-level strategies (CBS models MAPF point-to-point,
-     *   not Sokoban push/pull; JointAStar is O(5^n) unusable above 3 agents).
-     *   CBS is retained as PP-internal cycle fallback (tryCBSFallback).
+     * - All multi-agent levels use PriorityPlanningStrategy with different ordering modes.
+     *   (CBS / JointAStar removed: CBS models point-to-point MAPF, not Sokoban push/pull;
+     *   JointAStar is O(5^n) unusable above 3 agents.)
      * - REVERSE_TOPOLOGICAL is removed (never solved any competition level in testing).
      * - Multi-seed RANDOM is last-resort diversification with minimal budget.
      * 
@@ -315,16 +313,7 @@ public class PortfolioController implements SearchStrategy {
                 SingleAgentStrategy singleAgent = new SingleAgentStrategy(heuristic, strategyConfig);
                 singleAgent.setWeight(config.weight);
                 return singleAgent;
-                
-            case CBS:
-                CBSStrategy cbs = new CBSStrategy(heuristic, strategyConfig);
-                return cbs;
-                
-            case JOINT_SEARCH:
-                JointAStarStrategy jointAStar = new JointAStarStrategy(heuristic, strategyConfig);
-                jointAStar.setWeight(config.weight);
-                return jointAStar;
-                
+
             case STRICT_ORDER:
             case CYCLE_BREAKER:
             case GREEDY_WITH_RETRY:
