@@ -148,7 +148,7 @@ public class TrueDistanceHeuristic implements Heuristic {
             
             if (agentPos != null) {
                 int[][] distMap = distanceMaps.get(goalPos);
-                if (distMap != null) {
+                if (distMap != null && inBounds(agentPos)) {
                     int dist = distMap[agentPos.row][agentPos.col];
                     if (dist < UNREACHABLE) {
                         totalDistance += dist;
@@ -212,6 +212,9 @@ public class TrueDistanceHeuristic implements Heuristic {
         }
         
         int minDist = UNREACHABLE;
+        if (!inBounds(pos)) {
+            return minDist;
+        }
         for (Position goal : goals) {
             int[][] distMap = distanceMaps.get(goal);
             if (distMap != null) {
@@ -235,6 +238,11 @@ public class TrueDistanceHeuristic implements Heuristic {
         if (distMap == null) {
             return UNREACHABLE;
         }
+        if (!inBounds(from)) {
+            // Diagnostic: log first occurrence per session so we can find the source.
+            logOutOfBoundsOnce("getDistance", from, goal);
+            return UNREACHABLE;
+        }
         return distMap[from.row][from.col];
     }
     
@@ -245,11 +253,41 @@ public class TrueDistanceHeuristic implements Heuristic {
      * @return true if the position is reachable
      */
     public boolean isReachable(Position pos) {
+        if (!inBounds(pos)) {
+            return false;
+        }
         for (int[][] distMap : distanceMaps.values()) {
             if (distMap[pos.row][pos.col] < UNREACHABLE) {
                 return true;
             }
         }
         return false;
+    }
+
+    /** Bounds check for the level grid. */
+    private boolean inBounds(Position p) {
+        return p != null
+                && p.row >= 0 && p.row < level.getRows()
+                && p.col >= 0 && p.col < level.getCols();
+    }
+
+    private static boolean OOB_LOGGED = false;
+
+    /**
+     * Log the first out-of-bounds Position seen in a session, with a short stack trace,
+     * so we can pinpoint which BSP / planner code path is producing it.
+     * Subsequent occurrences are silent to keep stderr clean.
+     */
+    private static void logOutOfBoundsOnce(String where, Position from, Position goal) {
+        if (OOB_LOGGED) return;
+        OOB_LOGGED = true;
+        System.err.println("[TrueDistanceHeuristic] OOB lookup at " + where +
+                " from=(" + from.row + "," + from.col + ") goal=(" +
+                goal.row + "," + goal.col + ") -- returning UNREACHABLE.");
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        int n = Math.min(st.length, 12);
+        for (int i = 1; i < n; i++) {
+            System.err.println("    at " + st[i]);
+        }
     }
 }
