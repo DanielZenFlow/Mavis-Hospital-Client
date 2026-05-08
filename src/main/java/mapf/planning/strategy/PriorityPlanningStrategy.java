@@ -96,6 +96,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private List<Subgoal> escapeSubgoals = Collections.emptyList();
 
     /**
+     * P2: goal positions of escape subgoals — derived index for fast O(1) lookup
+     * in planSubgoal() to decide whether to try IW(1) as Round 0.
+     */
+    private Set<Position> escapeGoalPositions = Collections.emptySet();
+
+    /** P2: Iterated Width(1) planner (lazy init); used for escape subgoals only. */
+    private IW1Planner iw1Planner = null;
+
+    /**
      * Cache of barrier clearing orders that were found non-extractable.
      * Prevents the infinite loop where dynamic barrier re-detection keeps
      * finding the same non-extractable barrier every stuck iteration.
@@ -277,6 +286,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     public void setEscapeSubgoals(List<Subgoal> subgoals) {
         this.escapeSubgoals = subgoals != null ? subgoals : Collections.emptyList();
+        // P2: build position index for IW(1) routing.
+        if (this.escapeSubgoals.isEmpty()) {
+            this.escapeGoalPositions = Collections.emptySet();
+        } else {
+            Set<Position> set = new HashSet<>(this.escapeSubgoals.size() * 2);
+            for (Subgoal sg : this.escapeSubgoals) set.add(sg.goalPos);
+            this.escapeGoalPositions = set;
+        }
     }
 
     /** Sets the ordering mode for subgoal execution. */
@@ -3260,6 +3277,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 boxSearchPlanner.setMaxStatesOverride(dynamicBudget);
                 
                 try {
+                // P2: Round 0 — IW(1) for escape subgoals only.
+                // Per qanda.txt 75: "escape subgoal is exactly the sweet spot for IW(1):
+                // no need for a good heuristic, only need to reach any reachable P_temp."
+                // Cheap to try (small budget) and skipped entirely for non-escape subgoals.
+                if (escapeGoalPositions.contains(subgoal.goalPos)) {
+                    if (iw1Planner == null) {
+                        iw1Planner = new IW1Planner(Math.min(2000, dynamicBudget));
+                    }
+                    List<Action> iwPath = iw1Planner.search(subgoal.agentId, boxPos,
+                            subgoal.goalPos, subgoal.boxType, state, level, frozen);
+                    if (iwPath != null) {
+                        if (mapf.planning.SearchConfig.isMinimal()) {
+                            System.err.println("[PP] P2: IW(1) solved escape subgoal "
+                                    + subgoal.boxType + " -> " + subgoal.goalPos
+                                    + " in " + iwPath.size() + " steps");
+                        }
+                        return iwPath;
+                    }
+                }
+
                 // Round 1: ST-A* with all frozen as walls
                 List<Action> path = boxSearchPlanner.searchForSubgoal(subgoal.agentId, boxPos,
                         subgoal.goalPos, subgoal.boxType, state, level, frozen,
