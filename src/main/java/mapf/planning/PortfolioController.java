@@ -4,6 +4,7 @@ import mapf.domain.*;
 import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer.LevelFeatures;
 import mapf.planning.analysis.LevelAnalyzer.StrategyType;
+import mapf.planning.analysis.ImmovableFusion;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
@@ -60,13 +61,36 @@ public class PortfolioController implements SearchStrategy {
         long startTime = System.currentTimeMillis();
         long remainingTime = timeoutMs;
         attempts.clear();
-        
+
         // Step 1: Pre-analyze level
         features = LevelAnalyzer.analyze(level, initialState);
         if (SearchConfig.isNormal()) {
             System.err.println(features.analysisReport);
         }
-        
+
+        // Step 1a: Immovable-box → wall fusion.
+        // Boxes that no agent can ever push (wrong color / unreachable) are converted
+        // into static walls and removed from the State. This shrinks the search space
+        // for every downstream BFS / A* / heuristic precomputation.
+        if (features != null && features.taskFilter != null
+                && !features.taskFilter.immovableBoxes.isEmpty()) {
+            ImmovableFusion.FusedProblem fused = ImmovableFusion.fuse(
+                    level, initialState, features.taskFilter.immovableBoxes);
+            if (fused.changed) {
+                if (SearchConfig.isMinimal()) {
+                    System.err.println("[Portfolio] Immovable-box fusion: " +
+                            fused.fusedPositions.size() + " boxes → walls (of " +
+                            features.taskFilter.immovableBoxes.size() + " immovable detected)");
+                }
+                level = fused.level;
+                initialState = fused.state;
+                // Re-analyze after fusion so downstream features (TaskFilter,
+                // dependency analysis, coupling, recommended strategy) reflect
+                // the smaller post-fusion problem.
+                features = LevelAnalyzer.analyze(level, initialState);
+            }
+        }
+
         // Step 1b: Independence detection — solve independent groups separately
         // This is a shortcut: if all groups solve, return immediately.
         // If any group fails (partial), fall through to normal portfolio as fallback.
