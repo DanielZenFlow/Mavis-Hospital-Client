@@ -176,6 +176,11 @@ public class PortfolioController implements SearchStrategy {
         // giving other goals a chance to physically clear blockers first.
         Set<Position> deprioritizedGoals = new HashSet<>();
 
+        // P1: synthetic escape subgoals to break 2-cycles. Computed lazily once,
+        // when the first PP attempt has failed on a level with hasCircularDependency.
+        // Per qanda.txt 3 / claudeopus47.txt 3.2.2.
+        List<mapf.planning.strategy.PriorityPlanningStrategy.Subgoal> escapeSubgoals = null;
+
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
                 System.err.println("[Portfolio] Timeout - no more time for attempts");
@@ -215,6 +220,12 @@ public class PortfolioController implements SearchStrategy {
             if (!deprioritizedGoals.isEmpty() && strategy instanceof PriorityPlanningStrategy) {
                 ((PriorityPlanningStrategy) strategy).setDeprioritizedGoals(deprioritizedGoals);
             }
+
+            // P1: pass escape subgoals (synthesized lazily on first failure for cyclic levels).
+            if (escapeSubgoals != null && !escapeSubgoals.isEmpty()
+                    && strategy instanceof PriorityPlanningStrategy) {
+                ((PriorityPlanningStrategy) strategy).setEscapeSubgoals(escapeSubgoals);
+            }
             
             // Execute
             long attemptStart = System.currentTimeMillis();
@@ -244,6 +255,20 @@ public class PortfolioController implements SearchStrategy {
                             System.err.println("[Portfolio] P0b: deprioritize goal "
                                     + report.lastAttemptedSubgoal.goalPos
                                     + " for next attempt (now " + deprioritizedGoals.size() + " total)");
+                        }
+                    }
+
+                    // P1: synthesize escape subgoals once, after the first PP failure on a
+                    // level with hasCircularDependency=true. Subsequent attempts reuse them.
+                    if (escapeSubgoals == null && features != null && features.hasCircularDependency
+                            && features.goalDependsOn != null) {
+                        Set<Position> immovable = (features.taskFilter != null)
+                                ? features.taskFilter.immovableBoxes : Collections.emptySet();
+                        escapeSubgoals = mapf.planning.synthesis.EscapeSubgoalSynthesizer.synthesize(
+                                initialState, level, features.goalDependsOn, immovable);
+                        if (SearchConfig.isMinimal()) {
+                            System.err.println("[Portfolio] P1: synthesized "
+                                    + escapeSubgoals.size() + " escape subgoal(s) for cyclic level");
                         }
                     }
                 }

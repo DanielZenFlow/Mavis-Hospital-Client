@@ -88,6 +88,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> deprioritizedGoals = Collections.emptySet();
 
     /**
+     * P1: synthetic escape subgoals to PREPEND to the order (highest priority).
+     * Produced by EscapeSubgoalSynthesizer when LevelFeatures.hasCircularDependency=true:
+     * a 2-cycle (A,B) where box-on-A blocks goal-B is broken by first moving box-on-A
+     * to a P_temp parking position. Per qanda.txt 3 / claudeopus47.txt 3.2.2.
+     */
+    private List<Subgoal> escapeSubgoals = Collections.emptyList();
+
+    /**
      * Cache of barrier clearing orders that were found non-extractable.
      * Prevents the infinite loop where dynamic barrier re-detection keeps
      * finding the same non-extractable barrier every stuck iteration.
@@ -260,6 +268,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     public void setDeprioritizedGoals(Set<Position> goals) {
         this.deprioritizedGoals = goals != null ? goals : Collections.emptySet();
+    }
+
+    /**
+     * P1: synthetic escape subgoals from EscapeSubgoalSynthesizer; prepended to the
+     * cached order on next compute. Used by PortfolioController to break 2-cycles
+     * after a TOPOLOGICAL attempt failed on a level with hasCircularDependency=true.
+     */
+    public void setEscapeSubgoals(List<Subgoal> subgoals) {
+        this.escapeSubgoals = subgoals != null ? subgoals : Collections.emptyList();
     }
 
     /** Sets the ordering mode for subgoal execution. */
@@ -1598,6 +1615,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (mapf.planning.SearchConfig.isMinimal()) {
                     System.err.println("[PP] P0b: demoted " + tail.size() + " goal(s) to end (from prior FailureReport)");
                 }
+            }
+        }
+
+        // P1: prepend synthetic escape subgoals (highest priority). These break
+        // 2-cycles by parking a blocking box at a P_temp before normal subgoals.
+        if (!escapeSubgoals.isEmpty()) {
+            List<Subgoal> withEscapes = new ArrayList<>(escapeSubgoals.size() + cachedSubgoalOrder.size());
+            withEscapes.addAll(escapeSubgoals);
+            withEscapes.addAll(cachedSubgoalOrder);
+            cachedSubgoalOrder = withEscapes;
+            if (mapf.planning.SearchConfig.isMinimal()) {
+                System.err.println("[PP] P1: prepended " + escapeSubgoals.size()
+                        + " escape subgoal(s) for cycle-breaking");
             }
         }
 
