@@ -348,6 +348,40 @@ public class PortfolioController implements SearchStrategy {
                                     + escapeSubgoals.size() + " escape subgoal(s) for cyclic level");
                         }
                     }
+
+                    // P5 (NAMO / blocker-relief): synthesize relief subgoals when an agent
+                    // cannot geometrically reach its target box because other-color boxes
+                    // form a barrier. Reified as ordinary push subgoals for a helper agent
+                    // of the blocker's color → consumed by the existing PP/BSP loop.
+                    // Synthesized lazily on first PP failure, regardless of cycle status —
+                    // ISO.lvl-style "completely blocked" patterns are independent of cycles.
+                    if (features != null) {
+                        Set<Position> immovable = (features.taskFilter != null)
+                                ? features.taskFilter.immovableBoxes : Collections.emptySet();
+                        List<mapf.planning.strategy.PriorityPlanningStrategy.Subgoal> reliefs =
+                                mapf.planning.synthesis.BlockerReliefSynthesizer.synthesize(
+                                        initialState, level, immovable);
+                        if (!reliefs.isEmpty()) {
+                            // Merge with existing escapeSubgoals (relief goes FIRST: clear path
+                            // before breaking cycles). Dedupe by goalPos to avoid double-prepend.
+                            List<mapf.planning.strategy.PriorityPlanningStrategy.Subgoal> merged =
+                                    new ArrayList<>(reliefs);
+                            Set<Position> seen = new HashSet<>();
+                            for (mapf.planning.strategy.PriorityPlanningStrategy.Subgoal sg : reliefs) {
+                                seen.add(sg.goalPos);
+                            }
+                            if (escapeSubgoals != null) {
+                                for (mapf.planning.strategy.PriorityPlanningStrategy.Subgoal sg : escapeSubgoals) {
+                                    if (seen.add(sg.goalPos)) merged.add(sg);
+                                }
+                            }
+                            escapeSubgoals = merged;
+                            if (SearchConfig.isMinimal()) {
+                                System.err.println("[Portfolio] P5 (NAMO): synthesized "
+                                        + reliefs.size() + " blocker-relief subgoal(s)");
+                            }
+                        }
+                    }
                 }
             }
 
