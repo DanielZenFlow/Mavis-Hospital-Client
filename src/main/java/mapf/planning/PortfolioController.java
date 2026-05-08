@@ -154,9 +154,25 @@ public class PortfolioController implements SearchStrategy {
         
         // Step 3: Try strategies in sequence, keeping the best result
         
+        // Minimum useful attempt budget. If remaining wall-clock falls below
+        // this AND we already have a partial plan, returning early is strictly
+        // better than starting another attempt that will be killed mid-search
+        // (causing the cached bestPartialPlan to be lost).
+        final long MIN_ATTEMPT_MS = 5_000;
+        
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
                 System.err.println("[Portfolio] Timeout - no more time for attempts");
+                break;
+            }
+            // Plan-A guard: if we already saved a partial and there's not enough
+            // time left for a meaningful new attempt, ship the partial NOW rather
+            // than burning the rest of the budget on a strategy that will never
+            // get to return.
+            if (bestPartialPlan != null && remainingTime < MIN_ATTEMPT_MS) {
+                System.err.println("[Portfolio] Remaining time " + remainingTime
+                    + "ms < " + MIN_ATTEMPT_MS + "ms — shipping best partial ("
+                    + bestPartialPlan.size() + " steps) instead of new attempt");
                 break;
             }
             

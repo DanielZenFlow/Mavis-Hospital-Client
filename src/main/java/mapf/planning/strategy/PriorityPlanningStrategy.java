@@ -339,9 +339,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // This prevents burning the entire budget on repeated failures.
             // Note: 35% balances responsiveness (give up early enough for retries)
             // vs persistence (don't abort strategies that need sustained effort).
+            // Plan-A: also fire when fullPlan IS empty — a strategy that has
+            // produced ZERO actions in 35% of its budget is unlikely to ever
+            // produce any, and yielding the rest of the budget to the next
+            // strategy is strictly better than spinning silently to timeout.
             long noProgressMs = System.currentTimeMillis() - lastProgressTime;
-            if (noProgressMs > timeoutMs * 0.35 && !fullPlan.isEmpty()) {
-                logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
+            if (noProgressMs > timeoutMs * 0.35) {
+                if (!fullPlan.isEmpty()) {
+                    logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
+                } else {
+                    logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — yielding to next strategy (empty plan)");
+                }
                 break;
             }
 
@@ -464,9 +472,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // before tackling large barriers that need many parking spots.
         barriers.sort((a, b) -> Integer.compare(a.clearingOrder.size(), b.clearingOrder.size()));
 
+        // Plan-A guard: cap total clearing-phase wall-clock at 30% of strategy
+        // timeout. Without this, a single barrier whose pre-assignment / BFS
+        // explodes (NameHere: 10 barriers, deep maze) consumes the entire
+        // strategy budget without producing ANY plan steps, leaving the
+        // portfolio's bestPartialPlan permanently null.
+        long clearingPhaseBudget = Math.max(5_000L, timeoutMs * 30 / 100);
+        long clearingPhaseDeadline = startTime + clearingPhaseBudget;
+
         for (CrossColorBarrierAnalyzer.Barrier barrier : barriers) {
-            if (System.currentTimeMillis() - startTime > timeoutMs / 2) {
-                logNormal("[PP] Clearing phase timeout — skipping remaining barriers");
+            long now = System.currentTimeMillis();
+            if (now > clearingPhaseDeadline || now - startTime > timeoutMs / 2) {
+                logNormal("[PP] Clearing phase timeout — skipping remaining barriers"
+                        + " (elapsed=" + (now - startTime) + "ms, budget=" + clearingPhaseBudget + "ms)");
                 break;
             }
 

@@ -203,11 +203,23 @@ public class Client {
     private List<Action[]> searchWithFallback() {
         debugOut.println("[Client] Using Portfolio Controller");
         PortfolioController portfolio = new PortfolioController(config);
-        // Reserve 5s safety buffer for action serialization and transmission
-        // Without this, the planner may use the full server timeout, leaving
-        // no time to actually send the plan, causing 0-action submissions.
-        long planningTimeout = Math.max(config.getTimeoutMs() - 5_000, config.getTimeoutMs() / 2);
+        // Resolve effective wall-clock budget. Server -t is server-side and not
+        // exposed via protocol, so allow override via env var MAVIS_TIMEOUT_MS
+        // (tests/competition runners can pipe their server -t value through).
+        // Reserve 10s safety buffer for partial-plan flush + serialization +
+        // transmission so we never get killed mid-plan with bestPartialPlan
+        // still cached in PortfolioController memory.
+        long effectiveServerTimeoutMs = config.getTimeoutMs();
+        String envTimeout = System.getenv("MAVIS_TIMEOUT_MS");
+        if (envTimeout != null) {
+            try {
+                long v = Long.parseLong(envTimeout.trim());
+                if (v > 0) effectiveServerTimeoutMs = v;
+            } catch (NumberFormatException ignored) {}
+        }
+        long planningTimeout = Math.max(effectiveServerTimeoutMs - 10_000, effectiveServerTimeoutMs / 2);
         portfolio.setTimeout(planningTimeout);
+        debugOut.println("[Client] Planning budget: " + planningTimeout + "ms (server=" + effectiveServerTimeoutMs + "ms)");
         return portfolio.search(currentState, level);
     }
 
