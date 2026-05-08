@@ -119,14 +119,6 @@ public class BoxSearchPlanner {
 
                 Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
                 
-                // Corner deadlock pruning: if the target box was pushed/pulled into
-                // a corner (2 adjacent walls forming an L) and it's NOT the goal,
-                // this box can never reach the goal — prune this branch.
-                if (newTargetBoxPos != null && !newTargetBoxPos.equals(current.targetBoxPos) 
-                        && !newTargetBoxPos.equals(goalPos) && isCornerDeadlock(newTargetBoxPos, level)) {
-                    continue;
-                }
-                
                 StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
                 int penalty = disturbancePenalty(action, agentId, current.state, softFrozenGoals);
                 int newG = current.g + 1 + penalty;
@@ -336,7 +328,8 @@ public class BoxSearchPlanner {
         bestG.put(startKey, 0);
 
         int exploredCount = 0;
-        int maxExplore = 2000;
+        // Scale displacement budget with effective search budget (min 2000, up to 1/4 of effective max)
+        int maxExplore = Math.max(2000, getEffectiveMaxStates() / 4);
 
         while (!openList.isEmpty() && exploredCount < maxExplore) {
             if (exploredCount % 100 == 0 && System.currentTimeMillis() - startTime > timeLimitMs) {
@@ -820,11 +813,10 @@ public class BoxSearchPlanner {
             this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
         }
         
+        /** 4-arg constructor: tracks same-type box positions for obstacle-aware dedup. */
         StateKey(State state, int agentId, Position targetBoxPos, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            // Collect and sort all positions of boxes with the same type
-            // Sorted list provides deterministic, collision-free equality comparison
             List<Position> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
                 if (e.getValue() == boxType) {
@@ -899,14 +891,25 @@ public class BoxSearchPlanner {
         }
     }
     
-    /** State key for agent goal search: tracks agent position + all box positions
-     *  since Push/Pull changes box layout. */
+    /**
+     * State key for agent goal search: tracks only agent position.
+     * 
+     * Previous version tracked all box positions (state.getBoxes().hashCode()),
+     * which caused state space explosion on levels with many boxes (e.g. 45+ boxes
+     * in pacMAn). Every incidental push/pull created a unique state key, exhausting
+     * the search budget before the agent could reach its goal.
+     * 
+     * In pull-enabled Sokoban, the agent can always push/pull same-color boxes
+     * out of the way. Tracking only agent position is safe because:
+     * - A* guarantees the shortest path (lowest g) reaches each position first
+     * - If two paths reach the same position with different box layouts, the
+     *   shorter one is preferred regardless of box arrangement
+     * - Box displacement is a side-effect of pathfinding, not the goal
+     */
     private static class AgentGoalStateKey extends StateKey {
-        private final int boxHash;
         
         AgentGoalStateKey(State state, int agentId) {
             super(state, agentId, null);
-            this.boxHash = state.getBoxes().hashCode();
         }
         
         @Override
@@ -914,30 +917,13 @@ public class BoxSearchPlanner {
             if (this == obj) return true;
             if (!(obj instanceof AgentGoalStateKey)) return false;
             AgentGoalStateKey other = (AgentGoalStateKey) obj;
-            return agentPos.equals(other.agentPos) && boxHash == other.boxHash;
+            return agentPos.equals(other.agentPos);
         }
         
         @Override
         public int hashCode() {
-            return Objects.hash(agentPos, boxHash);
+            return agentPos.hashCode();
         }
-    }
-
-    /**
-     * Corner deadlock detection: a box is in a corner deadlock if it has two
-     * adjacent walls forming an L-shape. Such a box can never be moved (no agent
-     * can get behind it to push it out), so pushing a box into a corner is
-     * futile unless that corner IS the goal.
-     * 
-     * Checks the four L-shaped wall pairs: NW, NE, SW, SE.
-     */
-    private static boolean isCornerDeadlock(Position boxPos, Level level) {
-        boolean wallN = !level.isFree(boxPos.move(Direction.N));
-        boolean wallS = !level.isFree(boxPos.move(Direction.S));
-        boolean wallE = !level.isFree(boxPos.move(Direction.E));
-        boolean wallW = !level.isFree(boxPos.move(Direction.W));
-        
-        return (wallN && wallW) || (wallN && wallE) || (wallS && wallW) || (wallS && wallE);
     }
 
     private static class SearchNode implements Comparable<SearchNode> {

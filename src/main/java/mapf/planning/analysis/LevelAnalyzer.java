@@ -83,8 +83,6 @@ public class LevelAnalyzer {
     
     public enum StrategyType {
         SINGLE_AGENT,           // 1 agent: simple A*
-        CBS,                    // 2-10 agents, medium coupling: Conflict-Based Search
-        JOINT_SEARCH,           // 2-3 agents, very high coupling: joint A*
         STRICT_ORDER,           // Strong dependencies: execute in order
         GREEDY_WITH_RETRY,      // General case: greedy + retry on failure
         CYCLE_BREAKER           // Circular dependencies: break cycle first
@@ -1011,7 +1009,7 @@ public class LevelAnalyzer {
         Set<Position> visited = new HashSet<>();
         Set<Position> obstacles = new HashSet<>(immovableBoxes);
         obstacles.addAll(blockedPositions);
-        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        // FIXED: Movable boxes are NOT permanent obstacles (see existsPushPath fix).
         obstacles.remove(start);
         
         q.add(start);
@@ -1100,10 +1098,13 @@ public class LevelAnalyzer {
         Set<Position> obstacles = new HashSet<>(immovableBoxes);
         if (blockedPos != null) obstacles.add(blockedPos);
         
-        // Also add movableBoxPositions to obstacles, because if we are testing a specific box path,
-        // other boxes are obstacles unless we recursively solve them (too complex).
-        // Since this is for dependency analysis, assuming other boxes are obstacles is safer.
-        if (movableBoxPositions != null) obstacles.addAll(movableBoxPositions);
+        // FIXED: Movable boxes are NOT treated as permanent obstacles.
+        // In pull-enabled Sokoban, agents can push/pull movable boxes out of the way.
+        // Treating them as obstacles caused massive false dependencies → spurious
+        // cycles → topological sort failure → RANDOM ordering on levels like
+        // BigSplit, Spiraling, ISO, TheGate. This is consistent with
+        // isReachableWithHypotheticalBlock() which already correctly ignores
+        // movable boxes for agent reachability.
         
         // Start position cannot be an obstacle (it's where the box is)
         obstacles.remove(start); 
@@ -1717,11 +1718,9 @@ public class LevelAnalyzer {
     
     /**
      * Strategy recommendation: all multi-agent levels use Priority Planning (PP).
-     * 
-     * Rationale: CBS and JointAStar waste time budget on most competition levels.
-     * PP with different ordering modes (topological, reverse, greedy, random) is more
-     * effective than switching between fundamentally different algorithms.
-     * CBS is retained only as an internal PP fallback for cyclic dependencies.
+     *
+     * Rationale: PP with different ordering modes (topological, distance-greedy, random)
+     * is more effective than switching between fundamentally different algorithms.
      */
     private static StrategyType recommendStrategy(int numAgents, int maxDepth, 
                                                    boolean hasCycle, double couplingDegree,

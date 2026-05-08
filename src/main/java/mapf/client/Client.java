@@ -5,8 +5,6 @@ import mapf.planning.*;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
-import mapf.planning.strategy.JointAStarStrategy;
-import mapf.planning.strategy.SingleAgentStrategy;
 
 import java.io.*;
 import java.util.*;
@@ -24,14 +22,7 @@ import java.util.*;
  * Debug output should go to stderr to avoid interfering with server
  * communication.
  * 
- * Strategy Pattern: Dynamically selects search algorithm based on level
- * complexity.
- * Fallback Mechanism: If one strategy fails/times out, tries next with
- * increased weight.
- * 
- * Environment Variables:
- * - USE_SIMPLE_STRATEGY=true : Use the new simplified priority strategy (for
- * testing refactored code)
+ * Strategy Pattern: Delegates to PortfolioController for multi-strategy planning.
  */
 public class Client {
 
@@ -55,27 +46,6 @@ public class Client {
 
     /** Search configuration */
     private final SearchConfig config;
-
-    /** Whether to use Portfolio Controller for strategy selection.
-     *  Default: true. Portfolio provides multi-strategy fallback (CBS → PP → greedy).
-     *  Set USE_PORTFOLIO=false env var to fall back to legacy StrategySelector (no fallback). */
-    public static boolean USE_PORTFOLIO = true;
-
-    static {
-        // Check environment variable to enable new simplified strategy
-        String useSimple = System.getenv("USE_SIMPLE_STRATEGY");
-        if ("true".equalsIgnoreCase(useSimple)) {
-            StrategySelector.USE_SIMPLE_STRATEGY = true;
-            System.err.println("[Client] USE_SIMPLE_STRATEGY enabled via environment variable");
-        }
-
-        // Check environment variable to disable Portfolio Controller (for legacy testing)
-        String usePortfolio = System.getenv("USE_PORTFOLIO");
-        if ("false".equalsIgnoreCase(usePortfolio)) {
-            USE_PORTFOLIO = false;
-            System.err.println("[Client] USE_PORTFOLIO disabled via environment variable (legacy mode)");
-        }
-    }
 
     /**
      * Creates a new Client with standard I/O streams.
@@ -181,8 +151,6 @@ public class Client {
      * @throws IOException if communication fails
      */
     private void planAndExecute() throws IOException {
-        int numAgents = currentState.getNumAgents();
-
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
 
@@ -230,87 +198,29 @@ public class Client {
     }
 
     /**
-     * Attempts search with fallback strategies if primary fails.
-     * 
-     * Fallback order:
-     * 1. Primary strategy (A* with weight=1.0)
-     * 2. Weighted A* (weight=2.0)
-     * 3. More aggressive weighted A* (weight=5.0)
-     * 4. Greedy search (infinite weight)
-     * 
-     * @return the plan, or null if all strategies fail
+     * Searches for a plan using PortfolioController (which handles multi-strategy fallback internally).
      */
     private List<Action[]> searchWithFallback() {
-        // Use Portfolio Controller if enabled
-        if (USE_PORTFOLIO) {
-            debugOut.println("[Client] Using Portfolio Controller");
-            PortfolioController portfolio = new PortfolioController(config);
-            portfolio.setTimeout(config.getTimeoutMs());
-            return portfolio.search(currentState, level);
+        debugOut.println("[Client] Using Portfolio Controller");
+        PortfolioController portfolio = new PortfolioController(config);
+        // Resolve effective wall-clock budget. Server -t is server-side and not
+        // exposed via protocol, so allow override via env var MAVIS_TIMEOUT_MS
+        // (tests/competition runners can pipe their server -t value through).
+        // Reserve 10s safety buffer for partial-plan flush + serialization +
+        // transmission so we never get killed mid-plan with bestPartialPlan
+        // still cached in PortfolioController memory.
+        long effectiveServerTimeoutMs = config.getTimeoutMs();
+        String envTimeout = System.getenv("MAVIS_TIMEOUT_MS");
+        if (envTimeout != null) {
+            try {
+                long v = Long.parseLong(envTimeout.trim());
+                if (v > 0) effectiveServerTimeoutMs = v;
+            } catch (NumberFormatException ignored) {}
         }
-
-        // Legacy fallback mechanism
-        int numAgents = currentState.getNumAgents();
-        double[] weights = { config.getAstarWeight(), 2.0, 5.0, Double.POSITIVE_INFINITY };
-
-        long totalStartTime = System.currentTimeMillis();
-        long remainingTime = config.getTimeoutMs();
-
-        for (int i = 0; i < weights.length; i++) {
-            double weight = weights[i];
-            if (remainingTime <= 0) {
-                debugOut.println("Total timeout exceeded, stopping search");
-                break;
-            }
-
-            // Allocate time for this attempt: half of remaining time
-            // This ensures fair distribution across fallback strategies
-            long attemptTimeout = Math.min(remainingTime / 2, remainingTime);
-
-            SearchConfig currentConfig = new SearchConfig(
-                    attemptTimeout,
-                    config.getMaxStates(),
-                    weight);
-
-            SearchStrategy strategy = createStrategy(numAgents, currentConfig);
-            debugOut.println("Trying strategy: " + strategy.getName() + " (weight=" + weight +
-                    ", timeout=" + attemptTimeout + "ms)");
-
-            List<Action[]> plan = strategy.search(currentState, level);
-
-            if (plan != null && !plan.isEmpty()) {
-                debugOut.println("Success with " + strategy.getName());
-                return plan;
-            }
-
-            debugOut.println("Strategy " + strategy.getName() + " failed, trying fallback...");
-
-            // Update remaining time
-            remainingTime = config.getTimeoutMs() - (System.currentTimeMillis() - totalStartTime);
-        }
-
-        return null;
-    }
-
-    /**
-     * Creates appropriate search strategy based on agent count and config.
-     * Uses StrategySelector which can be configured via USE_SIMPLE_STRATEGY.
-     */
-    private SearchStrategy createStrategy(int numAgents, SearchConfig strategyConfig) {
-        Heuristic heuristic = createHeuristic();
-
-        // Use StrategySelector to allow simple strategy testing
-        StrategySelector selector = new StrategySelector(heuristic, strategyConfig);
-        SearchStrategy strategy = selector.selectStrategy(level, currentState);
-
-        // Set weight if supported
-        if (strategy instanceof SingleAgentStrategy) {
-            ((SingleAgentStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
-        } else if (strategy instanceof JointAStarStrategy) {
-            ((JointAStarStrategy) strategy).setWeight(strategyConfig.getAstarWeight());
-        }
-
-        return strategy;
+        long planningTimeout = Math.max(effectiveServerTimeoutMs - 10_000, effectiveServerTimeoutMs / 2);
+        portfolio.setTimeout(planningTimeout);
+        debugOut.println("[Client] Planning budget: " + planningTimeout + "ms (server=" + effectiveServerTimeoutMs + "ms)");
+        return portfolio.search(currentState, level);
     }
 
     /**

@@ -327,7 +327,19 @@ public class State {
             }
             
             Position agentPos = agentPositions[agentId]; // Always read from ORIGINAL state
-            
+
+            // Defensive: skip joint-action entries that would push the agent / box
+            // OUT OF GRID. applyJointAction historically trusted callers, and the
+            // legacy stuck-recovery flow expects "occupied-cell" inapplicability to
+            // pass through (so it can detect a stall and recover). But out-of-grid
+            // moves silently corrupt the state (e.g. agent at row=-8) and poison
+            // every downstream BSP / heuristic lookup with ArrayIndexOutOfBoundsException.
+            // We only block out-of-grid here; other inapplicabilities are left alone.
+            if (isJointActionOutOfGrid(action, agentPos, level)) {
+                logOutOfGridJointActionOnce(agentId, action, agentPos, level);
+                continue;
+            }
+
             switch (action.type) {
                 case MOVE: {
                     newAgentPositions[agentId] = agentPos.move(action.agentDir);
@@ -373,6 +385,67 @@ public class State {
         }
         
         return new State(newAgentPositions, newBoxes, true);
+    }
+
+    /** First-time stderr warning when a joint action contains a non-applicable entry. */
+    private static boolean INAPPLICABLE_LOGGED = false;
+
+    private static void logInapplicableJointActionOnce(int agentId, Action action, Position agentPos) {
+        if (INAPPLICABLE_LOGGED) return;
+        INAPPLICABLE_LOGGED = true;
+        System.err.println("[State.applyJointAction] Inapplicable action for agent " + agentId
+                + " at " + agentPos + " ; action=" + action + " -- treating as NoOp.");
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        int n = Math.min(st.length, 12);
+        for (int i = 1; i < n; i++) {
+            System.err.println("    at " + st[i]);
+        }
+    }
+
+    /** Returns true iff applying this joint-action entry would put an agent or box off-grid. */
+    private static boolean isJointActionOutOfGrid(Action action, Position agentPos, Level level) {
+        int rows = level.getRows();
+        int cols = level.getCols();
+        switch (action.type) {
+            case MOVE: {
+                int r = agentPos.row + action.agentDir.dRow;
+                int c = agentPos.col + action.agentDir.dCol;
+                return r < 0 || r >= rows || c < 0 || c >= cols;
+            }
+            case PUSH: {
+                int br = agentPos.row + action.agentDir.dRow;
+                int bc = agentPos.col + action.agentDir.dCol;
+                if (br < 0 || br >= rows || bc < 0 || bc >= cols) return true;
+                int nbr = br + action.boxDir.dRow;
+                int nbc = bc + action.boxDir.dCol;
+                return nbr < 0 || nbr >= rows || nbc < 0 || nbc >= cols;
+            }
+            case PULL: {
+                int nar = agentPos.row + action.agentDir.dRow;
+                int nac = agentPos.col + action.agentDir.dCol;
+                if (nar < 0 || nar >= rows || nac < 0 || nac >= cols) return true;
+                int br = agentPos.row - action.boxDir.dRow;
+                int bc = agentPos.col - action.boxDir.dCol;
+                return br < 0 || br >= rows || bc < 0 || bc >= cols;
+            }
+            default:
+                return false;
+        }
+    }
+
+    private static boolean OUT_OF_GRID_LOGGED = false;
+
+    private static void logOutOfGridJointActionOnce(int agentId, Action action, Position agentPos, Level level) {
+        if (OUT_OF_GRID_LOGGED) return;
+        OUT_OF_GRID_LOGGED = true;
+        System.err.println("[State.applyJointAction] Out-of-grid action for agent " + agentId
+                + " at " + agentPos + " (grid " + level.getRows() + "x" + level.getCols() + ")"
+                + " ; action=" + action + " -- treating as NoOp.");
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        int n = Math.min(st.length, 12);
+        for (int i = 1; i < n; i++) {
+            System.err.println("    at " + st[i]);
+        }
     }
 
     /**

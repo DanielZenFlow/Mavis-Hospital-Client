@@ -108,27 +108,106 @@ public class SubgoalManager {
     
     private void addBoxGoals(List<PriorityPlanningStrategy.Subgoal> unsatisfied, 
                             State state, Level level, Set<Position> staticGoals, Set<Position> completedBoxGoals) {
+        // P1: Same-color agent load balancing.
+        //
+        // Old behavior (per-goal independent nearest):
+        //   When a color has K agents and N>K goals, all N goals tended to be assigned
+        //   to the single closest agent — leaving K-1 agents idle and creating a serial
+        //   bottleneck. Particularly painful on donkeyK (5 brown), GroupEZ (3 blue),
+        //   Medibots (3 same-color pairs), NameHere (2 pink → 16 box types).
+        //
+        // New behavior (cap-based load balancing):
+        //   Per color group: cap = ceil(N/K). For each goal, pick the nearest same-color
+        //   agent whose current assignment count is below cap. If all are at cap, fall
+        //   back to absolute-nearest (preserves single-agent-color correctness).
+        //
+        // Complexity: O(N * K_per_color). Deterministic. Recomputed each call to match
+        // existing stateless re-planning semantics in PriorityPlanningStrategy.
+
+        // Pass 1: count unsatisfied goals per color and agents per color.
+        Map<Color, Integer> goalsPerColor = new EnumMap<>(Color.class);
+        Map<Color, Integer> agentsPerColor = new EnumMap<>(Color.class);
+
         for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
             char goalType = entry.getKey();
             Color boxColor = level.getBoxColor(goalType);
-            
             for (Position goalPos : entry.getValue()) {
-                // Skip pre-satisfied static goals (decorations)
                 if (staticGoals.contains(goalPos)) continue;
-                
-                // Skip completed goals (MAPF: permanent obstacle)
                 if (completedBoxGoals.contains(goalPos)) continue;
-                
                 Character actualBox = state.getBoxes().get(goalPos);
                 if (actualBox == null || actualBox != goalType) {
-                    // MAPF FIX: Choose NEAREST agent instead of first available (index-based)
-                    int agentId = findNearestAgentForColor(boxColor, goalPos, level, state);
+                    goalsPerColor.merge(boxColor, 1, Integer::sum);
+                }
+            }
+        }
+        for (int i = 0; i < state.getNumAgents(); i++) {
+            agentsPerColor.merge(level.getAgentColor(i), 1, Integer::sum);
+        }
+
+        Map<Color, Integer> capPerColor = new EnumMap<>(Color.class);
+        for (Map.Entry<Color, Integer> e : goalsPerColor.entrySet()) {
+            int n = e.getValue();
+            int m = agentsPerColor.getOrDefault(e.getKey(), 0);
+            if (m <= 0) {
+                capPerColor.put(e.getKey(), Integer.MAX_VALUE); // no same-color agent — leaves goal unassigned
+            } else {
+                capPerColor.put(e.getKey(), (n + m - 1) / m); // ceil(n/m)
+            }
+        }
+
+        // Pass 2: assign goals respecting per-agent cap.
+        Map<Integer, Integer> agentLoad = new HashMap<>();
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            Color boxColor = level.getBoxColor(goalType);
+            int cap = capPerColor.getOrDefault(boxColor, Integer.MAX_VALUE);
+
+            for (Position goalPos : entry.getValue()) {
+                if (staticGoals.contains(goalPos)) continue;
+                if (completedBoxGoals.contains(goalPos)) continue;
+
+                Character actualBox = state.getBoxes().get(goalPos);
+                if (actualBox == null || actualBox != goalType) {
+                    int agentId = findBalancedAgentForColor(boxColor, goalPos, level, state, agentLoad, cap);
                     if (agentId != -1) {
                         unsatisfied.add(new PriorityPlanningStrategy.Subgoal(agentId, goalType, goalPos, false));
+                        agentLoad.merge(agentId, 1, Integer::sum);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Picks the nearest same-color agent whose assigned-goal count is below {@code cap}.
+     * Falls back to absolute-nearest if every same-color agent is at the cap.
+     * Returns -1 if no same-color agent exists.
+     */
+    private int findBalancedAgentForColor(Color color, Position target, Level level, State state,
+                                          Map<Integer, Integer> agentLoad, int cap) {
+        int bestUnderCapId = -1;
+        int bestUnderCapDist = Integer.MAX_VALUE;
+        int bestAnyId = -1;
+        int bestAnyDist = Integer.MAX_VALUE;
+
+        int numAgents = state.getNumAgents();
+        for (int i = 0; i < numAgents; i++) {
+            if (level.getAgentColor(i) != color) continue;
+            Position agentPos = state.getAgentPosition(i);
+            int dist = immovableDetector.getDistanceWithImmovableBoxes(agentPos, target, state, level);
+
+            if (dist < bestAnyDist) {
+                bestAnyDist = dist;
+                bestAnyId = i;
+            }
+            int load = agentLoad.getOrDefault(i, 0);
+            if (load >= cap) continue;
+            if (dist < bestUnderCapDist) {
+                bestUnderCapDist = dist;
+                bestUnderCapId = i;
+            }
+        }
+        return bestUnderCapId != -1 ? bestUnderCapId : bestAnyId;
     }
     
     private void addCompletedAgentGoals(List<PriorityPlanningStrategy.Subgoal> unsatisfied,

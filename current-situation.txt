@@ -1,0 +1,208 @@
+课程主线与CBS适用性的深度分析
+一、课程知识体系的真正主线
+1.1 "Relax → Solve → Unrelax"是否是唯一主线
+"Relax → Solve → Unrelax"这个表述确实贯穿课程，但将其作为唯一主线会导致知识结构的扁平化理解。这个框架本质上是一个搜索复杂度管理的元策略，课程真正的主线可以从三个层次来描述：
+在宏观叙事层面，课程从单智能体搜索出发，逐步引入复杂度：单体A* → 规划（STRIPS/PDDL）→ 启发式 → 偏序规划/HTN → 迭代加宽搜索 → 多智能体 → CBS → BDI。整个课程的叙事张力是状态空间维度爆炸问题。每一章都是在回答同一个问题：当空间太大、约束太复杂时，我们如何找到可行解？
+在技术核心层面，Relax→Solve→Unrelax只是这个问题的一种元答案形式，但课程还有另一条技术主线：将联合问题分解为独立子问题，再用冲突/约束来重新耦合。这条主线在Priority Planning中体现为完全忽略冲突直到碰撞，在CBS中体现为将冲突显式建模后分支解决，在HTN/POP中体现为将偏序任务结构逐步精化。
+因此，如果要更准确地表述课程主线，是两条线的交织：松弛-求解-回收（Relax/Solve/Unrelax） 和 解耦-独立规划-冲突解消（Decompose/Plan independently/Resolve conflicts）。你之前只看到第一条，忽视了第二条——而你现在关注的PP和CBS，恰好分别代表这两种思路的两个极端立场。
+1.2 各模块知识的深度应用价值判断
+从对Hospital Domain的实际工程价值来排序：
+第一优先级：启发式设计（slides03）。无论用什么搜索框架，启发式函数的质量决定搜索效率的数量级。Hospital Domain中，盒子的曼哈顿距离是最朴素的h值，但忽略了盒子之间的互相阻挡。真正有效的启发式需要考虑"先移走哪个盒子才能移动目标盒子"这种依赖关系，这是许多人最容易忽视的瓶颈。
+第二优先级：多智能体协调框架（slides06）和CBS（slides07）。这是真正区分方案质量的地方。
+第三优先级：IW/迭代加宽（slides05）。这在结构上与LNS有关联，是理解"选择性探索"思想的关键。
+
+二、CBS适用性问题的深度分析
+2.1 你的判断"CBS只适合纯MAPF"是对的，但理由表述不够精确
+你说"Pull逻辑意味着操作可逆，没有绝对的死区"——这个推论方向是错的。Pull的可逆性和CBS的适用性之间没有直接的逻辑连接。真正的问题在于CBS的底层假设与Hospital Domain的问题结构之间的不匹配。
+课程的CBS幻灯片（p.2）直接写道：Hospital Domain比MAPF更复杂，区别在于"No boxes"和"All agents have one goal"。这两点是决定性的：
+关于"No boxes"：CBS的低层规划器（space-time A*）假设每个agent的规划空间是独立的位置-时间图，约束是"agent i不能在时刻t出现在位置v"。但在Hospital Domain中，agent携带box后，box的位置成为state的一部分，agent的"位置"变成(agent_pos, box_pos)的二元组，或者更复杂的联合状态。这意味着CBS的constraint结构——以(agent, location, time)三元组表示约束——无法直接套用，因为"location"本身就变成了高维的。
+关于"All agents have one goal"：CBS假设每个agent有一个固定终点，冲突消解只需要让某个agent改道绕行。Hospital Domain中，agent可能需要移动多个box，任务分配本身就是一个规划问题。如果agent A的子目标序列发生变化，CBS无法简单地在原有框架内重新规划。
+关于Pull的可逆性：Pull确实减少了deadlock的频率（因为agent不会因为被box卡住而永久死锁），但它不影响CBS的适用性判断，因为那个判断的核心是状态空间的结构，而不是是否存在死锁。你在这里的推理犯了一个典型错误：把"执行层面的死锁"和"规划框架的适用性"混淆了。
+2.2 CBS的正确适用场景与改造可能
+CBS理论上可以扩展到带box的域，但需要将约束从agent-level提升到(agent, box)-level，并且低层规划器必须是带box推拉的完整规划器，而不是简单的space-time A*。这本质上等同于对每个CBS分支运行一个独立的单智能体+单box规划问题，代价极高。
+有一种思路是将CBS用于宏观任务分配层：先用CBS解决纯movement层面的冲突（把box运输抽象为agent的高层动作），然后用另一个规划器处理具体的push/pull序列。这是一个分层规划的架构，courses的IWS幻灯片和HTN幻灯片都涉及了这种分层思想。
+
+三、你的知识盲区诊断
+3.1 表述逻辑的问题反映了什么
+你说"Pull逻辑意味着操作可逆，没有绝对的死区"时，把三个不同维度的概念串联在了一起：
+
+"操作可逆"是action model层面的属性
+"没有绝对死区"是completeness层面的判断
+"CBS只适合纯MAPF"是algorithm applicability层面的判断
+
+这三者之间缺乏明确的逻辑桥梁。这表明你对以下两个核心概念的掌握可能停留在直觉层面而非形式层面：搜索算法的applicability条件（即一个算法的前提假设是什么），以及状态空间的表示对算法选择的决定性影响。
+3.2 为什么你在CBS上失败了
+你"因为领域知识薄弱而失败"。这个自评方向正确，但需要更精确：CBS失败最可能的原因是低层规划器的设计。CBS的高层（constraint tree）逻辑并不复杂，难点在于低层的space-time A*需要能够携带正确的constraint集合，并且在Hospital Domain中，这个规划器需要处理box的存在。如果你的低层规划器只处理agent移动而忽略box，那CBS框架就是建立在一个不完整的地基上的。
+
+四、探索性问题——诊断你的掌握深度
+以下问题不是要求你立刻回答，而是帮助你自我定位：
+关于Priority Planning（你现在的主要工具）：
+当两个agent同时需要经过同一条走廊时，PP通过优先级排序来避免冲突。但如果优先级高的agent为了移动一个box，必须暂时站在优先级低的agent的必经之路上，你的PP实现如何处理这种"临时占位"？你的PP是否区分了"agent占位"和"box占位"对低优先级agent的不同影响？
+关于启发式：
+你目前用的h函数具体是什么？它是否考虑了"目标box被另一个box挡住"的情况？如果A box的目标位置被B box占据，你的h值会不会低估实际代价？这种低估有多严重——是O(1)还是可能导致搜索走向完全错误的方向？
+关于MAPF-LNS的理解：
+你说觉得MAPF-LNS"非常好"，但LNS的核心机制是"选择一个子集的agents，销毁他们的计划，在约束下重新规划"。在Hospital Domain中，"销毁一个agent的计划"是否等同于"允许该agent重新接受任务分配"？如果是，那么destroy operator应该选择哪些agents——是相互冲突的agents，还是距离目标最远的agents，还是别的标准？你有没有想过destroy operator的设计对LNS质量的决定性影响？
+关于IW（迭代加宽搜索）：
+IW的核心思想是什么？它和BFS有什么本质区别？在Hospital Domain里，"novelty"如何定义——(agent位置)这个单原子是否足够，还是需要(agent位置, box位置)这样的二元组才能捕捉到有意义的新颖性？
+关于CBS的两层结构：
+CBS的高层是constraint tree，每个节点包含一组constraints和一组individual plans。当你发现一个conflict后，你生成两个子节点，分别给两个agent加约束。问题：如果同一个conflict在树的不同分支被反复发现，CBS是如何避免无限重复劳动的？这个机制有没有在你之前的CBS尝试中被正确实现？
+
+
+MAPF-LNS 应用于 Hospital Domain 的可行性分析
+0. 关于「Relax → Solve → Unrelax」的评价
+你说得基本正确，但需要更精确地表述。
+
+当前架构的核心循环是：
+
+分析特征 → 选排序 → PP一次性求解 → 失败则换排序从头来
+
+这是一个 one-shot portfolio 模式，完全没有「在已有解上迭代改进」的能力。MAPF-LNS 的核心恰恰是 Relax → Solve → Unrelax：
+
+阶段	MAPF-LNS 中的含义	你当前代码的对应
+Relax (Destroy)	选一组 agent，丢弃它们的路径，将其余路径视为移动障碍	❌ 不存在
+Solve (Repair)	为被选中的 agent 重新规划路径（用 PP/CBS/EECBS）	⚠️ PP 存在但只做一次性规划
+Unrelax (Accept)	若新解更好则替换，否则保留旧解，继续迭代	❌ 不存在
+更准确的说法是：你的代码具备了 Solve 阶段的基础能力（PP、CBS），但完全缺少 Relax 和 Unrelax 的框架，因此无法做迭代改进。 你说「几乎没有用到」是对的——唯一沾边的是 partial plan 保存 + early-exit，但这只是保存中间结果，不是在其基础上改进。
+
+1. 需要新增的核心模块
+1.1 LNS 主控制器 (LNSController)
+这是整个改造的骨架。论文的 Algorithm 流程是：
+
+初始解 P ← InitialSolver(problem)
+while 未超时:
+    A_s ← SelectNeighborhood(P)        // Destroy: 选子集
+    P_s⁻ ← RemovePaths(P, A_s)         // Relax: 移除路径
+    P_s⁺ ← Replan(A_s, P \ P_s⁻)      // Solve: 重新规划
+    if cost(P_s⁺) < cost(P_s⁻):
+        P ← Replace(P, P_s⁻, P_s⁺)    // Unrelax: 接受改进
+return P
+
+当前代码中不存在此循环。 需要在 PortfolioController 之上或内部新建。
+
+工作量: 中等。主控循环本身约 200-300 行 Java，但需要定义好 Solution 数据结构（agent→path 映射 + cost）。
+
+1.2 三种邻域选择启发式 (Destroy Heuristics)
+论文提出三种正交的邻域选择策略：
+
+1.2.1 Agent-Based Neighborhood (Algorithm 1)
+选 delay 最大的 agent a_k，沿其路径做 restricted random walk，收集碰撞 agent
+需要新增：delay(p_i) = l(p_i) - d(s_i, g_i) 计算、random walk 沿路径收集冲突 agent 的逻辑
+当前 ConflictDetector 只做当步冲突检测，需要扩展为全路径冲突检测
+1.2.2 Map-Based Neighborhood (Algorithm 2)
+找 intersection vertex（degree ≥ 3），BFS 扩展收集经过的 agent
+需要新增：地图拓扑分析（intersection detection）、GetIntersectionAgents 时间窗口查询
+当前 LevelAnalyzer 有部分拓扑分析能力，可复用
+1.2.3 Random Neighborhood
+随机选 N 个 agent
+几乎零工作量，但论文证明在拥挤场景下效果不错
+1.3 Adaptive LNS (ALNS) 权重管理
+论文 Section 6 的关键：维护三种启发式的权重 w_i，用 roulette wheel selection 选择，按改进效果更新：
+
+w_i ← γ · max{cost_old - cost_new, 0} + (1 - γ) · w_i    (γ = 0.01)
+
+需要新增：一个轻量的权重管理器，跟踪每种启发式的历史表现。约 50-80 行代码。
+
+2. 需要改造的现有模块
+2.1 Solution 表示 — 从「Action 序列」到「Agent-Path 映射」
+这是最大的适配难点。
+
+维度	论文假设	当前实现
+解的表示	P = {p_i}, 每个 agent 一条独立路径 (vertex sequence)	Action[][] 二维数组，按 timestep 组织，agent 和 box 动作耦合
+动作模型	Move / Wait（agent only）	Push / Pull / Move / NoOp（agent + box 联动）
+冲突定义	vertex conflict + edge conflict	当前只检测同位置同时刻冲突
+Cost 度量	sum of path lengths 或 sum of delays	无显式 cost，只关心「是否找到完整解」
+改造要点：
+
+新建 AgentPath 类，记录每个 agent 在每个 timestep 的 (position, action, box_position)
+从现有 Action[][] 可以提取出 per-agent path，但需要处理 box 联动
+定义 cost 函数：建议用 sum of delays（论文默认），即 Σ(path_length - shortest_path_distance)
+2.2 Replan 模块 — 将 PP/CBS 改造为「约束下重规划」
+论文的 Repair 步骤要求：为选中的 agent 子集重新规划路径，同时将其余 agent 的现有路径视为移动障碍（时空约束）。
+
+当前代码的 PP (PriorityPlanningStrategy) 和 CBS (CBSStrategy) 都是从零开始规划，不支持「固定部分 agent 路径，只重规划子集」。
+
+改造要点：
+
+ReservationTable 已存在，但需要扩展为能加载「固定 agent 的完整路径」作为时空约束
+BoxSearchPlanner (BSP) 需要能在给定时空约束下搜索——当前它不考虑时间维度
+PP 的 planForAgent() 需要接受外部 reservation table 作为参数
+2.3 初始解生成器
+论文 Experiment 1 表明：初始解的质量不太关键，但必须能快速生成。 PP 是论文推荐的初始解生成器之一。
+
+当前 PP 已经可以生成初始解（甚至 partial solution），这部分基本可以复用。但需要：
+
+将 PP 的输出转换为新的 Solution 格式
+当 PP 只能生成 partial solution 时，需要为未解决的 agent 生成「原地等待」的 dummy path
+3. Hospital Domain 特有的适配挑战
+3.1 Push/Pull 动作模型
+这是论文与你项目之间最根本的差异。 论文假设 agent 只能 Move/Wait，但 hospital domain 的 agent 需要 Push/Pull box。
+
+影响：
+
+邻域选择时，移除一个 agent 的路径意味着同时移除它推/拉的 box 的运动轨迹
+Replan 时，不仅要避免 agent 冲突，还要避免 box 位置冲突
+Cost 函数需要考虑 box 是否到达目标
+解决方案：将 (agent, box) 视为一个「复合实体」，路径包含 agent 位置 + box 位置。Destroy 时移除整个复合路径，Repair 时用 BSP 重新规划。
+
+3.2 Box Goal 满足的不可逆性问题
+标准 MAPF 中 agent 到达 goal 后原地等待即可。但 hospital domain 中：
+
+box 被推到 goal 后，如果另一个 agent 路过又把它推走了，goal 就不再满足
+LNS 的 Repair 步骤可能破坏已满足的 box goal
+需要新增：Repair 时将已满足且不属于被选中 agent 的 box goal 位置设为不可修改约束。
+
+3.3 Immovable Box 处理
+你的分析文档中已经指出这是 P0 优先级。LNS 的引入不解决这个问题，但与 LNS 结合效果更好：
+
+immovable box → wall 融合后，搜索空间缩小
+LNS 的每次 Replan 迭代都会从缩小的搜索空间中受益
+建议：在实现 LNS 之前先完成 immovable box → wall 融合（P0）。
+
+4. 工程集成方案
+4.1 架构改造路径
+当前架构:
+  Client → PortfolioController → [PP策略1, PP策略2, ...] → 第一个完整解
+
+目标架构:
+  Client → PortfolioController (改造)
+            ├── Phase 1: InitialSolver (现有PP) → 初始解 P₀
+            └── Phase 2: LNSController (新增)
+                  ├── NeighborhoodSelector (新增)
+                  │     ├── AgentBasedSelector
+                  │     ├── MapBasedSelector
+                  │     └── RandomSelector
+                  ├── ALNSWeightManager (新增)
+                  ├── Repairer (改造自PP/CBS)
+                  │     └── ConstrainedReplan (PP + ReservationTable)
+                  └── SolutionManager (新增)
+                        ├── Solution / AgentPath
+                        └── CostEvaluator
+
+4.2 时间预算分配建议
+论文实验用 60s 时限。你的 competition 有 180s（留 5s 缓冲 = 175s），建议：
+
+阶段	时间	说明
+分析 + 分组	5s	现有 LevelAnalyzer + 独立分组
+初始解 (PP)	30-50s	现有 portfolio 的前 1-2 个策略
+LNS 迭代	剩余所有时间	尽可能多次 destroy-repair
+安全缓冲	5s	保持不变
+5. 实施优先级与工作量总览
+优先级	任务	依赖	工作量	对解题能力的影响
+S0	Immovable box → wall 融合	无	★★☆☆☆	7 关直接受益，且为 LNS 铺路
+S1	Solution / AgentPath 数据结构	无	★★☆☆☆	LNS 的基础设施
+S2	ReservationTable 扩展（加载固定路径）	S1	★★★☆☆	Repair 的核心能力
+S3	ConstrainedReplan（约束下 PP 重规划）	S2	★★★★☆	LNS 的 Repair 步骤
+S4	LNSController 主循环 + SolutionManager	S1, S3	★★★☆☆	LNS 骨架
+S5	Random Neighborhood 选择器	S4	★☆☆☆☆	最简单的邻域，用于验证框架
+S6	Agent-Based Neighborhood 选择器	S4	★★★☆☆	论文中最有效的启发式
+S7	Map-Based Neighborhood 选择器	S4	★★★☆☆	正交于 Agent-Based，互补
+S8	ALNS 权重管理	S5-S7	★☆☆☆☆	自适应选择最优启发式
+S9	Push/Pull 复合路径适配	S3	★★★★★	Hospital Domain 特有的最大难点
+S10	Box Goal 不可逆性约束	S9	★★☆☆☆	防止 Repair 破坏已达成的 goal
+推荐实施路线
+第一阶段 (基础): S0 → S1 → S2
+第二阶段 (最小可行LNS): S3 → S4 → S5 → 验证
+第三阶段 (完整LNS): S6 → S7 → S8
+第四阶段 (深度适配): S9 → S10
+
+关键判断：第二阶段结束时（仅用 Random Neighborhood），你就能在所有 partial solution 的关卡上看到改进。论文 Table 2 显示，即使是 Random Neighborhood，在拥挤场景下也能大幅降低 sum of delays。这意味着你的 8 个 partial solution 关卡（TBSTANS1、DECrunchy、help 等）有望从中直接获益。
