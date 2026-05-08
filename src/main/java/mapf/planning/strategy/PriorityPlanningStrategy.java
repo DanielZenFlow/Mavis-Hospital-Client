@@ -80,6 +80,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> immovableBoxes = Collections.emptySet();
 
     /**
+     * P0b: goal positions to demote to the back of the subgoal order.
+     * Populated by PortfolioController from prior attempts' FailureReport.lastAttemptedSubgoal:
+     * if attempt N got stuck on goal G, attempt N+1 tries G last (other goals first may
+     * unblock G physically). Pure ordering hint — no goals are removed.
+     */
+    private Set<Position> deprioritizedGoals = Collections.emptySet();
+
+    /**
      * Cache of barrier clearing orders that were found non-extractable.
      * Prevents the infinite loop where dynamic barrier re-detection keeps
      * finding the same non-extractable barrier every stuck iteration.
@@ -240,11 +248,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         this.goalDependsOn = deps != null ? deps : Collections.emptyMap();
     }
     
-    /** Sets immovable boxes (treated as walls in pathfinding). */
+    /** Sets immovable goal positions (treated as walls in pathfinding). */
     public void setImmovableBoxes(Set<Position> immovable) {
         this.immovableBoxes = immovable != null ? immovable : Collections.emptySet();
     }
-    
+
+    /**
+     * P0b: hint from PortfolioController to push these goals to the end of the order.
+     * Source: prior attempts' FailureReport.lastAttemptedSubgoal.goalPos accumulated
+     * across the portfolio. Does NOT remove goals — only changes ordering.
+     */
+    public void setDeprioritizedGoals(Set<Position> goals) {
+        this.deprioritizedGoals = goals != null ? goals : Collections.emptySet();
+    }
+
     /** Sets the ordering mode for subgoal execution. */
     public void setOrderingMode(OrderingMode mode) {
         this.orderingMode = mode != null ? mode : OrderingMode.TOPOLOGICAL;
@@ -1563,7 +1580,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // Physical blocking sort: reorder subgoals where filling goal A would place a box
         // on goal B's box-to-goal path. Goal B should be filled BEFORE goal A.
         applyPhysicalBlockingSort(cachedSubgoalOrder, state, level);
-        
+
+        // P0b: stable-partition deprioritized goals (from prior attempts' FailureReport)
+        // to the end. They are still attempted, just last — giving other goals a chance
+        // to clear physical blockers first.
+        if (!deprioritizedGoals.isEmpty()) {
+            int beforeSize = cachedSubgoalOrder.size();
+            List<Subgoal> head = new ArrayList<>(beforeSize);
+            List<Subgoal> tail = new ArrayList<>();
+            for (Subgoal sg : cachedSubgoalOrder) {
+                if (deprioritizedGoals.contains(sg.goalPos)) tail.add(sg);
+                else head.add(sg);
+            }
+            if (!tail.isEmpty()) {
+                cachedSubgoalOrder = head;
+                cachedSubgoalOrder.addAll(tail);
+                if (mapf.planning.SearchConfig.isMinimal()) {
+                    System.err.println("[PP] P0b: demoted " + tail.size() + " goal(s) to end (from prior FailureReport)");
+                }
+            }
+        }
+
         logGoalOrder(cachedSubgoalOrder);
     }
     

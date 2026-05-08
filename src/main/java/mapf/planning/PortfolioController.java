@@ -170,7 +170,12 @@ public class PortfolioController implements SearchStrategy {
         // better than starting another attempt that will be killed mid-search
         // (causing the cached bestPartialPlan to be lost).
         final long MIN_ATTEMPT_MS = 5_000;
-        
+
+        // P0b: accumulate goal positions that previous PP attempts got stuck on.
+        // Each subsequent PP attempt will demote these to the end of its order \u2014
+        // giving other goals a chance to physically clear blockers first.
+        Set<Position> deprioritizedGoals = new HashSet<>();
+
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
                 System.err.println("[Portfolio] Timeout - no more time for attempts");
@@ -205,6 +210,11 @@ public class PortfolioController implements SearchStrategy {
             // Create and configure strategy
             SearchStrategy strategy = createStrategy(strategyConfig, level);
             strategy.setTimeout(attemptTimeout);
+
+            // P0b: pass accumulated deprioritized goals from prior failed attempts.
+            if (!deprioritizedGoals.isEmpty() && strategy instanceof PriorityPlanningStrategy) {
+                ((PriorityPlanningStrategy) strategy).setDeprioritizedGoals(deprioritizedGoals);
+            }
             
             // Execute
             long attemptStart = System.currentTimeMillis();
@@ -218,13 +228,24 @@ public class PortfolioController implements SearchStrategy {
             long attemptDuration = System.currentTimeMillis() - attemptStart;
 
             // P0a: log structured failure signal when present (PP nulls it on success).
-            // Pure logging \u2014 no decision-making yet (P0b will consume this).
+            // P0b: also accumulate the failed subgoal's goal position into deprioritizedGoals
+            // so the next PP attempt demotes it to the end.
             if (strategy instanceof PriorityPlanningStrategy) {
                 mapf.planning.signal.FailureReport report =
                         ((PriorityPlanningStrategy) strategy).getLastFailureReport();
-                if (report != null && SearchConfig.isMinimal()) {
-                    System.err.println("[Portfolio] FailureReport from " + strategyConfig.type
-                            + ": " + report.summary());
+                if (report != null) {
+                    if (SearchConfig.isMinimal()) {
+                        System.err.println("[Portfolio] FailureReport from " + strategyConfig.type
+                                + ": " + report.summary());
+                    }
+                    if (report.lastAttemptedSubgoal != null && report.lastAttemptedSubgoal.goalPos != null) {
+                        if (deprioritizedGoals.add(report.lastAttemptedSubgoal.goalPos)
+                                && SearchConfig.isMinimal()) {
+                            System.err.println("[Portfolio] P0b: deprioritize goal "
+                                    + report.lastAttemptedSubgoal.goalPos
+                                    + " for next attempt (now " + deprioritizedGoals.size() + " total)");
+                        }
+                    }
                 }
             }
 
