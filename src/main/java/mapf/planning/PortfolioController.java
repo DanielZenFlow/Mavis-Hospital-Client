@@ -72,6 +72,13 @@ public class PortfolioController implements SearchStrategy {
         // Boxes that no agent can ever push (wrong color / unreachable) are converted
         // into static walls and removed from the State. This shrinks the search space
         // for every downstream BFS / A* / heuristic precomputation.
+        //
+        // Relationship to ImmovableBoxDetector (used by SubgoalManager / Hungarian):
+        //   - TaskFilter.immovableBoxes: color + reachability based; INPUT to fusion.
+        //   - ImmovableBoxDetector.getImmovableBoxes(): color-only; computed lazily on
+        //     the FUSED level/state where those boxes are already walls, so it returns
+        //     the empty set (or only edge cases like wrong-letter-on-goal). The two are
+        //     complementary, not duplicate; documented here to prevent future confusion.
         if (features != null && features.taskFilter != null
                 && !features.taskFilter.immovableBoxes.isEmpty()) {
             ImmovableFusion.FusedProblem fused = ImmovableFusion.fuse(
@@ -88,6 +95,15 @@ public class PortfolioController implements SearchStrategy {
                 // dependency analysis, coupling, recommended strategy) reflect
                 // the smaller post-fusion problem.
                 features = LevelAnalyzer.analyze(level, initialState);
+                // Sanity: post-fusion immovable should be empty (or only non-fusible
+                // edge cases). Logged once if violated for diagnostic purposes.
+                if (SearchConfig.isNormal()
+                        && features.taskFilter != null
+                        && !features.taskFilter.immovableBoxes.isEmpty()) {
+                    System.err.println("[Portfolio] Note: " +
+                            features.taskFilter.immovableBoxes.size() +
+                            " immovable boxes remain after fusion (likely wrong-letter-on-goal).");
+                }
             }
         }
 
