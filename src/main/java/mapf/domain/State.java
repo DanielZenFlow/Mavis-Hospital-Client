@@ -357,6 +357,8 @@ public class State {
                         boxRemovePositions.add(boxPos);
                         boxAddPositions.add(newBoxPos);
                         boxAddTypes.add(boxType);
+                    } else {
+                        logBoxMismatchOnce(agentId, action, agentPos, boxPos);
                     }
                     break;
                 }
@@ -370,6 +372,8 @@ public class State {
                         boxRemovePositions.add(boxPos);
                         boxAddPositions.add(agentPos); // Box moves to agent's old position
                         boxAddTypes.add(boxType);
+                    } else {
+                        logBoxMismatchOnce(agentId, action, agentPos, boxPos);
                     }
                     break;
                 }
@@ -443,6 +447,23 @@ public class State {
         System.err.println("[State.applyJointAction] Out-of-grid action for agent " + agentId
                 + " at " + agentPos + " (grid " + level.getRows() + "x" + level.getCols() + ")"
                 + " ; action=" + action + " -- treating as NoOp.");
+        StackTraceElement[] st = Thread.currentThread().getStackTrace();
+        int n = Math.min(st.length, 12);
+        for (int i = 1; i < n; i++) {
+            System.err.println("    at " + st[i]);
+        }
+    }
+
+    /** One-time stderr warning when PUSH/PULL references a position with no box. */
+    private static boolean BOX_MISMATCH_LOGGED = false;
+
+    private static void logBoxMismatchOnce(int agentId, Action action, Position agentPos, Position boxPos) {
+        if (BOX_MISMATCH_LOGGED) return;
+        BOX_MISMATCH_LOGGED = true;
+        System.err.println("[State.applyJointAction] Box-source mismatch: agent " + agentId
+                + " at " + agentPos + " ; action=" + action
+                + " ; expected box at " + boxPos + " but none found"
+                + " -- treating as NoOp for the box effect.");
         StackTraceElement[] st = Thread.currentThread().getStackTrace();
         int n = Math.min(st.length, 12);
         for (int i = 1; i < n; i++) {
