@@ -287,13 +287,28 @@ public class Client {
      * @param results which actions succeeded
      */
     private void updateState(Action[] actions, boolean[] results) {
-        // Apply successful actions one by one
-        for (int i = 0; i < actions.length && i < results.length; i++) {
-            if (results[i]) {
-                currentState = currentState.apply(actions[i], i);
+        // Mirror server semantics: actions are evaluated synchronously against the
+        // state at the START of the timestep. We mask rejected actions to NoOp and
+        // hand the whole array to applyJointAction, which (a) reads every agent
+        // position from the original state (no order-dependent shadow updates) and
+        // (b) defensively rejects out-of-grid effects. Previously we called
+        // currentState.apply(actions[i], i) per agent, which happened to produce
+        // the same final state when results[] was trustworthy but bypassed those
+        // safety checks and diverged in semantics from the planner's own
+        // applyJointAction usage.
+        boolean logRejected = "1".equals(System.getenv("MAVIS_LOG_REJECTED"));
+        Action[] effective = new Action[actions.length];
+        for (int i = 0; i < actions.length; i++) {
+            boolean ok = i < results.length && results[i];
+            if (ok) {
+                effective[i] = actions[i];
             } else {
-                debugOut.println("Warning: Action for agent " + i + " failed: " + actions[i]);
+                effective[i] = Action.noOp();
+                if (logRejected) {
+                    debugOut.println("Warning: Action for agent " + i + " failed: " + actions[i]);
+                }
             }
         }
+        currentState = currentState.applyJointAction(effective, level);
     }
 }

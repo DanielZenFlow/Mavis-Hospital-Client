@@ -182,7 +182,7 @@ public class CrossColorBarrierAnalyzer {
             barriers.add(new Barrier(agentId, agentColor, barrierGoals, barrierBoxTypes,
                     clearingOrder, blockingType, blockingColor));
 
-            if (SearchConfig.isNormal()) {
+            if (SearchConfig.isVerbose()) {
                 System.err.println("[BarrierAnalyzer] " + barriers.get(barriers.size() - 1));
             }
         }

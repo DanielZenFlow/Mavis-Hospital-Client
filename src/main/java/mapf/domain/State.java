@@ -94,7 +94,9 @@ public class State {
     
     /**
      * Checks if there is an agent at the specified position.
-     * With Position flyweight cache, equals() short-circuits via == on first check.
+     * O(numAgents) linear scan; numAgents <= 10 per problem spec, so the
+     * Position flyweight (interned via Position.of) lets equals() short-circuit
+     * to a reference compare per probe, but the scan itself is still linear.
      * 
      * @param pos the position to check
      * @return true if there is an agent at this position
@@ -110,7 +112,7 @@ public class State {
     
     /**
      * Gets the agent at the specified position, if any.
-     * With Position flyweight cache, equals() short-circuits via == on first check.
+     * O(numAgents) linear scan; same caveat as {@link #hasAgentAt}.
      * 
      * @param pos the position to check
      * @return the agent number at this position, or -1 if no agent

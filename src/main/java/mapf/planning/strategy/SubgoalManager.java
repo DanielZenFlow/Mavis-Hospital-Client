@@ -568,14 +568,6 @@ public class SubgoalManager {
         return bestAgentId;
     }
     
-    /** Legacy method maintained for compilation if referenced elsewhere, but discouraged. */
-    private int findAgentForColor(Color color, Level level, int numAgents) {
-        for (int i = 0; i < numAgents; i++) {
-            if (level.getAgentColor(i) == color) return i;
-        }
-        return -1;
-    }
-    
     private boolean hasCompletedBoxTasks(int agentId, State state, Level level) {
         Color agentColor = level.getAgentColor(agentId);
         Position agentPos = state.getAgentPosition(agentId);

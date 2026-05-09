@@ -94,9 +94,8 @@ public class BoxSearchPlanner {
             SearchNode current = openList.poll();
             exploredCount++;
 
-            // Check if goal is achieved
-            Character boxAtGoal = current.state.getBoxes().get(goalPos);
-            if (boxAtGoal != null && boxAtGoal == boxType) {
+            // Check if goal is achieved — target box must be at goal, not just any same-type box
+            if (goalPos.equals(current.targetBoxPos)) {
                 return reconstructPath(current);
             }
 
@@ -172,9 +171,8 @@ public class BoxSearchPlanner {
             SearchNode current = openList.poll();
             exploredCount++;
 
-            // Check if goal is achieved
-            Character boxAtGoal = current.state.getBoxes().get(goalPos);
-            if (boxAtGoal != null && boxAtGoal == boxType) {
+            // Check if goal is achieved — target box must be at goal, not just any same-type box
+            if (goalPos.equals(current.targetBoxPos)) {
                 return reconstructPath(current);
             }
 

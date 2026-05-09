@@ -38,7 +38,7 @@ import java.util.*;
 public final class BlockerReliefSynthesizer {
 
     /** Maximum relief subgoals to emit per invocation (incl. recursive sub-reliefs). */
-    private static final int MAX_RELIEF_SUBGOALS = 10;
+    private static final int MAX_RELIEF_SUBGOALS = 20;
 
     /** Maximum recursion depth for cascade NAMO (helper-of-helper-of...). */
     private static final int MAX_RECURSION_DEPTH = 3;
@@ -61,6 +61,30 @@ public final class BlockerReliefSynthesizer {
      */
     public static List<Subgoal> synthesize(State state, Level level,
                                            Set<Position> immovableBoxes) {
+        return synthesizeWithMeta(state, level, immovableBoxes).reliefs;
+    }
+
+    /**
+     * Result of {@link #synthesizeWithMeta} carrying both the relief subgoal list
+     * and the F2 suspension set (original goals of relocated blockers).
+     */
+    public static final class ReliefResult {
+        public final List<Subgoal> reliefs;
+        public final Set<Position> suspendedBoxGoals;
+        ReliefResult(List<Subgoal> reliefs, Set<Position> suspended) {
+            this.reliefs = reliefs;
+            this.suspendedBoxGoals = suspended;
+        }
+    }
+
+    /**
+     * Like {@link #synthesize} but additionally returns the set of original box-goals
+     * to suspend (F2). For each emitted relief, the blocker box's closest same-type
+     * unsatisfied goal is added to the suspension set so the PP planner won't try to
+     * push the blocker from P_temp back to that goal during this attempt.
+     */
+    public static ReliefResult synthesizeWithMeta(State state, Level level,
+                                                  Set<Position> immovableBoxes) {
         if (immovableBoxes == null) immovableBoxes = Collections.emptySet();
 
         Set<Position> emittedTemps = new HashSet<>();
@@ -117,8 +141,37 @@ public final class BlockerReliefSynthesizer {
                     if (boxPos.equals(goalPos)) continue;
 
                     // Reachability check: agent must reach adj(box) to push it.
-                    if (anyAdjacentInSet(boxPos, rActual, level)) continue;
-                    if (anyAdjacentInSet(goalPos, rActual, level)) continue;
+                    boolean agentBlocked = !anyAdjacentInSet(boxPos, rActual, level)
+                            && !anyAdjacentInSet(goalPos, rActual, level);
+
+                    if (!agentBlocked) {
+                        // F5: agent can reach the box, but can the BOX reach the goal?
+                        // Check the push-corridor: BFS from boxPos to goalPos in box-permeable
+                        // space. If unreachable through actual boxes but reachable through
+                        // boxes-as-walls=false, find blockers along that corridor.
+                        Set<Position> boxReachActual = bfsReachable(boxPos, state, level,
+                                immovableBoxes, /*treatBoxesAsWalls*/ true, agentColor);
+                        if (boxReachActual.contains(goalPos)) continue; // corridor clear
+                        Set<Position> boxReachThrough = bfsReachable(boxPos, state, level,
+                                immovableBoxes, /*treatBoxesAsWalls*/ false, agentColor);
+                        if (!boxReachThrough.contains(goalPos)) continue; // wall problem
+                        // Find blockers on corridor box -> goal.
+                        List<Position> corridorBlockers = findBlockerPathBetween(
+                                boxPos, goalPos, state, level, immovableBoxes, agentColor);
+                        for (Position blockerPos : corridorBlockers) {
+                            if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
+                            // Skip the target box itself.
+                            if (blockerPos.equals(boxPos)) continue;
+                            ReliefNode n = tryEmitRelief(blockerPos, /*depth*/ 0,
+                                    state, level, immovableBoxes, allGoalCells,
+                                    agentsByColor, emittedTemps, handledBlockerPositions);
+                            if (n != null) {
+                                nodes.add(n);
+                                toExpand.add(n);
+                            }
+                        }
+                        continue;
+                    }
 
                     // Confirm the obstruction is BOX-shaped (not a wall problem).
                     if (rThrough == null) {
@@ -191,7 +244,30 @@ public final class BlockerReliefSynthesizer {
         nodes.sort((a, b) -> Integer.compare(b.depth, a.depth));
         List<Subgoal> reliefs = new ArrayList<>(nodes.size());
         for (ReliefNode n : nodes) reliefs.add(n.subgoal);
-        return reliefs;
+
+        // F2: derive suspended box-goal set from blocker positions. For each emitted
+        // relief, find the closest UNSATISFIED same-type goal to the blocker's
+        // current position \u2014 that's the goal the planner would naturally try to
+        // push the blocker toward, undoing the relief. Suspend it.
+        Set<Position> suspended = new HashSet<>();
+        Map<Position, Character> stateBoxes = state.getBoxes();
+        for (ReliefNode n : nodes) {
+            Position blockerPos = n.blockerPos;
+            Character blockerType = stateBoxes.get(blockerPos);
+            if (blockerType == null) continue;
+            List<Position> sameTypeGoals = level.getBoxGoalsByType()
+                    .getOrDefault(blockerType, Collections.emptyList());
+            Position best = null;
+            int bestD = Integer.MAX_VALUE;
+            for (Position g : sameTypeGoals) {
+                Character occ = stateBoxes.get(g);
+                if (occ != null && occ == blockerType) continue; // already satisfied
+                int d = Math.abs(g.row - blockerPos.row) + Math.abs(g.col - blockerPos.col);
+                if (d < bestD) { bestD = d; best = g; }
+            }
+            if (best != null) suspended.add(best);
+        }
+        return new ReliefResult(reliefs, suspended);
     }
 
     /**
@@ -438,6 +514,64 @@ public final class BlockerReliefSynthesizer {
     }
 
     /**
+     * F5: BFS from {@code startBox} to {@code endGoal} in box-permeable space,
+     * then walk back the parent chain to enumerate other-color boxes encountered
+     * on the corridor. Used to find blockers in the BOX'S push corridor (not the
+     * agent's reach corridor). Excludes startBox itself.
+     */
+    private static List<Position> findBlockerPathBetween(Position startBox, Position endGoal,
+                                                         State state, Level level,
+                                                         Set<Position> immovableBoxes,
+                                                         Color agentColor) {
+        Map<Position, Character> boxes = state.getBoxes();
+        int rows = level.getRows();
+        int cols = level.getCols();
+
+        Map<Position, Position> parent = new HashMap<>();
+        Set<Position> visited = new HashSet<>();
+        Deque<Position> queue = new ArrayDeque<>();
+        queue.add(startBox);
+        visited.add(startBox);
+        int expansions = 0;
+        int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+
+        boolean found = false;
+        while (!queue.isEmpty() && expansions < REACH_BFS_CAP) {
+            Position p = queue.poll();
+            expansions++;
+            if (p.equals(endGoal)) { found = true; break; }
+            for (int[] d : dirs) {
+                int nr = p.row + d[0];
+                int nc = p.col + d[1];
+                if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+                if (level.isWall(nr, nc)) continue;
+                Position np = new Position(nr, nc);
+                if (visited.contains(np)) continue;
+                if (immovableBoxes.contains(np)) continue;
+                visited.add(np);
+                parent.put(np, p);
+                queue.add(np);
+            }
+        }
+
+        if (!found) return Collections.emptyList();
+
+        List<Position> blockers = new ArrayList<>();
+        Position cur = endGoal;
+        while (cur != null && !cur.equals(startBox)) {
+            Character bx = boxes.get(cur);
+            if (bx != null) {
+                Color bc = level.getBoxColor(bx);
+                if (bc != null && bc != agentColor) {
+                    blockers.add(cur);
+                }
+            }
+            cur = parent.get(cur);
+        }
+        return blockers;
+    }
+
+    /**
      * Find a same-type box position to fill {@code goalPos}. Picks the one
      * nearest to {@code goalPos} that is not already on a different goal of the
      * same type. Returns {@code null} if none found.
@@ -463,6 +597,12 @@ public final class BlockerReliefSynthesizer {
      * BFS from box position to find a free, non-goal, non-corner cell to park at.
      * Mirrors {@link EscapeSubgoalSynthesizer}'s findPTempBFS logic but takes
      * immovableBoxes as input.
+     *
+     * <p>F4: prefers "dead-end" cells (only 1 free orthogonal neighbor besides the
+     * one we'd come from). Such cells are intrinsically out-of-the-way \u2014 they
+     * cannot lie on any other agent's required corridor. The search collects all
+     * BFS-visited valid candidates and returns the deadest-end one; falls back to
+     * the BFS-nearest valid cell if no dead-end exists within the cap.
      */
     private static Position findPTempBFS(Position boxPos, State state, Level level,
                                          Set<Position> immovableBoxes,
@@ -478,6 +618,10 @@ public final class BlockerReliefSynthesizer {
         int expansions = 0;
         int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
 
+        Position firstValid = null;
+        Position bestDeadEnd = null;
+        int bestNeighborCount = Integer.MAX_VALUE;
+
         while (!queue.isEmpty() && expansions < PTEMP_BFS_CAP) {
             Position p = queue.poll();
             expansions++;
@@ -488,7 +632,13 @@ public final class BlockerReliefSynthesizer {
                     && !boxes.containsKey(p)
                     && !immovableBoxes.contains(p)
                     && !isCorner(p, level, immovableBoxes)) {
-                return p;
+                if (firstValid == null) firstValid = p;
+                int free = countFreeNeighbors(p, level, immovableBoxes, boxes);
+                if (free < bestNeighborCount) {
+                    bestNeighborCount = free;
+                    bestDeadEnd = p;
+                    if (free <= 1) break; // can't get better than dead-end
+                }
             }
 
             for (int[] d : dirs) {
@@ -503,7 +653,28 @@ public final class BlockerReliefSynthesizer {
                 queue.add(np);
             }
         }
-        return null;
+        return bestDeadEnd != null ? bestDeadEnd : firstValid;
+    }
+
+    /** Count orthogonally-adjacent cells that are passable (not wall, not box, not immovable). */
+    private static int countFreeNeighbors(Position p, Level level,
+                                          Set<Position> immovableBoxes,
+                                          Map<Position, Character> boxes) {
+        int rows = level.getRows();
+        int cols = level.getCols();
+        int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+        int count = 0;
+        for (int[] d : dirs) {
+            int nr = p.row + d[0];
+            int nc = p.col + d[1];
+            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+            if (level.isWall(nr, nc)) continue;
+            Position np = new Position(nr, nc);
+            if (immovableBoxes.contains(np)) continue;
+            if (boxes.containsKey(np)) continue;
+            count++;
+        }
+        return count;
     }
 
     private static boolean isCorner(Position p, Level level, Set<Position> immovableBoxes) {

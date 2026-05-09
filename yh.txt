@@ -1,0 +1,397 @@
+
+E:\mavis-hospital-client>java -jar server.jar -l complevels/ISO.lvl -c "java -Xmx4g -cp target/classes mapf.client.Client" -g -t 180
+[server][info] Running client on level: complevels\ISO.lvl
+Level: ISO | 36x45 | 10 agents
+[Client] Using Portfolio Controller
+[Client] Planning budget: 170000ms (server=180000ms)
+[LevelAnalyzer] Found 65 Hard Goal-to-Goal dependencies
+[LevelAnalyzer] P3 Path conflict analysis: 5956 cross-agent overlaps across 33 goal paths
+[TRANSIT] level — goals: 25  TERMINAL=6  NEUTRAL=11  TRANSIT=8  CHOKEPOINT=0
+[TRANSIT] TRANSIT  goal=L@(33,30)  crossings=4  degree=3  via=[(32,31),(32,32),(33,31),(33,32)]
+[TRANSIT] TRANSIT  goal=E@(28,4)  crossings=3  degree=3  via=[(28,1),(28,2),(28,3)]
+[TRANSIT] TRANSIT  goal=E@(29,4)  crossings=3  degree=3  via=[(29,1),(29,2),(29,3)]
+[TRANSIT] TRANSIT  goal=L@(33,31)  crossings=3  degree=4  via=[(32,31),(32,32),(33,32)]
+[TRANSIT] TRANSIT  goal=O@(1,39)  crossings=2  degree=2  via=[(1,37),(1,38)]
+[TRANSIT] TRANSIT  goal=G@(28,3)  crossings=2  degree=3  via=[(28,1),(28,2)]
+[TRANSIT] TRANSIT  goal=G@(29,3)  crossings=2  degree=3  via=[(29,1),(29,2)]
+[TRANSIT] TRANSIT  goal=L@(34,30)  crossings=2  degree=3  via=[(34,31),(34,32)]
+[TRANSIT] TERMINAL  goal=O@(1,37)  crossings=0  degree=1
+[TRANSIT] TERMINAL  goal=A@(6,28)  crossings=0  degree=1
+[TRANSIT] TERMINAL  goal=B@(6,30)  crossings=0  degree=1
+[TRANSIT] TERMINAL  goal=C@(8,28)  crossings=0  degree=1
+[TRANSIT] TERMINAL  goal=D@(8,30)  crossings=0  degree=1
+[TRANSIT] TERMINAL  goal=I@(10,43)  crossings=0  degree=1
+
+========== LEVEL ANALYSIS ==========
+Agents: 10, Boxes: 27, Active goals: 33
+Free spaces: 856, Density: 4.32%
+Corridors: 278 (32.5%), Junctions: 578
+Max dependency depth: 5, Has cycle: true
+
+Goal dependencies (65 edges, X depends on Y means fill Y first):
+  a5@(1,29) -> I@(10,43)[TERMINAL]
+  O@(1,37)[TERMINAL] -> I@(10,43)[TERMINAL]
+  O@(1,38)[NEUTRAL] -> O@(1,37)[TERMINAL], I@(10,43)[TERMINAL]
+  O@(1,39)[TRANSIT] -> O@(1,37)[TERMINAL], O@(1,38)[NEUTRAL], I@(10,43)[TERMINAL]
+  a3@(2,28) -> I@(10,43)[TERMINAL]
+  a2@(2,30) -> I@(10,43)[TERMINAL]
+  a1@(4,28) -> I@(10,43)[TERMINAL]
+  a0@(4,30) -> I@(10,43)[TERMINAL]
+  A@(6,28)[TERMINAL] -> B@(6,30)[TERMINAL], I@(10,43)[TERMINAL]
+  B@(6,30)[TERMINAL] -> A@(6,28)[TERMINAL], I@(10,43)[TERMINAL]
+  C@(8,28)[TERMINAL] -> A@(6,28)[TERMINAL], B@(6,30)[TERMINAL], D@(8,30)[TERMINAL], I@(10,43)[TERMINAL]
+  D@(8,30)[TERMINAL] -> A@(6,28)[TERMINAL], B@(6,30)[TERMINAL], C@(8,28)[TERMINAL], I@(10,43)[TERMINAL]
+  H@(9,43)[NEUTRAL] -> I@(10,43)[TERMINAL]
+  a9@(24,4) -> A@(6,28)[TERMINAL], B@(6,30)[TERMINAL], C@(8,28)[TERMINAL], D@(8,30)[TERMINAL], I@(10,43)[TERMINAL]
+  a8@(26,2) -> A@(6,28)[TERMINAL], C@(8,28)[TERMINAL], I@(10,43)[TERMINAL]
+  F@(28,1)[NEUTRAL] -> I@(10,43)[TERMINAL]
+  F@(28,2)[NEUTRAL] -> I@(10,43)[TERMINAL], F@(28,1)[NEUTRAL]
+  G@(28,3)[TRANSIT] -> I@(10,43)[TERMINAL], F@(28,1)[NEUTRAL], F@(28,2)[NEUTRAL]
+  E@(28,4)[TRANSIT] -> I@(10,43)[TERMINAL], F@(28,1)[NEUTRAL], F@(28,2)[NEUTRAL], G@(28,3)[TRANSIT]
+  F@(29,1)[NEUTRAL] -> I@(10,43)[TERMINAL]
+  F@(29,2)[NEUTRAL] -> I@(10,43)[TERMINAL], F@(29,1)[NEUTRAL]
+  G@(29,3)[TRANSIT] -> I@(10,43)[TERMINAL], F@(29,1)[NEUTRAL], F@(29,2)[NEUTRAL]
+  E@(29,4)[TRANSIT] -> I@(10,43)[TERMINAL], F@(29,1)[NEUTRAL], F@(29,2)[NEUTRAL], G@(29,3)[TRANSIT]
+  K@(32,31)[NEUTRAL] -> I@(10,43)[TERMINAL]
+  K@(32,32)[NEUTRAL] -> I@(10,43)[TERMINAL]
+  L@(33,30)[TRANSIT] -> I@(10,43)[TERMINAL]
+  L@(33,31)[TRANSIT] -> I@(10,43)[TERMINAL], K@(32,31)[NEUTRAL]
+  L@(33,32)[NEUTRAL] -> I@(10,43)[TERMINAL], K@(32,32)[NEUTRAL]
+  a6@(34,1) -> I@(10,43)[TERMINAL]
+  L@(34,30)[TRANSIT] -> I@(10,43)[TERMINAL]
+  K@(34,31)[NEUTRAL] -> I@(10,43)[TERMINAL], K@(32,31)[NEUTRAL]
+  K@(34,32)[NEUTRAL] -> I@(10,43)[TERMINAL], K@(32,32)[NEUTRAL]
+
+Execution order (33 goals, CYCLE present — back-edges dropped, forward edges preserved):
+  I@(10,43)[TERMINAL] -> B@(6,30)[TERMINAL] -> A@(6,28)[TERMINAL] -> F@(29,1)[NEUTRAL] -> F@(28,1)[NEUTRAL] -> D@(8,30)[TERMINAL]
+  C@(8,28)[TERMINAL] -> O@(1,37)[TERMINAL] -> F@(29,2)[NEUTRAL] -> F@(28,2)[NEUTRAL] -> K@(32,32)[NEUTRAL] -> K@(32,31)[NEUTRAL]
+  O@(1,38)[NEUTRAL] -> G@(29,3)[TRANSIT] -> G@(28,3)[TRANSIT] -> O@(1,39)[TRANSIT] -> K@(34,32)[NEUTRAL] -> K@(34,31)[NEUTRAL]
+  a6@(34,1) -> L@(33,32)[NEUTRAL] -> L@(33,31)[TRANSIT] -> L@(34,30)[TRANSIT] -> L@(33,30)[TRANSIT] -> H@(9,43)[NEUTRAL]
+  a9@(24,4) -> E@(29,4)[TRANSIT] -> E@(28,4)[TRANSIT] -> a8@(26,2) -> a5@(1,29) -> a2@(2,30)
+  a3@(2,28) -> a0@(4,30) -> a1@(4,28)
+
+Recommended strategy: STRICT_ORDER
+=====================================
+Path conflicts: 5956 cross-agent overlaps (33 paths analyzed)
+
+[Portfolio] Cyclic + open topology (corridorRatio=0.32) → TOPO-first
+[Portfolio] Strategy sequence: [STRICT_ORDER(TOPOLOGICAL), STRICT_ORDER(DISTANCE_GREEDY)]
+[Portfolio] Trying STRICT_ORDER(TOPOLOGICAL) (timeout=59499ms, budget=35%)
+[ImmovableBoxDetector] Precomputed 35 distance maps (36×45), 0 immovable boxes as walls
+Priority Planning: [PARTIAL] Partial plan (1 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=0 succeeded=0 | planSubgoalNull=31 pathClearingRescued=0 | conflictResolver: calls=1 withConflicts=0
+[PP][DIAG][PARTIAL] completed=0 trapBlacklisted=0
+[Portfolio] FailureReport from STRICT_ORDER: PARTIAL_PLAN lastSubgoal=agent8->I@(10,43) unsatisfied=26 (plan size=1)
+[Portfolio] P0b: deprioritize goal (10,43) for next attempt (now 1 total)
+[Portfolio] P4: promote 25 blocker goal(s) of (10,43) for next attempt (now 25 total)
+[Portfolio] P1: synthesized 0 escape subgoal(s) for cyclic level
+[Portfolio] P5 (NAMO): synthesized 9 blocker-relief subgoal(s) (F2: 5 suspended)
+[Portfolio] Partial plan from STRICT_ORDER (1 steps, saved as best so far)
+[Portfolio] STRICT_ORDER partial after 195ms
+[Portfolio] Trying STRICT_ORDER(DISTANCE_GREEDY) (timeout=59499ms, budget=35%)
+Priority Planning: [TRAP] Skipping L -> (1,25) — agent 8 would be trapped after filling
+Priority Planning: [TRAP] Skipping L -> (1,16) — agent 8 would be trapped after filling
+Priority Planning: [PARTIAL] Partial plan (562 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=56 succeeded=15 | planSubgoalNull=149 pathClearingRescued=0 | conflictResolver: calls=597 withConflicts=0
+[PP][DIAG][PARTIAL] completed=0 trapBlacklisted=2 {(1,25),(1,16)}
+[PP][BOX-OSC-SUMMARY][PARTIAL] 2 oscillation events across 10 snapshots (showing top 2)
+[Portfolio] FailureReport from STRICT_ORDER: PARTIAL_PLAN lastSubgoal=agent8->I@(10,43) unsatisfied=30 (plan size=562)
+[Portfolio] P5 (NAMO): synthesized 8 blocker-relief subgoal(s) (F2: 4 suspended)
+[Portfolio] Partial plan from STRICT_ORDER (562 steps, saved as best so far)
+[Portfolio] STRICT_ORDER partial after 2762ms
+[CBSR] Learned nogood: {required=[(33,32), (34,30), (33,31), (33,30)], forbidden=(10,43)} reason=PARTIAL_PLAN
+[CBSR] Learned nogood: {required=[(10,6), (32,2), (1,16), (17,32), (1,25), (34,30), (33,31)], forbidden=(10,43)} reason=PARTIAL_PLAN
+[CBSR] Starting loop: baseOrder=33 goals, initialNogoods=1, budget=166061ms
+[CBSR] Iteration #1, nogoods=1, ordering(first5)=[(6,30), (6,28), (29,1), (28,1), (8,30)], budget=20757ms
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+Priority Planning: [PARTIAL] Partial plan (2863 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=55 succeeded=22 | planSubgoalNull=261 pathClearingRescued=3 | conflictResolver: calls=2761 withConflicts=0
+[PP][DIAG][PARTIAL] completed=18 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 5 oscillation events across 33 snapshots (showing top 5)
+[CBSR] Iteration #1 partial(2863) (9621ms), nogoods=1
+[CBSR] Ordering converged after 1 directed iters — switching to random diversification
+[CBSR] Iteration #2 [RANDOM#42], budget=22345ms
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+Priority Planning: [PARTIAL] Partial plan (2787 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=90 succeeded=22 | planSubgoalNull=231 pathClearingRescued=3 | conflictResolver: calls=2672 withConflicts=0
+[PP][DIAG][PARTIAL] completed=17 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 7 oscillation events across 34 snapshots (showing top 7)
+[CBSR] Iteration #2 partial(2787) (11796ms), nogoods=1
+[CBSR] Iteration #3 [RANDOM#137], budget=24104ms
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+Priority Planning: [PARTIAL] Partial plan (2947 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=57 succeeded=23 | planSubgoalNull=254 pathClearingRescued=2 | conflictResolver: calls=2841 withConflicts=0
+[PP][DIAG][PARTIAL] completed=18 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 6 oscillation events across 34 snapshots (showing top 6)
+[CBSR] Iteration #3 partial(2947) (11892ms), nogoods=1
+[CBSR] Iteration #4 [RANDOM#9999], budget=26545ms
+Priority Planning: [PARTIAL] Partial plan (2840 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=56 succeeded=21 | planSubgoalNull=262 pathClearingRescued=1 | conflictResolver: calls=2747 withConflicts=0
+[PP][DIAG][PARTIAL] completed=18 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 4 oscillation events across 33 snapshots (showing top 4)
+[CBSR] Iteration #4 partial(2840) (5252ms), nogoods=1
+[CBSR] Iteration #5 [RANDOM#12345], budget=31868ms
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+Priority Planning: [PARTIAL] Partial plan (2779 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=85 succeeded=22 | planSubgoalNull=256 pathClearingRescued=3 | conflictResolver: calls=2664 withConflicts=0
+[PP][DIAG][PARTIAL] completed=17 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 6 oscillation events across 34 snapshots (showing top 6)
+[CBSR] Iteration #5 partial(2779) (15073ms), nogoods=1
+[CBSR] All random seeds exhausted — stopping
+[CBSR] Loop done, nogoods=1, result=TIMEOUT/UNSAT
+[Portfolio] F7-PRE: unsatisfied-first ordering (12 unsat, 13 sat)
+Priority Planning: [PARTIAL] Partial plan (3029 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=58 succeeded=23 | planSubgoalNull=277 pathClearingRescued=3 | conflictResolver: calls=2934 withConflicts=0
+[PP][DIAG][PARTIAL] completed=16 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 6 oscillation events across 34 snapshots (showing top 6)
+[Portfolio] F7-PRE goals=16/35 steps=3029 (current best=15)
+[Portfolio] F7-PRE improved best to 16 goals
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+[PP] Cross-color barriers detected: 1
+Priority Planning: [PARTIAL] Partial plan (2934 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=59 succeeded=22 | planSubgoalNull=269 pathClearingRescued=2 | conflictResolver: calls=2832 withConflicts=0
+[PP][DIAG][PARTIAL] completed=16 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 6 oscillation events across 34 snapshots (showing top 6)
+[Portfolio] F7-PRE goals=16/35 steps=2934 (current best=16)
+[Portfolio] F7-PRE improved best to 16 goals
+[Portfolio] F7.1 warm-start from 2934-step plan, seed=9001 budget=30000ms (remaining=90392ms)
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+Priority Planning: [EARLY-EXIT] No progress for 10932ms — returning partial plan
+Priority Planning: [STUCK-DIAG] completed=7 trapBlacklisted=0 lastAttempted=agent8->L@(6,3)
+Priority Planning: [PARTIAL] Partial plan (1859 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=73 succeeded=20 | planSubgoalNull=0 pathClearingRescued=0 | conflictResolver: calls=1819 withConflicts=0
+[PP][DIAG][PARTIAL] completed=7 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 3 oscillation events across 19 snapshots (showing top 3)
+[Portfolio] F7.1 goals=25/35 steps=4793
+[Portfolio] F7.1 improved: goals 16→25, steps=4793
+[Portfolio] F7.2 warm-start from 4793-step plan, seed=42 budget=30000ms (remaining=68818ms)
+Priority Planning: [EARLY-EXIT] No progress for 11057ms — returning partial plan
+Priority Planning: [STUCK-DIAG] completed=3 trapBlacklisted=0 lastAttempted=agent8->L@(6,3)
+Priority Planning: [PARTIAL] Partial plan (398 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=44 succeeded=10 | planSubgoalNull=0 pathClearingRescued=0 | conflictResolver: calls=377 withConflicts=0
+[PP][DIAG][PARTIAL] completed=3 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 2 oscillation events across 9 snapshots (showing top 2)
+[Portfolio] F7.2 goals=25/35 steps=5191
+[Portfolio] F7.2 no improvement (consec=1)
+[Portfolio] F7.3 warm-start from 4793-step plan, seed=137 budget=30000ms (remaining=57372ms)
+Priority Planning: [EARLY-EXIT] No progress for 11164ms — returning partial plan
+Priority Planning: [STUCK-DIAG] completed=3 trapBlacklisted=0 lastAttempted=agent8->L@(6,3)
+Priority Planning: [PARTIAL] Partial plan (396 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=44 succeeded=10 | planSubgoalNull=0 pathClearingRescued=0 | conflictResolver: calls=375 withConflicts=0
+[PP][DIAG][PARTIAL] completed=3 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 2 oscillation events across 9 snapshots (showing top 2)
+[Portfolio] F7.3 goals=25/35 steps=5189
+[Portfolio] F7.3 no improvement (consec=2)
+[Portfolio] F7.4 warm-start from 4793-step plan, seed=9999 budget=30000ms (remaining=45823ms)
+Priority Planning: [EARLY-EXIT] No progress for 10649ms — returning partial plan
+Priority Planning: [STUCK-DIAG] completed=3 trapBlacklisted=0 lastAttempted=agent8->L@(1,3)
+Priority Planning: [PARTIAL] Partial plan (554 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=64 succeeded=14 | planSubgoalNull=0 pathClearingRescued=0 | conflictResolver: calls=533 withConflicts=0
+[PP][DIAG][PARTIAL] completed=3 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 2 oscillation events across 11 snapshots (showing top 2)
+[Portfolio] F7.4 goals=25/35 steps=5347
+[Portfolio] F7.4 no improvement (consec=3)
+[Portfolio] F7 stopping: 3 consecutive non-improvements
+[Portfolio] F7B: trying 6 seeds from CBSR base (2947 steps, 15 goals), current best=25
+[Portfolio] F7B.1 warm-start from CBSR base, seed=42 budget=29063ms
+[PP] Cross-color barriers detected: 1
+[PP] Clearing barrier for agent 7: 1 L-boxes to clear (clearing agent 8)
+[PP] [CLEAR-BARRIER] Moving L from (34,30) to (33,28) (agent 8)
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) -> (33,28) — trying alternative targets
+[PP] [CLEAR-BARRIER] BSP failed for (34,30) (all targets exhausted)
+[PP] [CLEAR-BARRIER] First box failed — aborting barrier
+Priority Planning: [EARLY-EXIT] No progress for 11063ms — returning partial plan
+Priority Planning: [STUCK-DIAG] completed=7 trapBlacklisted=0 lastAttempted=agent8->L@(6,3)
+Priority Planning: [PARTIAL] Partial plan (2004 steps) — goal not reached
+[PP][DIAG][PARTIAL] IW1: invoked=87 succeeded=21 | planSubgoalNull=0 pathClearingRescued=0 | conflictResolver: calls=1968 withConflicts=0
+[PP][DIAG][PARTIAL] completed=7 trapBlacklisted=0
+[PP][BOX-OSC-SUMMARY][PARTIAL] 2 oscillation events across 20 snapshots (showing top 2)
+[Portfolio] F7B.1 goals=25 steps=4951
+[Portfolio] No full solution found. Returning best partial plan (4793 steps, 25/35 goals satisfied)
+[Portfolio] Unsatisfied goals: agent8->@(26,2)[at(12,32)] boxG@(28,3) boxE@(28,4) boxG@(29,3) boxE@(29,4) boxK@(32,32) boxL@(33,30) boxL@(33,32) agent7->@(34,13)[at(14,40)] boxK@(34,32)
+
+=== Portfolio Attempt Summary ===
+--------------------------------------------------------------------------------
+#   Strategy(Mode)              Steps Unsat  Rlf Susp     Time  Failure / Result
+--------------------------------------------------------------------------------
+1   STRICT_ORDER(TOPOLOGICAL)       1    26    9    5     195ms  PARTIAL_PLAN agent8->I@(10,43)
+2   STRICT_ORDER(DISTANCE_GREE    562    30    8    4    2762ms  PARTIAL_PLAN agent8->I@(10,43)
+3   STRICT_ORDER(TOPOLOGICAL)    2863    18    0    4    9621ms  [CBSR#1]PARTIAL_PLAN agent5->@(1,29)
+4   STRICT_ORDER(TOPOLOGICAL)    2787    18    0    4   11796ms  [CBSR#2]PARTIAL_PLAN agent5->@(1,29)
+5   STRICT_ORDER(TOPOLOGICAL)    2947    18    0    4   11892ms  [CBSR#3]PARTIAL_PLAN agent5->@(1,29)
+6   STRICT_ORDER(TOPOLOGICAL)    2840    18    0    4    5252ms  [CBSR#4]PARTIAL_PLAN agent5->@(1,29)
+7   STRICT_ORDER(TOPOLOGICAL)    2779    18    0    4   15073ms  [CBSR#5]PARTIAL_PLAN agent5->@(1,29)
+--------------------------------------------------------------------------------
+Total attempts: 7  |  Total time: 56591ms
+[Portfolio][DIAG] All 7 attempts FAILED — action-layer fix needed
+[Portfolio][DIAG] Best partial: 2947 steps via STRICT_ORDER(TOPOLOGICAL) blocked at agent5->@(1,29)
+[Portfolio][DIAG] Dominant blocker: agent5->@(1,29) (x5)
+[Portfolio][DIAG] dependency chain for agent8->I@(10,43)  (I@(10,43))
+[Portfolio][DIAG]   ancestors  (must fill BEFORE I@(10,43)):
+[Portfolio][DIAG]     (none)
+[Portfolio][DIAG]   dependents (BLOCKED by I@(10,43)):
+[Portfolio][DIAG]     - a5@(1,29)
+[Portfolio][DIAG]     - O@(1,37)
+[Portfolio][DIAG]       - O@(1,38)
+[Portfolio][DIAG]         - O@(1,39)
+[Portfolio][DIAG]       - O@(1,39) (already shown / cycle)
+[Portfolio][DIAG]     - O@(1,38) (already shown / cycle)
+[Portfolio][DIAG]     - O@(1,39) (already shown / cycle)
+[Portfolio][DIAG]     - a3@(2,28)
+[Portfolio][DIAG]     - a2@(2,30)
+[Portfolio][DIAG]     - a1@(4,28)
+[Portfolio][DIAG]     - a0@(4,30)
+[Portfolio][DIAG]     - A@(6,28)
+[Portfolio][DIAG]       - B@(6,30)
+[Portfolio][DIAG]         - A@(6,28) (already shown / cycle)
+[Portfolio][DIAG]         - C@(8,28)
+[Portfolio][DIAG]           - D@(8,30)
+[Portfolio][DIAG]             - C@(8,28) (already shown / cycle)
+[Portfolio][DIAG]             - a9@(24,4)
+[Portfolio][DIAG]           - a9@(24,4) (already shown / cycle)
+[Portfolio][DIAG]           - a8@(26,2)
+[Portfolio][DIAG]         - D@(8,30) (already shown / cycle)
+[Portfolio][DIAG]         - a9@(24,4) (already shown / cycle)
+[Portfolio][DIAG]       - C@(8,28) (already shown / cycle)
+[Portfolio][DIAG]       - D@(8,30) (already shown / cycle)
+[Portfolio][DIAG]       - a9@(24,4) (already shown / cycle)
+[Portfolio][DIAG]       - a8@(26,2) (already shown / cycle)
+[Portfolio][DIAG]     - B@(6,30) (already shown / cycle)
+[Portfolio][DIAG]     - C@(8,28) (already shown / cycle)
+[Portfolio][DIAG]     - D@(8,30) (already shown / cycle)
+[Portfolio][DIAG]     - H@(9,43)
+[Portfolio][DIAG]     - a9@(24,4) (already shown / cycle)
+[Portfolio][DIAG]     - a8@(26,2) (already shown / cycle)
+[Portfolio][DIAG]     - F@(28,1)
+[Portfolio][DIAG]       - F@(28,2)
+[Portfolio][DIAG]         - G@(28,3)
+[Portfolio][DIAG]           - E@(28,4)
+[Portfolio][DIAG]         - E@(28,4) (already shown / cycle)
+[Portfolio][DIAG]       - G@(28,3) (already shown / cycle)
+[Portfolio][DIAG]       - E@(28,4) (already shown / cycle)
+[Portfolio][DIAG]     - F@(28,2) (already shown / cycle)
+[Portfolio][DIAG]     - G@(28,3) (already shown / cycle)
+[Portfolio][DIAG]     - E@(28,4) (already shown / cycle)
+[Portfolio][DIAG]     - F@(29,1)
+[Portfolio][DIAG]       - F@(29,2)
+[Portfolio][DIAG]         - G@(29,3)
+[Portfolio][DIAG]           - E@(29,4)
+[Portfolio][DIAG]         - E@(29,4) (already shown / cycle)
+[Portfolio][DIAG]       - G@(29,3) (already shown / cycle)
+[Portfolio][DIAG]       - E@(29,4) (already shown / cycle)
+[Portfolio][DIAG]     - F@(29,2) (already shown / cycle)
+[Portfolio][DIAG]     - G@(29,3) (already shown / cycle)
+[Portfolio][DIAG]     - E@(29,4) (already shown / cycle)
+[Portfolio][DIAG]     - K@(32,31)
+[Portfolio][DIAG]       - L@(33,31)
+[Portfolio][DIAG]       - K@(34,31)
+[Portfolio][DIAG]     - K@(32,32)
+[Portfolio][DIAG]       - L@(33,32)
+[Portfolio][DIAG]       - K@(34,32)
+[Portfolio][DIAG]     - L@(33,30)
+[Portfolio][DIAG]     - L@(33,31) (already shown / cycle)
+[Portfolio][DIAG]     - L@(33,32) (already shown / cycle)
+[Portfolio][DIAG]     - a6@(34,1)
+[Portfolio][DIAG]     - L@(34,30)
+[Portfolio][DIAG]     - K@(34,31) (already shown / cycle)
+[Portfolio][DIAG]     - K@(34,32) (already shown / cycle)
+[Portfolio][DIAG] dependency chain for agent5->@(1,29)  (a5@(1,29))
+[Portfolio][DIAG]   ancestors  (must fill BEFORE a5@(1,29)):
+[Portfolio][DIAG]     - I@(10,43)
+[Portfolio][DIAG]   dependents (BLOCKED by a5@(1,29)):
+[Portfolio][DIAG]     (none)
+[SNAPSHOT] wrote target\diagnostics\ISO-failure.md
+Plan found with 4793 steps
+Partial plan executed - goal NOT reached. Check agent/box positions for debugging.
+Final state:
++++++++++++++++++++++++++++++++++++++++++++++
++  L  ++         J +   +   ++5+++++++OOO    +
++EE+  ++   +   L +   +   +I+  2++++++++++++ +
++GG+  ++   ++    ++++++++++++ +++++++       +
++++++      +++             +  0++++++ +++++++
+++++++++   ++              ++ +++++++       +
++K L7      +               +A  ++++++++++++ +
++K++  +          ++++++++  ++ +++++++       +
++++  ++ ++        ++++++   +C  ++++++ +++++ +
++ 8  +  ++9        ++++    ++ +++++++ +   +H+
++  +    ++    ++    ++                +   + +
++ ++  ++++   ++++       ++++  ++   +  ++ ++++
++ +     ++  ++++++       ++   ++  ++   + +  +
++    L  ++ ++++++++     ++++  ++  +    + +  +
+++++++  ++                    ++            +
++  13 L ++++++++++++++++++++++++ ++++++++++++
++  ++   ++++++++++++++++++++++++ ++++++++++++
++  ++             ++                        +
++  ++ ++    ++    ++        +++ +++   ++    +
++  ++       ++    ++ ++++             +++++ +
++  ++    +++++    ++  ++   ++ ++ ++   +++++ +
++  ++    +++++    ++  ++   ++ ++ ++   ++    +
++                     ++            +       +
+++++++++++   +++++   ++++  ++ ++ ++ +       +
+++ +D+ + +   +++++         ++ ++ ++         +
++            ++     +++              ++++++ +
+++ +B+ + +   ++     +            ++  ++++++ +
+++++++++++       ++   +++        ++  +++    +
++FF             ++    +++++++++  ++   ++    +
++FF                   +++++++++  ++   ++    +
++++++++++  ++ ++        ++   ++++++   ++    +
++++++++++  ++ ++   ++   ++   ++++++         +
++   +   +  ++ ++  ++++       ++K ++   +++++++
++ + + + +  ++ ++   ++            ++   +++++++
++6+   +    ++ 4+       ++++    K ++         +
++++++++++++++++++++++++++++++++++++++++++++++
+
+[client][info] Waiting for client process to terminate by itself.
+[client][info] Client terminated.
+[server][info] Level solved: No.
+[server][info] Actions used: 4,793.
+[server][info] Time to solve: 166.107 seconds.

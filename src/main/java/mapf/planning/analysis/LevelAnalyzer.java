@@ -153,19 +153,32 @@ public class LevelAnalyzer {
                     + " cross-agent overlaps across " + pathConflicts.analyzedPaths + " goal paths");
         }
         
-        List<Position> executionOrder = hasCycle ? activeGoals : 
-            topologicalSort(goalDependsOn, activeGoals, distances, agentGoalBoxTasks,
-                           pathConflicts.conflictScores, pathConflicts.narrowness);
+        // Bug 1 fix (2026-05): Previously, hasCycle=true caused the entire topo
+        // sort to be discarded and replaced with raw activeGoals order, losing all
+        // *non-cyclic* edges (e.g. H@(9,43) -> I@(10,43) on ISO). topologicalDFS
+        // already handles cycles gracefully via the visited set (back-edges are
+        // silently dropped), so we always run the sort. Within an SCC, tie-break
+        // ordering decides; outside SCCs, dependency direction is preserved.
+        List<Position> executionOrder = topologicalSort(goalDependsOn, activeGoals,
+                distances, agentGoalBoxTasks,
+                pathConflicts.conflictScores, pathConflicts.narrowness);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
         StrategyType recommended = recommendStrategy(numAgents, maxDepth, hasCycle, 
                                                      couplingDegree, bottlenecks.size());
-        
+
+        // Step 1 – Layer-3 diagnostic: classify goals by transit pressure.
+        // Pure read-only analysis; no decision is changed.
+        // Computed BEFORE generateReport so dep listing can annotate goals with profile.
+        Map<Position, GoalTransitAnalyzer.GoalProfile> transitProfiles =
+                GoalTransitAnalyzer.analyze(activeGoals, level, state);
+
         // 9. Generate report
         String report = generateReport(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
-                                       goalDependsOn, maxDepth, hasCycle, 
-                                       corridorCells, junctionCells, recommended);
+                                       goalDependsOn, executionOrder, maxDepth, hasCycle,
+                                       corridorCells, junctionCells, recommended,
+                                       level, transitProfiles);
         
         // Append P3 path conflict summary to report
         if (pathConflicts.analyzedPaths > 0) {
@@ -174,7 +187,9 @@ public class LevelAnalyzer {
             report += String.format("Path conflicts: %d cross-agent overlaps (%d paths analyzed)\n", 
                                    totalOverlaps, pathConflicts.analyzedPaths);
         }
-        
+
+        GoalTransitAnalyzer.printDiagnostic(transitProfiles, "level");
+
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
                                 goalDependsOn, executionOrder, maxDepth, hasCycle,
                                 bottlenecks, bottleneckScores, couplingDegree,
@@ -1594,29 +1609,6 @@ public class LevelAnalyzer {
         return Math.abs(a.row - b.row) + Math.abs(a.col - b.col);
     }
     
-    /**
-     * Adjusts goal execution order: goals AT high-traffic bottleneck positions
-     * should be completed earlier to clear the bottleneck.
-     */
-    private static List<Position> adjustOrderForBottlenecks(List<Position> baseOrder, 
-                                                            Map<Position, Integer> bottleneckScores) {
-        if (bottleneckScores.isEmpty()) return baseOrder;
-        
-        List<Position> adjusted = new ArrayList<>(baseOrder);
-        
-        // Sort: higher bottleneck score = earlier execution (to clear the position)
-        adjusted.sort((a, b) -> {
-            int scoreA = bottleneckScores.getOrDefault(a, 0);
-            int scoreB = bottleneckScores.getOrDefault(b, 0);
-            // Higher score first (descending)
-            if (scoreA != scoreB) return Integer.compare(scoreB, scoreA);
-            // Otherwise keep original order
-            return Integer.compare(baseOrder.indexOf(a), baseOrder.indexOf(b));
-        });
-        
-        return adjusted;
-    }
-    
     // ========== Structural Analysis ==========
     
     private static int countFreeSpaces(Level level) {
@@ -1738,9 +1730,12 @@ public class LevelAnalyzer {
     
     private static String generateReport(int numAgents, int numBoxes, int numGoals, int freeSpaces,
                                         TaskFilter.FilterResult taskFilter,
-                                        Map<Position, Set<Position>> dependsOn, int maxDepth,
+                                        Map<Position, Set<Position>> dependsOn,
+                                        List<Position> executionOrder, int maxDepth,
                                         boolean hasCycle, int corridors, int junctions,
-                                        StrategyType recommended) {
+                                        StrategyType recommended,
+                                        Level level,
+                                        Map<Position, GoalTransitAnalyzer.GoalProfile> transitProfiles) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n========== LEVEL ANALYSIS ==========\n");
         sb.append(String.format("Agents: %d, Boxes: %d, Active goals: %d\n", numAgents, numBoxes, numGoals));
@@ -1759,23 +1754,69 @@ public class LevelAnalyzer {
                                corridors, corridors * 100.0 / freeSpaces, junctions));
         sb.append(String.format("Max dependency depth: %d, Has cycle: %s\n", maxDepth, hasCycle));
         
-        // Show dependencies summary
+        // Show dependencies summary (always; was previously gated by isVerbose).
+        // Format: <goalLabel> -> [dep1, dep2, ...]
+        // Goal label = letter@(r,c)[PROFILE] where letter is box-goal letter or 'A<id>' for agent goal.
         int depCount = dependsOn.values().stream().mapToInt(Set::size).sum();
         if (depCount > 0) {
-            sb.append("\nGoal dependencies: ").append(depCount).append(" total\n");
-            if (SearchConfig.isVerbose()) {
-                for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
-                    if (!entry.getValue().isEmpty()) {
-                        sb.append("  ").append(entry.getKey()).append(" depends on: ");
-                        sb.append(entry.getValue()).append("\n");
-                    }
+            sb.append("\nGoal dependencies (").append(depCount).append(" edges, X depends on Y means fill Y first):\n");
+            // Stable iteration order: by row then col
+            List<Position> sortedKeys = new ArrayList<>(dependsOn.keySet());
+            sortedKeys.sort(Comparator.<Position>comparingInt(p -> p.row).thenComparingInt(p -> p.col));
+            for (Position src : sortedKeys) {
+                Set<Position> deps = dependsOn.get(src);
+                if (deps == null || deps.isEmpty()) continue;
+                sb.append("  ").append(formatGoalLabel(src, level, transitProfiles)).append(" -> ");
+                List<Position> dl = new ArrayList<>(deps);
+                dl.sort(Comparator.<Position>comparingInt(p -> p.row).thenComparingInt(p -> p.col));
+                for (int i = 0; i < dl.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(formatGoalLabel(dl.get(i), level, transitProfiles));
                 }
+                sb.append("\n");
             }
+        } else {
+            sb.append("\nGoal dependencies: none\n");
+        }
+
+        // Execution order (topological sort result, with back-edges dropped if cyclic).
+        if (executionOrder != null && !executionOrder.isEmpty()) {
+            sb.append("\nExecution order (").append(executionOrder.size()).append(" goals");
+            if (hasCycle) sb.append(", CYCLE present — back-edges dropped, forward edges preserved");
+            sb.append("):\n  ");
+            for (int i = 0; i < executionOrder.size(); i++) {
+                if (i > 0) sb.append(i % 6 == 0 ? "\n  " : " -> ");
+                sb.append(formatGoalLabel(executionOrder.get(i), level, transitProfiles));
+            }
+            sb.append("\n");
         }
         
         sb.append("\nRecommended strategy: ").append(recommended).append("\n");
         sb.append("=====================================\n");
         
         return sb.toString();
+    }
+
+    /** Format a goal position as "X@(r,c)[PROFILE]". X = box letter, 'a<id>' for agent goal, '?' otherwise. */
+    private static String formatGoalLabel(Position p, Level level,
+                                          Map<Position, GoalTransitAnalyzer.GoalProfile> profiles) {
+        StringBuilder lbl = new StringBuilder();
+        char bg = level.getBoxGoal(p);
+        int ag = level.getAgentGoal(p);
+        if (bg != 0) {
+            lbl.append(bg);
+        } else if (ag != -1) {
+            lbl.append('a').append(ag);
+        } else {
+            lbl.append('?');
+        }
+        lbl.append('@').append('(').append(p.row).append(',').append(p.col).append(')');
+        if (profiles != null) {
+            GoalTransitAnalyzer.GoalProfile gp = profiles.get(p);
+            if (gp != null) {
+                lbl.append('[').append(gp.profile).append(']');
+            }
+        }
+        return lbl.toString();
     }
 }

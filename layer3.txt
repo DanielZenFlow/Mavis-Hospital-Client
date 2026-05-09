@@ -1,0 +1,259 @@
+# 跳出来看：彻底分析
+
+
+
+## 1. 重读 claudeopus47.txt 的核心论断
+
+
+
+opus47 把整个项目分成 5 层，并断言："**第三层（任务分解层）是真正的瓶颈，补它 ROI 最高**"。
+
+
+
+我们今天的所有挣扎——F1～F7、MAX_RELIEF 调参、warm-start、suspendedBoxGoals、box ping-pong——本质上**全部发生在第 4 层（协调层）**，是在用越来越多的 hack 去掩盖第 3 层的结构缺陷。
+
+
+
+## 2. 把 BOX-OSC 证据映射到 5 层架构
+
+
+
+看刚才抓到的振荡数据：
+
+
+
+| 现象 | 表面原因（第 4 层） | 真实原因（第 3 层） |
+
+|---|---|---|
+
+| L 在 (17,33) 反复 [0,2,4] | NAMO 推开→PP 推回 | **L 的 goal 位于其它任务的过境通道里，但分解器不知道** |
+
+| L 在 (16,32) 7 次 | revalidate 把它从 completed 移除 | 分解器把"L→(16,32)"当成独立 atomic subgoal，**没建模它是过境节点** |
+
+| K 在 (13,40) 24 次 | Hungarian 反复重分配 | 分解器没识别 (13,40) 是关节点 KL 的入口 |
+
+| F 在 (29,1)/(28,1) | NAMO 选错 helper | 分解器没意识到 F 的 goal 阻断了下半区进出 |
+
+
+
+**统一结论**：被 NAMO 挪开后又被 PP 推回的所有箱子，**它们的 goal 都在某条"必须有别人通过的过境通道"上**。第 3 层把每个 `(box, goal)` 当成 first-class、独立、对称的子目标，**完全没有"过境"和"驻留"的概念**。
+
+
+
+## 3. 本质问题的一句话陈述
+
+
+
+> **当前架构里，"box X 在 goal Y" 既是一个待规划的任务（subgoal），又是一个世界谓词（world predicate）。两者被强行等同。一旦 NAMO 把 X 从 Y 挪开作为过境腾位，"world predicate 不成立"立即被翻译成"subgoal 重新待办"，于是 PP 把它推回去。**
+
+
+
+这是 Layer 3 缺失的直接后果，不是 NAMO 写错了，也不是 suspendedBoxGoals 范围不够。修补 suspended 集合（B 方案）只是给"翻译机"加一个例外清单——治不了根，因为下次出现新的过境通道，又得加新例外。
+
+
+
+## 4. 彻底解法：补齐第 3 层
+
+
+
+opus47 把这层叫 "Task Decomposition Layer"。它要做的事，**用我们现在的代码语言重新表述**就是 4 件：
+
+
+
+### (a) 静态过境分析（GoalTransitAnalyzer，新组件）
+
+
+
+输入：Level + LevelAnalyzer 的 goal 依赖图。  
+
+输出：每个 goal 标记一个 `TransitProfile`：
+
+- `TERMINAL`：处于死胡同/角落，填了不影响任何人 → 可以最早填
+
+- `NEUTRAL`：旁边空旷，可以正常排序
+
+- `TRANSIT`：位于至少一条 *其它 goal 的最优运送路径* 上 → **必须最后填，且 NAMO 期间禁止 reinstate**
+
+- `CHOKEPOINT_GUARD`：位于关节点（K/L 那种）→ 最严格的 TRANSIT
+
+
+
+实现：对每对 (boxStart_i, goal_i) 做一遍 BFS 推送路径，统计每个格子被多少条路径经过。被 ≥2 条路径经过的格子，如果上面也有人的 goal，那个 goal 就是 TRANSIT。
+
+
+
+代价：O(goals² × cells) 一次性预处理，对 26 个 goals × 50×50 = 16 万次操作，毫秒级。
+
+
+
+### (b) Subgoal 生命周期状态机（替换当前的 boolean completedBoxGoals）
+
+
+
+```
+
+PENDING ──plan成功──> SATISFIED
+
+                          │
+
+                          ├── 自然 disturb（被推走，物理 regression）──> PENDING （现状）
+
+                          │
+
+                          └── NAMO 主动 displace ──> SUSPENDED_FOR_TRANSIT
+
+                                                          │
+
+                                                          └── 触发条件满足 ──> PENDING
+
+```
+
+
+
+**关键**：`SUSPENDED_FOR_TRANSIT` 状态下，`getOrComputeSubgoalOrder` **不把它列入待办**，`revalidateCompletedGoals` **不能把它降级**。它只在"NAMO 申请的过境窗口"结束后由调度器主动 reinstate。
+
+
+
+这就是 opus47 说的 "subgoal-level 回溯比 action-level 便宜两个数量级" 的具体落地。
+
+
+
+### (c) NAMO 与第 3 层的接口契约
+
+
+
+今天 `BlockerReliefSynthesizer` 的输出是"一组 escape 动作"，本质上是 Layer 4 hack。要改为：
+
+
+
+```java
+
+class TransitPermit {
+
+    Set<Position> displacedGoals;        // 被借用的 goal 位置
+
+    Set<Subgoal> reinstateAfter;         // 这些 subgoal 完成后才能复位
+
+    int maxDuration;                     // 兜底超时
+
+}
+
+```
+
+
+
+NAMO 不再"push and pray"，而是向第 3 层**申请一个 TransitPermit**。第 3 层批准后，把对应 goal 切到 `SUSPENDED_FOR_TRANSIT`，同时**在 dependency graph 临时加边**：原 goal → reinstateAfter 的所有 subgoal。
+
+
+
+这样 PP 在 permit 期间**根本看不到这个 goal**，自然不会推回去。Permit 到期或条件满足后，goal 进入 `PENDING`，按依赖序重新规划。
+
+
+
+### (d) Dependency graph 扩展：把 "transit edge" 加进去
+
+
+
+LevelAnalyzer 当前只有"goal A 占住后 goal B 不可达"这种边。需要补充：
+
+
+
+- **transit-precedence edge**：如果 goal_T 是 TRANSIT 且 goal_X 的运送路径过 T 的位置 → 添加 X →before→ T
+
+- **chokepoint-coupling edge**：如果两个 goal 共享同一个关节点附近 → 它们必须在 *同一阶段* 内连续完成（不能交错）
+
+
+
+这两类边送进 SubgoalManager 的拓扑排序，**ordering 自然就对了**——TRANSIT goals 永远排在末尾，关节点 goals 成块完成。这是从根上消除 ping-pong 的来源。
+
+
+
+## 5. 与现有代码的关系（不破坏现状）
+
+
+
+| 现有 | 新角色 |
+
+|---|---|
+
+| `LevelAnalyzer.detectBottlenecks()` 路径频率 | **复用为** GoalTransitAnalyzer 的输入 |
+
+| `completedBoxGoals: Set<Position>` | **升级为** `Map<Position, SubgoalState>` |
+
+| `suspendedBoxGoals` (F2 半成品) | **吸收进** `SUSPENDED_FOR_TRANSIT` 状态，删除独立字段 |
+
+| `BlockerReliefSynthesizer` | **签合同**：返回 TransitPermit 而不是裸 escape actions |
+
+| `revalidateCompletedGoals` | **改判定**：只对 `SATISFIED` 自然 regression，碰到 `SUSPENDED_FOR_TRANSIT` 直接跳过 |
+
+| `Hungarian assignment` | **加约束**：TRANSIT goal 不参与早期分配 |
+
+| `cachedSubgoalOrder = null` | **细粒度失效**：状态从 SATISFIED→PENDING 才清缓存，TRANSIT 切换不清 |
+
+
+
+## 6. 工程上的落地步骤（按 opus47 "高 ROI 动一处三处受益" 的原则）
+
+
+
+**Step 1（必做）**：实现 `GoalTransitAnalyzer`，给每个 goal 打 TransitProfile 标签。**只读，不改任何决策**。先输出诊断日志：`[TRANSIT] goal=L@(17,33) profile=TRANSIT crossingPaths=[I→(10,43), O→(1,37), ...]`。  
+
+预期：能在 ISO 里看到我们今天观察到的振荡 box 的 goal **全部** 被标 TRANSIT。如果标对了，证明分析正确。
+
+
+
+**Step 2（核心）**：把 `completedBoxGoals` 从 `Set` 升级为 `Map<Position, SubgoalState>`。这是个机械重构，编译器帮你找所有读写点。先保持行为等价（无 SUSPENDED 状态），仅引入抽象。
+
+
+
+**Step 3（关键）**：让 NAMO 申请 TransitPermit。第 3 层批准后切状态。`getOrComputeSubgoalOrder` 跳过 SUSPENDED。
+
+
+
+**Step 4（兜底）**：加 transit-precedence edge 进依赖图，让拓扑排序自动把 TRANSIT goal 排到末尾。
+
+
+
+**Step 5（清理）**：删除 F2/F6/F7 的临时补丁，因为它们的功能被状态机吸收了。
+
+
+
+每一步都可独立测试、可独立回滚。Step 1 + Step 2 不改变行为，Step 3 是真正的修复点，Step 4 是性能优化，Step 5 是债务清理。
+
+
+
+## 7. 为什么不接着打补丁
+
+
+
+每加一个 suspended set 的例外、一个 cap、一个 TTL，都会：
+
+1. 让现状更难理解（已有 F1～F7，再加 F8 是 unreadable 的）
+
+2. 在新关卡（Lily/MArtians）出现新模式时仍然失败
+
+3. 永远在 Layer 4 修 Layer 3 的债
+
+
+
+opus47 反复强调这点：**"如果你的整个系统的所有'智能'都集中在协调层，那意味着第三层（任务分解）几乎不存在……补好第三层，第二层的搜索空间会从'整个关卡'缩到'单步任务'，速度提升是数量级的；同时第四层的冲突频率会下降"**。
+
+
+
+我们今天看到的 ISO 跑了 2452 步还没解、4 个 attempt 全部 PARTIAL，正是 Layer 3 不存在导致 Layer 4 在打无效仗的写照。
+
+
+
+---
+
+
+
+## 我建议的下一步
+
+
+
+**只做 Step 1**——实现 `GoalTransitAnalyzer` 并跑 ISO，**不做任何决策改动**，只看输出的 TRANSIT 标记是不是和 BOX-OSC 报告里的振荡 box 的 goal 完全吻合。如果吻合，根因诊断闭环；接着做 Step 2-5。如果不吻合，说明分析模型还没建对，再讨论。
+
+
+
+要我开始 Step 1 吗？这一步代码量约 150 行（新文件 + LevelAnalyzer 调用 + 启动期日志），不动现有任何决策路径，零风险。

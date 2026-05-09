@@ -1,0 +1,188 @@
+ ---
+  五层架构完整度分析
+
+  根据 claudeopus47.txt 的五层架构框架，以下是逐层对比：
+
+  架构实现状态总表
+
+  层级: L1 领域层
+  要求的组件: State/Action/Level 抽象、PDDL 分离、高效 hashCode
+  已实现: ✅ State 不可变+缓存hash、Action 静态预分配37个实例、Position flyweight、Level 预计算索引
+  部分实现: ⚠️ applyJointAction 只检测越界不检测其他不适用性
+  未实现: —
+  状态评估: 85% 扎实
+  ────────────────────────────────────────
+  层级: L2 单Agent求解
+  要求的组件: A*、FF启发式、IW(1)、SIW、可互换实现
+  已实现: ✅ A*(加权)、TrueDistance BFS、Manhattan、IW(1)
+  部分实现: ⚠️ IW(1)仅用于escape子目标，通用find-route未启用
+  未实现: ❌ FF-style启发式 ❌ SIW
+  状态评估: 55% IW(1)利用率低
+  ────────────────────────────────────────
+  层级: L3 任务分解
+  要求的组件: HTN分解、依赖图、subgoal序列化、subgoal层CBS-lite
+  已实现: ✅ 可达性依赖分析、Hungarian分配、2-cycle escape合成、NAMO blocker-relief合成、P4冲突驱动PP
+  部分实现: ⚠️ 分解是扁平的（无递归HTN） ⚠️ subgoal层CBS-lite仅有排序调整，无真正约束分支
+  未实现: ❌ 递归HTN分解 ❌ subgoal级约束分裂
+  状态评估: 65% 核心逻辑强但缺深度
+  ────────────────────────────────────────
+  层级: L4 协调层
+  要求的组件: PP、CBS、冲突检测、回溯、死锁打破
+  已实现: ✅
+    PP+多层冲突处理、ConflictDetector、DeadlockBreaker、AgentCoordinator、CrossColorBarrierAnalyzer、ReservationTable
+  部分实现: ⚠️ 协调只有PP一种算法 ⚠️ CBS思想仅用于排序调整
+  未实现: ❌ 完整CBS ❌ action级约束分支
+  状态评估: 50% 单一协调策略
+  ────────────────────────────────────────
+  层级: L5 执行/监控
+  要求的组件: BDI循环、在线重规划、滑动窗口执行
+  已实现: ✅ PortfolioController多策略fallback、独立组检测、部分计划缓存
+  部分实现: ⚠️ Client线性执行全量计划
+  未实现: ❌ BDI reasoning cycle ❌ 在线重规划 ❌ 滑动窗口执行
+  状态评估: 30% 最弱层
+
+  各层详细分析
+
+  L1 领域层 (85%) — 基本完整
+
+  已实现:
+  - State: 不可变、缓存hashCode、applyJointAction 支持同步联合动作
+  - Action: 37个预分配静态实例（4 Move + 16 Push + 16 Pull + 1 NoOp）
+  - Level: 预计算 boxGoalsByType、allBoxGoalPositions、agentGoalPositionMap
+  - Position: flyweight缓存（Position.initCache）
+  - 颜色约束在 Level.canAgentMoveBox() 中强制执行
+
+  缺失/问题:
+  - applyJointAction 仅防御越界，其他不适用动作静默通过（注释声明"legacy stuck-recovery"需要）
+
+  L2 单Agent求解层 (55%) — IW(1)严重利用不足
+
+  已实现:
+  - BoxSearchPlanner: 加权A* + TrueDistance/Manhattan启发式
+  - IW1Planner: novelty=1 BFS，用于escape子目标
+  - TrueDistanceHeuristic: BFS预计算距离
+
+  关键缺失:
+  - FF-style (delete-relaxation) 启发式 — claudeopus47明确推荐但未实现
+  - SIW (Serialized Iterated Width) — 文档中提及但未实现
+  - IW(1)通用化: 代码中定义了 IW1_FINDROUTE_MIN_MANHATTAN=10 和 MAX=35 常量，暗示应该用于一般find-route场景，但实际上
+  planSubgoal() 只对escape子目标调用IW(1)，其他子目标从未触发
+
+  L3 任务分解层 (65%) — 核心强但缺少深度
+
+  已实现（较强）:
+  - 可达性依赖分析（computeGoalDependencies）：假设阻塞法检测硬依赖 + agent-body依赖 + start-to-goal依赖
+  - Hungarian最优box-goal分配
+  - EscapeSubgoalSynthesizer: 合成P_temp逃脱子目标打破2-cycle
+  - BlockerReliefSynthesizer: NAMO跨色辅助子目标
+  - P4冲突驱动PP: 失败后提升blocker目标优先级
+  - 5层tie-breaking排序（重要性→冲突→窄路→任务数→距离）
+
+  缺失:
+  - 递归HTN分解: 当前是扁平的subgoal列表，不是递归的"大任务→子任务→原子动作"
+  - Subgoal级约束分裂（CBS-lite）: P4只是重排序，没有真正的"在subgoal A和B之间生成约束 → 两个分支各自求解"
+
+  L4 协调层 (50%) — 只有PP一种实现
+
+  已实现:
+  - PP中的多层冲突处理: ConflictResolver → ConflictDetector → AgentCoordinator(yielding/clearing) → DeadlockBreaker
+  - CrossColorBarrierAnalyzer: 跨色障碍检测
+  - ReservationTable: 时空预约表
+
+  关键缺失:
+  - 完整CBS算法 — 有意排除（CLAUDE.md声明"CBS/JointAStar removed from top-level
+  sequences"），但claudeopus47建议的CBS-lite也未完整实现
+  - Action级约束分支: CBS精神的"碰撞→生成约束→分支重规划"仅在subgoal排序层面存在，未在action层面实现
+  - 所有portfolio策略都是PP变体（不同排序模式），没有真正异构的协调算法
+
+  L5 执行/监控层 (30%) — 最弱
+
+  已实现:
+  - PortfolioController: 多策略fallback + 时间预算分配
+  - 独立组检测: BFS+union-find → footprint细化 → NAMO耦合合并
+  - 部分计划缓存(bestPartialPlan)
+
+  关键缺失:
+  - BDI reasoning cycle: claudeopus47 §1.2.5描述的标准监控循环（感知→更新信念→检验意图→重规划）完全不存在
+  - 在线重规划: Client.updateState 只应用成功的动作，不检测状态是否偏离计划预期
+  - 滑动窗口执行: 当前是全量计划→全量执行。没有"规划N步→执行→观察→再规划"
+  - Client 一旦plan完成就逐条发送，如果中途状态偏离（例如某条动作被server拒绝后的级联效应），没有重新规划的机制
+
+  ---
+  发现的明显Bug
+
+  #: 1
+  严重程度: 🟡 中等
+  位置: ConflictResolver.java:62-67
+  问题描述:
+  无主Agent冲突解决使用"更高编号agent等待"策略。这是naive的优先级方案，当低编号agent需要高编号agent先移动时会死锁
+  ────────────────────────────────────────
+  #: 2
+  严重程度: 🟡 中等
+  位置: IW1Planner 使用范围
+  问题描述: IW1_FINDROUTE_MIN_MANHATTAN=10/MAX=35
+    常量已定义但从未在通用find-route场景触发。IW(1)仅对escape子目标调用。对10-35步的中间距离box推箱子任务，缺失了可能的
+  数量级加速
+  ────────────────────────────────────────
+  #: 3
+  严重程度: 🟢 低
+  位置: LevelAnalyzer.java:1616-1633
+  问题描述: adjustOrderForBottlenecks() 是死代码。注释明确说"Removed, logic was flawed"但方法体仍然存在
+  ────────────────────────────────────────
+  #: 4
+  严重程度: 🟢 低
+  位置: SubgoalManager.java:572-577
+  问题描述: findAgentForColor() 是死代码。注释标注为"Legacy method maintained for compilation"
+  ────────────────────────────────────────
+  #: 5
+  严重程度: 🟡 中等
+  位置: State.java:102-109
+  问题描述: hasAgentAt 和 getAgentAt 每次调用O(n)线性扫描。注释声称"Position flyweight cache, equals() short-circuits
+  via
+    ==" 但有误导性——仍需遍历所有agent。10个agent下可接受但注释不准确
+  ────────────────────────────────────────
+  #: 6
+  严重程度: 🟡 中等
+  位置: State.applyJointAction
+  问题描述:
+  仅防御越界动作，其他不适用动作（占用格、错色box等）静默通过。代码注明为legacy行为保留，但可能掩盖上游planning
+    bug
+  ────────────────────────────────────────
+  #: 7
+  严重程度: 🔴 较高
+  位置: PortfolioController 策略序列
+  问题描述: 所有策略都是PP变体（不同排序模式:
+    TOPOLOGICAL/DISTANCE_GREEDY/RANDOM）。没有真正异构的协调算法。遇到PP的固有短板（如复杂循环依赖），不同seed的RANDOM只
+  是运气重试而非算法修复
+  ────────────────────────────────────────
+  #: 8
+  严重程度: 🟡 中等
+  位置: Client.java:289-301
+  问题描述: updateState 按顺序应用成功动作 (currentState.apply(actions[i], i))，但server语义是同步联合动作——应使用
+    applyJointAction 而非逐agent应用 apply。这会导致中间状态与server实际状态不一致
+
+  Bug #8 是最危险的：server的语义是"所有agent同时行动，基于执行前的状态判断成败"。但Client逐个应用成功动作，如果agent
+  0和agent 1同时移动到相邻格且都成功，apply 链会产生一个实际不存在的中间状态。
+
+  ---
+  claudeopus47.txt 建议的补救优先级 vs 实际完成度
+
+  补救次序: 第1优先: 补L3任务分解
+  claudeopus47的建议: "补好第三层，第二层搜索空间从整个关卡缩到单步任务"
+  当前状态: ✅ 已做大量工作：依赖分析、Hungarian、escape合成、NAMO relief、P4冲突驱动PP
+  ────────────────────────────────────────
+  补救次序: 第2优先: 补L2启发式
+  claudeopus47的建议: "更好的启发式、IW应该在第三层稳定之后做"
+  当前状态: ⚠️ IW(1)利用率不足，FF启发式缺失
+  ────────────────────────────────────────
+  补救次序: 第3优先: 补L4协调
+  claudeopus47的建议: "PP→CBS/回溯式PP，认真做完任务分解后剩余冲突量已很小"
+  当前状态: ⚠️ PP+多seed随机+冲突驱动PP基本覆盖，但无真CBS-lite
+  ────────────────────────────────────────
+  补救次序: 最后: L5执行
+  claudeopus47的建议: "执行层负责吐action给server并监控异常"
+  当前状态: ❌ BDI循环和在线重规划基本缺失
+
+  总结：你们的代码在 L1领域层 和 L3任务分解层 投入最大、完成度最高，这符合claudeopus47建议的ROI优先级。L2单Agent层的IW(1
+  )有明确的低垂果实（扩展使用范围）。L5执行层是整栋楼最薄弱的一层，Client.updateState 的逐agent apply 而非
+  applyJointAction 是一个需要修复的真实bug。

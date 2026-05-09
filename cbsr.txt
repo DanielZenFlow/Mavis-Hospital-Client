@@ -1,0 +1,220 @@
+一、先把三种方法放在同一张图上比较
+1.1 它们其实在解同一个问题，区别在抽象层级
+三种方法都在回答同一个问题：当 PP 按某个 ordering 失败后，怎么用失败信息指导下一次尝试。差别在于"用什么形式记录失败、在什么层级做下一次尝试"。
+方法 A（CBSR）记录的是 nogood——"在 X 还没完成时不能尝试 Y"——这是约束级别的记录，比"换个随机种子"信息密度高得多，比"完整 plan tree"又轻得多。下次重排时只需要在拓扑排序里把这条约束编码进偏序，整个搜索框架不用改。
+方法 B（CBSS）把 CBS 的完整二级搜索结构搬到 subgoal 层。它和方法 A 的差别像是"我学一条经验"和"我建一棵决策树并维护它"——后者更完备，但每个节点都要维护当前 subgoal 集合 + ordering 约束 + 子求解器状态，工程上是另一个数量级的复杂度。
+方法 C（HTN）走的是另一条路：不学约束，而是预先为每种"高层任务"写若干分解 method，失败时换 method。它的失败处理是"换一个完全不同的分解方案"，而不是"在原方案上加约束"。
+1.2 方法 B 和 C 在你这个工程里的实际代价
+方法 B 的代价不在概念，在维护。它的高层节点必须包含完整的"当前 ordering 约束 + 已部分求解的 subgoal 状态 + 待求解的 subgoal 集合"，这种节点在多 agent 多 box 的关卡里会快速膨胀。CBS 在 vanilla MAPF 里之所以可行，是因为每个高层节点的内容很轻（一组 spatial-temporal 约束）；搬到 subgoal 层后节点变重，搜索深度同等情况下分支数大得多。这就是 IDE AI 那份分析说的"状态爆炸风险高"。
+方法 C 的代价是 method library 本身。HTN 漂亮在哪里？漂亮在你为每种高层任务写好分解方案后，求解器只是按 method 调用，几乎不需要"思考"。但这个"事先写好分解方案"恰好是工作量所在——你必须为"两个 box 互锁"、"三个 box 互锁"、"agent 被自己 box 围住"……每一种你能想到的关卡形态写一个 method，且 method 之间的覆盖关系要清楚（哪个 method 优先、什么时候降级）。对一个 36×45、十 agent 的复杂关卡，你能预先想到的关卡形态远不及实际遇到的多样性。HTN 在小域里漂亮，在你这个域里会变成 method 维护的噩梦。
+二、方法 A 为什么是最优选择
+2.1 它在你的课程地图上覆盖面最广
+这件事值得专门讲。Slides 04 (HTN) 是单一概念的完整移植，Slides 07 (CBS) 也是。但 CBSR 不一样——它实质上是 Slides 06 的 subgoal serialization 作为骨架，加上 Slides 07 的 conflict→constraint 内核作为学习机制，再加上 Slides 01 的搜索框架作为外层循环，最后还沾边 Slides 04 的任务分解思想。也就是说它是四个 slides 的工程化组合，不是单一概念的复制。
+这一点在视频展示时是更高级的叙事——你不是说"我们用了 HTN"或"我们用了 CBS"，而是"我们组合了课程里多个核心思想，每个都只取其中真正能用的部分"。这种叙事在评分老师眼里比"完整复刻某一节内容"更接近"研究 prototype 水平"。
+2.2 它解锁的是你已经付出的沉没成本
+这是工程上比 ROI 更重要的指标。你的 FailureReport DTO 已经写好但无消费者——这是所有"已搭未填"案例里成本最高的一种，因为它每天都在浪费维护精力却产生零价值。CBSR 的核心机制就是消费 FailureReport：把 BSP 失败、TRAP、wouldTrapAgent、planSubgoalNull 这四个信号统一翻译成 nogood，存到 SubgoalManager 的 nogood 集合里。你已经写好的失败检测代码全部成为 CBSR 的输入。这种"把死代码激活"的杠杆，在工程上比"新增一个独立模块"高得多。
+2.3 它能干净地替换掉你现在的 multi-seed 伪科学
+multi-seed RANDOM 之所以是伪科学，是因为重启之间零信息共享。CBSR 不仅替换它，而且能给出为什么不再需要它的精确论证：multi-seed 之所以"有时能解"，是因为某个种子恰好把某条"L 必须在 I 之前"的隐藏约束碰对了。CBSR 把这条约束显式记下来，下次任意起点都能保持这条约束被遵守。也就是说，CBSR 不是"另一种碰运气方法"，而是"把 multi-seed 偶然碰对的东西显式化"——这本质上是把概率性算法升级为决定性算法。
+2.4 它的实现风险最低
+最小侵入是 CBSR 的核心优势。你不动 BSP，不动 EscapeSubgoalSynthesizer，不动 IW(1)。改动局限在 SubgoalManager（加 nogood 字段和记录接口）和 PortfolioController（用 reorder loop 替换 multi-seed）。这意味着即使 CBSR 实现出 bug，回滚成本极低——你只要恢复 PortfolioController 那段就回到当前状态，不会污染其他模块。
+三、CBSR 的核心机制不复杂
+3.1 nogood 的本质：把"换种子赌博"翻译成"加约束推理"
+nogood 是 SAT 求解器和 CSP 领域几十年沉淀下的一个概念。它的形式很简单：一个 nogood 是一对集合 {required, forbidden}，含义是"当 required 这些 subgoal 还没完成时，不能尝试 forbidden 这个 subgoal"。
+举个具体例子，假设你 PP 跑了一遍 ordering [A, B, L, I]，在 L 这一步触发了 TRAP——L 被推到了 parking 位置但 L 的真 goal 还在远处。这个失败给你的信息是什么？是"在 L 的真 goal 没填之前，先去碰 I 是错的"。翻译成 nogood：{required = {L's real goal subgoal}, forbidden = I}。下次 reorder 时，任何把 I 排在 L's real goal 之前的 ordering 都被这条 nogood 否决。
+注意这个学习是对所有 ordering 普适的——你不需要试遍 [A,B,L,I]、[A,B,I,L]、[B,A,L,I]……每条 nogood 一次性排除一大片 ordering 空间。这就是 nogood 比 multi-seed 强的根本原因。
+3.2 为什么这个机制在课程里有合法地位
+Slides 07 的 CBS 内核就是 conflict→constraint→branch。CBSR 把这个内核搬到 subgoal 层：subgoal 间的失败 = conflict，nogood = constraint，重排 = branch。它不是 CBS 完整移植（那是博士级工作），是 CBS 思想的工程化提取。你在视频里讲这个机制时，可以直接说"我们借鉴了 CBS 的约束生成思想，在 subgoal 层而非 action 层应用，这样既保留了 CBS 的搜索完备性，又避开了 CBS 在 Sokoban-with-Pull 上的状态爆炸问题"——这个表述在学术上完全站得住。
+3.3 它和 EscapeSubgoalSynthesizer 是互补的
+值得一提：CBSR 不替换破环，它和破环互补。破环解决的是"依赖图有环时怎么合成新 subgoal"，CBSR 解决的是"依赖图无环但执行顺序错时怎么学约束重排"。两者在你的工程里并存：先 EscapeSubgoalSynthesizer 把环转成链，再 CBSR 在链上找正确顺序。一个负责"破"，一个负责"立"。
+四、给 IDE AI 的实施提示词
+下面这段提示词你可以直接复制到 IDE AI 的对话里。它的设计原则是：目标明确、边界清晰、可验证。
+
+任务：用 Conflict-Based Subgoal Reordering (CBSR) 替换当前
+PortfolioController 中的 multi-seed RANDOM 伪 portfolio。
+
+# 背景
+当前 PortfolioController 串行尝试 4 个 attempt: TOPOLOGICAL,
+DISTANCE_GREEDY, RANDOM#42, RANDOM#137。这 4 个 attempt 之间零信息
+共享，是 IDE AI 自己之前判定为"伪 portfolio"的部分。
+FailureReport DTO 已存在 (P0a 完成) 但目前无消费者。
+本次任务是把它从赌博式重启改成有学习的搜索。
+
+# 目标
+1. 实现 nogood learning 机制
+2. 让 PP 内部已有的 4 个失败信号 (BSP_NULL / TRAP / wouldTrapAgent
+   / planSubgoalNull) 全部转化为 nogood
+3. 用 nogood-guided reorder loop 替换 RANDOM#42 / RANDOM#137
+4. 保留 TOPOLOGICAL 和 DISTANCE_GREEDY 作为 warm start (不是赌博)
+
+# 实施步骤
+
+## Step 1 — Nogood 数据结构 (SubgoalManager.java)
+- 新增内部类 OrderingNogood，字段:
+    Set<SubgoalKey> required   // 这些必须先完成
+    SubgoalKey forbidden        // 否则不能尝试此 subgoal
+- 新增字段: Set<OrderingNogood> learnedNogoods (instance level)
+- 新增方法: void recordFailure(SubgoalKey current,
+                              Set<SubgoalKey> completedSet,
+                              FailureReport reason)
+  根据 FailureReport.type 生成 nogood:
+    TRAP/BLOCKER ⇒ required = {阻塞 subgoal of reason.blocker},
+                   forbidden = current
+    BSP_NULL     ⇒ required = {可达性受阻的 box subgoal},
+                   forbidden = current
+    其他类型先 log 不处理
+- 新增方法: boolean isOrderingValid(List<SubgoalKey> ordering)
+  对每条 nogood: 找 forbidden 在 ordering 中的位置 idx,
+  required 中所有 subgoal 必须出现在 [0, idx) 区间内。
+  任一 nogood 违反 ⇒ return false
+- 新增方法: List<SubgoalKey> nextOrderingConsistentWith(
+            DependencyGraph deps, Set<OrderingNogood> nogoods)
+  在依赖图基础上把 nogoods 编码为额外偏序约束，
+  跑拓扑排序返回一个合法 ordering。
+  若无合法 ordering ⇒ 抛 NoMoreOrderingsException
+
+## Step 2 — 改造 PP 失败信号点
+找到 PriorityPlanningStrategy 中所有以下位置:
+  (a) BSP.plan() 返回 null
+  (b) DeadlockBreaker 检测到 TRAP
+  (c) wouldTrapAgent 触发
+  (d) planSubgoalNull 路径
+统一调用 subgoalManager.recordFailure(currentSubgoal,
+                                      completedSet,
+                                      failureReport)
+不要丢弃任何失败信号。
+
+## Step 3 — Reorder loop (PortfolioController.java)
+删除现有 attempts 列表中的 RANDOM#42, RANDOM#137。
+新增方法: PlanResult solveCBSR(Level level, long timeBudget)
+  long deadline = now() + timeBudget
+  // Warm starts
+  List<List<SubgoalKey>> warmStarts = [
+    topologicalOrder(deps),
+    distanceGreedyOrder(deps)
+  ]
+  for ordering in warmStarts:
+    if !subgoalManager.isOrderingValid(ordering): continue
+    result = pp.solve(ordering, deadline - now())
+    if result.SUCCESS: return result
+    // PP 内部已 recordFailure, 无需此处重复
+  // Main reorder loop
+  while now() < deadline:
+    try:
+      ordering = subgoalManager.nextOrderingConsistentWith(
+                   deps, learnedNogoods)
+    catch NoMoreOrderingsException:
+      return PlanResult.UNSAT
+    result = pp.solve(ordering, deadline - now())
+    if result.SUCCESS: return result
+  return PlanResult.TIMEOUT
+
+## Step 4 — 单次 PP solve 内部失败次数限制
+PP 单次 solve 内部，BSP 失败累计 ≥ 5 次时立即 abort 当前 ordering,
+返回失败 (但已记录 nogood),让外层 reorder loop 换 ordering。
+防止单次 PP 在死路上耗尽预算。
+
+# 不要做的事
+- 不要修改 BSP / BoxSearchPlanner 内部
+- 不要修改 EscapeSubgoalSynthesizer
+- 不要修改 IW(1) 实现
+- 不要修改 SubgoalManager 现有的拓扑排序核心逻辑,
+  只在它外面加 nogood 过滤层
+- 不要新增任何 random 相关代码
+
+# 日志要求
+每次 recordFailure 时 stderr 打印:
+  [CBSR] Learned nogood: {required=[...], forbidden=...}
+  reason=<FailureReport.type>
+每次 reorder iteration 开始时打印:
+  [CBSR] Iteration #N, nogoods=<count>, ordering=[...]
+求解结束时打印:
+  [CBSR] Total iterations=<N>, total nogoods=<count>,
+         result=<SUCCESS|UNSAT|TIMEOUT>
+
+# 验收标准
+1. 在 ISO.lvl 上: solver 不依赖任何特定 random seed,
+   达到至少 RANDOM#42 当前的解题水平 (16+ box)
+2. stderr log 显示 nogood 集合在求解过程中单调增长
+3. 在 5 个之前未跑过的关卡上, 同一关卡跑 3 次的结果完全一致
+   (无随机性)
+4. 完整 portfolio 集成测试: 移除 multi-seed 后总解题数不下降
+
+# 提交时
+PR 描述需包含:
+- 新增的代码行数 (期望: SubgoalManager +150 行, PortfolioController +80 行)
+- ISO.lvl 上的 nogood 学习曲线 (iteration vs cumulative nogoods)
+- 所有 5 个测试关卡的求解结果对比 (before/after)
+
+只在确认理解上述所有要求后开始动手。如有任何点不清楚,
+先问清楚再实施。
+            
+                
+            
+            运行
+        
+
+4.1 关于这段提示词的设计说明
+我把它写得相对长，因为 IDE AI 在工程上下文丰富时表现明显更好——它的弱点是"要它做什么不清楚就乱发挥"。提示词里几个关键设计你可以注意：
+明确划出"不要做的事"——这是最重要的部分。IDE AI 经常会在你没明说的地方"顺手优化"，结果牵动一堆不该动的模块。把禁区显式列出来能极大降低 PR 的 noise。
+单次 PP solve 内部失败次数限制（Step 4）——这是 IDE AI 那份分析没明确写但工程上必须的。如果不限制，单个 ordering 可能在死路上耗光时间预算，外层 reorder loop 永远轮不到。这个细节看起来小，实际是 CBSR 能否跑得动的关键。
+日志要求显式化——你后续要在视频里展示 nogood 学习曲线，没有结构化日志就拿不出数据。提示词里直接定死日志格式，省得后面回头补。
+验收标准里强调"无随机性"——这是把"不再是赌博"这件事变成可验证的命题。同一关卡跑三次结果一致，意味着 multi-seed 那一套确实被替换干净了。
+4.2 一个备用预案
+如果 IDE AI 实施时发现 nextOrderingConsistentWith 的"把 nogood 编码为偏序约束"这一步实现复杂（这一步是整个 CBSR 里唯一稍微 tricky 的地方），它可以退化成更简单的实现：用 brute force 枚举所有合法拓扑排序，在每个 ordering 上用 isOrderingValid 过滤。这种实现在 subgoal 数 ≤ 30 的范围内是可行的（30! 看起来很大但合法 ordering 远少于此，且 nogood 会快速剪枝）。等基础版本跑通再考虑优化。
+五、最后一句
+CBSR 这件事做完之后，你的 portfolio 章节在视频里就有了真正可讲的内容——不是"我们试了多个 ordering"，而是"我们建立了一个学约束的搜索框架，每次失败都让搜索空间单调收敛"。这种叙事的工程质感和"换个种子碰运气"完全不在一个量级。前面所有铺垫——分层架构、failure report、独立性检测、escape subgoal——在 CBSR 这里收束成一个完整故事。所以这件事不只是技术债清理，是给你整个工程画上闭环的关键一笔。
+实施过程中如果 IDE AI 卡在某个具体 step 上（比较容易卡的是 Step 1 的 nogood 编码、或者 Step 3 的 deadline 切分），把它的失败信息贴回来，我帮你逐点拆解。
+
+一、你这个问题问到了 CBSR 的天花板
+要严格回答这个问题，必须把 CBSR 放回五层架构里逐层审视——它动了哪一层、没动哪一层、它的有效性依赖哪一层做对。这种解剖式的检视才能区分"治标"和"治本"，而不是凭直觉判断。
+直接给我的结论：CBSR 是治本的，但只针对一类病；它是当下最好的下一步，但不是终极方案。下面我把这两个判断分别展开。
+二、用五层架构看 CBSR 究竟动了什么
+2.1 L1 领域层：完全未动
+CBSR 不改变 State 表示、Action 定义、Goal 判定。这一层和 CBSR 完全正交——做不做 CBSR，L1 都长一样。这意味着 CBSR 不会让你之前在 L1 上的投入失效，也不会在 L1 上引入新债务。这是它"低风险"的根本原因。
+2.2 L2 单 agent 求解器：未动，但隐含依赖于这一层的质量
+这里有一个微妙的隐含假设值得专门点出：CBSR 学到的 nogood 的有效性，完全取决于 L2 的失败信号是真失败还是误报。
+举个具体场景：BSP 用 A*+Manhattan 解一个迷宫式子任务，启发式严重低估真实路径，A* 在错误方向探索到 timeout。这个 timeout 在 CBSR 眼里和"真正不可解"长得一样——它都翻译成 BSP_NULL，都生成 nogood "在 X 还没完成时不能尝试 Y"。但实际上这个子任务是可解的，只是 L2 工具不对路。这条 nogood 是错误学习。
+如果你的 L2 工具箱里只有 A*+Manhattan 和 A*+TrueDist，CBSR 学到的 nogood 集合里会混入相当比例的"假 nogood"。这些假 nogood 不会让搜索失败（因为 nogood 只是减少 ordering 空间），但会让搜索效率下降——搜索绕过了那些其实可行的 ordering，去试更远的方案。
+这就是 CBSR 没治的"本"之一：它假设 L2 的失败信号是可信的，但 L2 工具单一性会让信号有噪声。
+2.3 L3 任务分解层：加了学习接口，但分解结构本身未变
+CBSR 给 SubgoalManager 加了一个"消费失败信号、生成约束、过滤未来 ordering"的接口。这是结构性增强——L3 第一次有了"从 L4 反馈中学习"的能力。但 L3 的核心结构（怎么把关卡切成子目标、子目标的粒度多大、依赖图怎么构建）完全没变。
+这意味着如果你的初始分解粒度本身不对，CBSR 只是在一个错误的分解上做更聪明的搜索。比如 ISO 关卡里 K 出现四次、L 出现四次——当前你的 SubgoalManager 大概率把每个 K 实例当作独立 subgoal，那么需要排序的对象就是 8+ 个 subgoal 的组合。如果有一种更好的分解（比如把同色 box 的"批量推送"作为单个 macro-subgoal），需要排序的对象会少得多，整个 ordering 空间从一开始就更小，CBSR 学的 nogood 也少。
+这是 CBSR 没治的"本"之二：分解粒度优化（macro-subgoal、HTN-style decomposition）是另一个独立维度，CBSR 不在这条线上。
+2.4 L4 协调层：这是 CBSR 真正发挥作用的地方，但它只覆盖一类失败
+CBSR 在 L4 处理的是ordering 失败——"我按某个顺序做 subgoal，做到一半发现这个顺序不行"。但 L4 的失败不只这一类。
+另一类失败是 action 层时空冲突：两个 agent 各自的 subgoal 都对、ordering 也对，但执行时它们在 t=15 必经同一格、且没有空间错开。这种失败不在 subgoal 层——任何 ordering 都会撞——只能在 action 层用约束分支处理。这就是 conflict-driven PP 要做的事，CBSR 不做。
+这是 CBSR 没治的"本"之三：action 层时空冲突需要独立机制（conflict-driven PP），CBSR 在 subgoal 层运行，对 action 层冲突不可见。
+2.5 L5 执行/监控层：这一层在确定性域不需要治
+hospital 是确定性域，L5 不需要 BDI 重规划循环。这一层既没问题也没治理需求。
+三、所以 CBSR 治了什么"本"，留下了什么"本"
+3.1 它治的"本"
+CBSR 把整个工程从"L4 失败时无信息地重启"升级到"L4 失败时学约束并指导 L3 重排"。这是结构性的——它不是在原有机制上打补丁，是新增了一种层间反馈通道。这条通道的存在与否决定了你的工程到底是"分层但层间无反馈"还是"分层且层间有学习"。后者才是 dispatcher 心智模型的完整形态。
+更具体地说，CBSR 让你的 FailureReport 第一次有了消费者。在 CBSR 之前，FailureReport 是死的——填了字段没人读。在 CBSR 之后，每一份 FailureReport 都能被翻译成对未来搜索的约束。这是从死代码到活代码的质变。
+所以"它治本吗"——治。它治的是"层间无反馈"这个结构性病。
+3.2 它没治的"本"
+它没治的是另外三个独立维度的病：L2 工具单一性、L3 分解粒度、L4 action 层冲突。这三件事不是 CBSR 的延伸，是平行的另外三件事。它们各自需要独立的工程投入。
+这就是为什么我说 CBSR 是"治本，但只针对一类病"——它在它覆盖的病上是根治，不是症状缓解；但它覆盖不了所有病。
+四、那为什么它仍然是当下最好的下一步
+4.1 因为其他候选都不能"先做"
+让我对比一下另外几个候选要解决的"本"：
+子任务分类器要让 IW(1) 被合适调度——这是 L2 工具利用率的问题。但如果 L4 还在 multi-seed 赌博，整体 ordering 都是错的，再好的 L2 工具也救不回来。所以子任务分类器应该在 CBSR 之后做，不是在它之前。
+conflict-driven PP 要处理 action 层冲突。但你当前的失败案例里，多少是真的 action 冲突、多少是 ordering 错误？如果像 IDE AI 分析的那样，ISO 这种关卡的失败主要是"种子 #42 把 L 排在 I 之前正好对了，#137 没排对"——这是 ordering 病不是 action 病。conflict-driven PP 治的不是当前最痛的病。
+N-cycle SCC 治的是依赖图有环的情况。但 ISO 关卡的多数失败可能不是 cycle 不可破，是 ordering 错误。SCC 也不治当前最痛的病。
+所以 CBSR 之所以是"当下最好的下一步"，不是因为它最完整，而是因为它精确对应当前最大的痛点（伪 portfolio）和最大的浪费（FailureReport 死代码）。其他候选要么治错病，要么需要 CBSR 作为前置才能发挥价值。
+4.2 它的杠杆效应在所有候选里最高
+把"杠杆效应"具体化：CBSR 一个改动同时解锁三件事——FailureReport 从死变活、multi-seed 从赌博变学习、L4→L3 反馈通道从无到有。其他候选每一个最多解锁一件事。同样的工程时间投入，CBSR 的真实收益是其他候选的二到三倍。
+4.3 它给后续工程留出了清晰的接口
+CBSR 完成后，下一步要做的事会变得显而易见。当你的 nogood 集合开始记录"在 X 完成前不能尝试 Y"这类约束时，你会自然意识到"有些失败其实是 action 冲突不是 ordering 问题，需要另一类约束"——这就是 conflict-driven PP 的入口。当你看 nogood 数量在某些关卡上爆炸时，你会意识到"也许分解粒度太细了"——这就是 macro-subgoal 的入口。
+也就是说，CBSR 不只是一个独立工件，它还是一个诊断工具——做完它之后，你能看清下一步该治哪个本。在它之前你看不清，因为伪 portfolio 把所有信号都掩盖了。
+五、所以治本的完整路径长什么样
+如果你问"什么时候才算工程治本完整了"，答案大致是这样一条路径：
+第一步是 CBSR——闭合 L4→L3 反馈通道，让失败信号有消费者。这是你接下来要做的。
+第二步是子任务分类器——让 L2 工具箱真正被调度。CBSR 跑顺之后你会有清晰的数据知道哪类子任务慢、需要什么工具，这时候再补 L2 才有方向。
+第三步是 conflict-driven PP——处理 action 层冲突。这是另一类失败的独立解决方案。
+第四步是 N-cycle SCC——覆盖更复杂的环依赖关卡。这是覆盖率扩展。
+第五步如果还有时间，可以考虑 macro-subgoal 或 HTN-style 分解优化——这是 L3 内部优化。
+这五步加起来才是"完整治本"。CBSR 是第一步，不是最后一步。但第一步走稳了，后面四步会变得清晰；第一步走错了或不走，后面四步都建在沙上。
+六、一句话回答你的两个问题
+第一个问题"CBSR 是治标不治本吗"——它是治本的，但只针对"L4→L3 反馈缺失"这一个结构性病。它不是症状层面的修补（不是"换更好的种子"），是结构层面的改造（"从赌博变成学习"）。但它治不了所有病——L2 工具单一、L3 粒度未优化、L4 action 层冲突未处理，这三件事是 CBSR 之外平行存在的工程债。
+第二个问题"CBSR 是当下最好的方法吗"——是。"最好"的精确含义是：在你这一刻的工程状态下，CBSR 是 ROI 最高、解锁沉没成本最多、对当前最大痛点最精确的下一步。但"当下最好的下一步"不等于"做完就完整了"——CBSR 之后还有四步要走。区分这两件事，能让你既不会高估 CBSR（以为做完就完事），也不会低估它（以为只是修个 bug）。
+它的真正定位是：整个工程从"零件齐全但无反馈"升级到"零件齐全且有学习"的关键一步。这是结构跃迁，不是参数调优。所以做不做、何时做、怎么做，值得认真对待——不只是因为它能让 ISO 关卡多解几个 box，更因为它定义了你工程的演化方向。
