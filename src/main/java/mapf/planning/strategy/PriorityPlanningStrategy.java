@@ -126,13 +126,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     private Set<Position> escapeGoalPositions = Collections.emptySet();
 
-    /** P2: Iterated Width(1) planner (lazy init); used for escape subgoals only. */
+    /**
+     * P2 / P4b: Iterated Width(1) planner (lazy init).
+     * Used for two paths: (a) escape subgoals (P2, Round 0), and
+     * (b) find-route fallback for moderate-distance non-escape subgoals
+     * (P4b, Round 1.5 — see planSubgoal ~L3700).
+     * See also IW1_FINDROUTE_{MIN,MAX}_MANHATTAN below.
+     */
     private IW1Planner iw1Planner = null;
 
     /**
-     * P4 (subtask classifier): box-to-goal Manhattan distance gate for trying IW(1)
-     * on non-escape subgoals. Below MIN: A* with Manhattan is trivially fast — IW(1)
-     * is wasteful. Above MAX: IW(1) state explosion likely; trust BSP/A*+TrueDistance.
+     * P4b (subtask classifier): box-to-goal Manhattan distance gate for trying IW(1)
+     * on non-escape subgoals (IW(1) FIND-ROUTE FALLBACK per claudeopus47 §1.2.2 / §3.2).
+     * Below MIN: A* with Manhattan is trivially fast — IW(1) is wasteful.
+     * Above MAX: IW(1) state explosion likely; trust BSP/A*+TrueDistance.
+     * Used in planSubgoal ~L3700 (P4b branch).
      * Per qanda.txt §3.3 / §4.4 (IW(1) sweet spot for moderate find-route paths).
      */
     private static final int IW1_FINDROUTE_MIN_MANHATTAN = 10;
@@ -3697,12 +3705,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 logVerbose("[PP] Round 1 (frozen) failed for " + subgoal.boxType + " -> " + subgoal.goalPos);
 
-                // P4b: Round 1.5 — IW(1) fallback for moderate-distance find-route subgoals
-                // when A*/BSP failed under frozen. Per qanda.txt §3.3 / §4.4: IW(1) is the
-                // sweet spot for single-box find-route where A*+Manhattan badly underestimates
-                // (long detours around walls). Used as a FALLBACK (not Round 0 speculation)
-                // to preserve the fast A* path on simple subgoals. Skip very short paths
-                // (A* trivially solves them) and very long paths (IW(1) state explosion).
+                // P4b: Round 1.5 — IW(1) FIND-ROUTE FALLBACK (per claudeopus47 §1.2.2 / §3.2)
+                // for moderate-distance find-route subgoals when A*/BSP failed under frozen.
+                // Per qanda.txt §3.3 / §4.4: IW(1) is the sweet spot for single-box find-route
+                // where A*+Manhattan badly underestimates (long detours around walls).
+                // Used as a FALLBACK (not Round 0 speculation) to preserve the fast A* path
+                // on simple subgoals. Skip very short paths (A* trivially solves them)
+                // and very long paths (IW(1) state explosion).
                 if (!isEscapeSg
                         && boxToGoalManhattan >= IW1_FINDROUTE_MIN_MANHATTAN
                         && boxToGoalManhattan <= IW1_FINDROUTE_MAX_MANHATTAN) {
