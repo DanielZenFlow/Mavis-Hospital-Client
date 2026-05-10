@@ -33,6 +33,7 @@ public final class FailureSnapshot {
 
     /** Lightweight per-attempt record passed in from PortfolioController. */
     public static final class AttemptInfo {
+        public final String phase;
         public final String label;       // e.g. "STRICT_ORDER(RANDOM#42)"
         public final long durationMs;
         public final boolean success;
@@ -44,6 +45,7 @@ public final class FailureSnapshot {
         public AttemptInfo(String label, long durationMs, boolean success,
                            int planSteps, int unsatCount,
                            String failedSubgoal, String failureKind) {
+            this.phase = phaseOf(label, failureKind);
             this.label = label;
             this.durationMs = durationMs;
             this.success = success;
@@ -154,15 +156,17 @@ public final class FailureSnapshot {
         sb.append('\n');
 
         // --- Attempts table ---
-        sb.append("## Portfolio attempts\n");
+        sb.append("## Stage trace\n");
         if (attempts == null || attempts.isEmpty()) {
             sb.append("(none)\n\n");
         } else {
-            sb.append("| # | strategy | ms | steps | kind | unsat | failed-subgoal |\n");
-            sb.append("|---|----------|----|-------|------|-------|----------------|\n");
+            appendPhaseSummary(sb, attempts);
+            sb.append("| # | phase | attempt | ms | steps | kind | unsat | failed-subgoal |\n");
+            sb.append("|---|-------|---------|----|-------|------|-------|----------------|\n");
             for (int i = 0; i < attempts.size(); i++) {
                 AttemptInfo a = attempts.get(i);
                 sb.append("| ").append(i + 1)
+                        .append(" | ").append(a.phase)
                         .append(" | ").append(a.label)
                         .append(" | ").append(a.durationMs)
                         .append(" | ").append(a.planSteps)
@@ -172,6 +176,7 @@ public final class FailureSnapshot {
                         .append(" |\n");
             }
             sb.append('\n');
+            appendBlockerSummary(sb, attempts);
         }
 
         // --- Goal status ---
@@ -216,7 +221,14 @@ public final class FailureSnapshot {
             sb.append("(none)\n\n");
         } else {
             sb.append("- Kind: ").append(lastReport.kind).append('\n');
+            sb.append("- Cause: ").append(lastReport.cause).append('\n');
             sb.append("- Note: ").append(lastReport.note).append('\n');
+            if (lastReport.blockedGoals != null && !lastReport.blockedGoals.isEmpty()) {
+                sb.append("- Blocked goals: ").append(lastReport.blockedGoals).append('\n');
+            }
+            if (lastReport.blockedPositions != null && !lastReport.blockedPositions.isEmpty()) {
+                sb.append("- Blocked cells: ").append(lastReport.blockedPositions).append('\n');
+            }
             if (lastReport.lastAttemptedSubgoal != null) {
                 Subgoal sg = lastReport.lastAttemptedSubgoal;
                 sb.append("- Last attempted: agent").append(sg.agentId)
@@ -265,6 +277,87 @@ public final class FailureSnapshot {
         return name.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
+    private static String phaseOf(String label, String failureKind) {
+        String l = label == null ? "" : label;
+        String k = failureKind == null ? "" : failureKind;
+        if (l.startsWith("L3-ResidualOrderRepair")) return "L3 residual-order repair";
+        if (l.startsWith("L3-PartialPlanContinuation")) return "L3 partial-plan continuation";
+        if (l.startsWith("L3-CBSRBaseContinuation")) return "L3 CBSR-base continuation";
+        if (k.contains("[CBSR#")) return "L3 CBSR ordering repair";
+        if (l.contains("DISTANCE") || l.contains("TOPOLOGICAL") || l.contains("SINGLE_AGENT")) {
+            return "initial ordering probe";
+        }
+        return "other";
+    }
+
+    private static void appendPhaseSummary(StringBuilder sb, List<AttemptInfo> attempts) {
+        Map<String, long[]> byPhase = new LinkedHashMap<>();
+        for (AttemptInfo a : attempts) {
+            long[] row = byPhase.computeIfAbsent(a.phase, k -> new long[4]);
+            row[0]++;
+            row[1] += a.durationMs;
+            row[2] = Math.max(row[2], a.planSteps);
+            if (a.success) row[3]++;
+        }
+        sb.append("### Time by phase\n");
+        sb.append("| phase | attempts | ms | best steps | success |\n");
+        sb.append("|-------|----------|----|------------|---------|\n");
+        for (Map.Entry<String, long[]> e : byPhase.entrySet()) {
+            long[] row = e.getValue();
+            sb.append("| ").append(e.getKey())
+                    .append(" | ").append(row[0])
+                    .append(" | ").append(row[1])
+                    .append(" | ").append(row[2])
+                    .append(" | ").append(row[3])
+                    .append(" |\n");
+        }
+        sb.append('\n');
+        sb.append("### Attempt timeline\n");
+    }
+
+    private static void appendBlockerSummary(StringBuilder sb, List<AttemptInfo> attempts) {
+        Map<String, Integer> blockers = new LinkedHashMap<>();
+        Map<String, Integer> kinds = new LinkedHashMap<>();
+        for (AttemptInfo a : attempts) {
+            if (a.failedSubgoal != null && !a.failedSubgoal.isEmpty()) {
+                blockers.merge(a.failedSubgoal, 1, Integer::sum);
+            }
+            if (a.failureKind != null && !a.failureKind.isEmpty()) {
+                kinds.merge(normalizeFailureKind(a.failureKind), 1, Integer::sum);
+            }
+        }
+        if (!blockers.isEmpty()) {
+            sb.append("### Repeated blockers\n");
+            sb.append("| failed subgoal | count |\n");
+            sb.append("|----------------|-------|\n");
+            blockers.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .limit(8)
+                    .forEach(e -> sb.append("| ").append(e.getKey())
+                            .append(" | ").append(e.getValue()).append(" |\n"));
+            sb.append('\n');
+        }
+        if (!kinds.isEmpty()) {
+            sb.append("### Failure kinds\n");
+            sb.append("| kind | count |\n");
+            sb.append("|------|-------|\n");
+            kinds.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                    .limit(8)
+                    .forEach(e -> sb.append("| ").append(e.getKey())
+                            .append(" | ").append(e.getValue()).append(" |\n"));
+            sb.append('\n');
+        }
+    }
+
+    private static String normalizeFailureKind(String kind) {
+        int close = kind.indexOf(']');
+        if (kind.startsWith("[CBSR#") && close >= 0 && close + 1 < kind.length()) {
+            return kind.substring(close + 1);
+        }
+        return kind;
+    }
+
     private static List<Position> collectBoxGoals(Level level) {
         List<Position> out = new ArrayList<>();
         for (int r = 0; r < level.getRows(); r++) {
@@ -285,6 +378,12 @@ public final class FailureSnapshot {
 
     private static Position pickCentre(FailureReport rep, List<Position> goals,
                                        Set<Position> completed) {
+        if (rep != null && rep.blockedPositions != null && !rep.blockedPositions.isEmpty()) {
+            return rep.blockedPositions.get(0);
+        }
+        if (rep != null && rep.blockedGoals != null && !rep.blockedGoals.isEmpty()) {
+            return rep.blockedGoals.get(0);
+        }
         if (rep != null && rep.lastAttemptedSubgoal != null
                 && rep.lastAttemptedSubgoal.goalPos != null) {
             return rep.lastAttemptedSubgoal.goalPos;

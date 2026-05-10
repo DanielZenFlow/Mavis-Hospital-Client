@@ -1,0 +1,272 @@
+1. 先把两句话压缩成最本质的结论
+1.1 关于 dispatcher
+
+Dispatcher 不应该只是“换几个 PP ordering mode 再试一次”，而应该是一个基于 HTN / POP / Subgoal Serialization 思想的结构化调度器：它先看懂任务之间的依赖和资源冲突，再决定 goal 顺序、agent 分工、时间预算和失败后的约束修复。
+
+你现在的 claude.md 里确实显示，顶层 strategy menu 主要是 STRICT_ORDER，也就是 PriorityPlanningStrategy 加不同 OrderingMode，另外还有 SINGLE_AGENT；CBS 和 JointAStar 都不是顶层主策略。这个设计不是错的，但它说明当前 dispatcher 的智能主要还在“换顺序试 PP”，而不是“先建模资源，再调度任务”。
+
+1.2 关于 static feature 和 resource conflict model
+
+Static feature 是“看见地图上有什么”，resource conflict model 是“看见哪些任务会争抢同一个关键资源”；前者属于 LevelAnalyzer 的基础观察，后者应该主要在 Layer 3 建模，并在 Layer 4 被执行和修复。
+
+换句话说：
+
+Layer 3:
+    预测冲突
+    例如：Task A 和 Task B 都要经过同一个 narrow corridor
+
+Layer 4:
+    处理冲突
+    例如：agent 0 和 agent 1 在 t=12 同时想进同一个 cell
+
+你可以这样记：
+
+Layer 3 管“任务之间为什么会冲突”，Layer 4 管“执行时真的撞了怎么办”。
+
+2. 结合课程内容，这部分应该怎么做？
+2.1 Dispatcher 应该从“PP 多次尝试器”升级为“课程式 planner”
+2.1.1 现在的问题是什么？
+
+现在大致是：
+
+LevelAnalyzer 给出：
+    executionOrder
+    coupling degree
+    corridor ratio
+    dependency info
+
+Dispatcher 做：
+    TOPOLOGICAL PP
+    DISTANCE_GREEDY PP
+    DISTANCE_FARTHEST PP
+    RANDOM PP
+    CBSR reorder
+    F7 repair
+
+这已经比普通 PP 强很多。claude.md 里也说明，现在有 warm-start sequence、CBSR、F7-PRE、F7B，而且 CBSR 会从 PP 失败里收集 FailureReport，再学习 OrderingNogood 来重排 subgoal。
+
+但是它的核心动作仍然是：
+
+换一个 ordering mode
+再跑一次 PP
+
+这就是我说的“PP 多次尝试器”。
+
+2.1.2 课程上对应的正确升级方向是什么？
+
+你要把 dispatcher 改成这样：
+
+Slides 04 HTN:
+    把 solve whole level 拆成多个 box-to-goal task
+
+Slides 04 POP:
+    不要一开始就写死线性顺序
+    只记录谁必须在谁前面
+
+Slides 06 Subgoal Serialization:
+    根据依赖图做 goal ordering
+
+Slides 06 PP:
+    执行已经排好的任务序列
+
+Slides 07 CBS:
+    如果失败，不是随机重试
+    而是把失败转化成 constraint / nogood
+
+Slides 08 BDI:
+    每次失败后更新 belief
+    再重新选择 intention，也就是下一轮 dispatch plan
+
+所以 dispatcher 的核心不是“我有哪些 solver”，而是：
+
+我现在知道哪些任务？
+哪些任务必须先做？
+哪些任务共享走廊？
+哪个 agent 应该先让？
+如果失败了，我学到了哪条新约束？
+2.2 具体应该做成什么结构？
+2.2.1 最小可落地版本
+
+你可以不要重写整个系统，只是在 LevelFeatures 里加一个更强的中间结构：
+
+LevelFeatures
+    |
+    +-- staticFeatures
+    |       walls
+    |       goals
+    |       colors
+    |       connected components
+    |       coupling score
+    |
+    +-- taskGraph
+    |       task = move box B to goal G by agent A
+    |       dependency edge
+    |       soft preference edge
+    |
+    +-- resourceGraph
+    |       corridor C used by tasks {T1, T3, T7}
+    |       chokepoint P used by tasks {T2, T5}
+    |       push-bay cell X needed by task T4
+    |
+    +-- failureMemory
+            nogood: T3 must not be before T1
+            blocker: cell X blocked by completed goal G2
+
+然后 dispatcher 不再只是：
+
+try TOPOLOGICAL
+try DISTANCE_GREEDY
+try RANDOM
+
+而是：
+
+1. 从 taskGraph 里拿到可执行 task
+2. 从 resourceGraph 里看哪些 task 共享关键资源
+3. 先选择风险最低、依赖最强、最容易封路的 task
+4. 调用 PP 执行
+5. 如果失败，把失败原因写回 failureMemory
+6. 重新调度
+3. Resource conflict model 到底放 Layer 3 还是 Layer 4？
+3.1 最关键答案
+
+Resource conflict model 的“建模”放在 Layer 3；resource conflict 的“检测、避让、NoOp、重规划”放在 Layer 4。
+
+这是最不容易混乱的分法。
+
+3.2 为什么主要放 Layer 3？
+3.2.1 因为它本质上是“任务分解问题”
+
+资源冲突不是等 agent 真撞上了才存在。很多冲突在静态地图上已经能看出来。
+
+例如：
+
+      corridor
++---+---+---+---+
+| A |   |   | B |
++---+---+---+---+
+
+如果 Task A 和 Task B 都必须经过中间这条 corridor，那么它们还没有开始执行，你就已经知道它们会争抢同一个资源。
+
+这不是 Layer 4 的“实时冲突”，而是 Layer 3 的“任务结构冲突”。
+
+它对应课程里的：
+
+Slides 04 POP:
+    谁必须在谁之前？
+
+Slides 04 HTN:
+    大任务怎么拆成小任务？
+
+Slides 06 Subgoal Serialization:
+    哪些 goal 需要序列化，而不是并行做？
+
+所以 resource conflict model 应该先在 Layer 3 产生。
+
+3.3 Layer 4 负责什么？
+3.3.1 Layer 4 负责具体执行时的时空冲突
+
+Layer 4 不应该重新“理解整张地图”。它应该接收 Layer 3 给出的任务和约束，然后处理执行中的具体碰撞。
+
+例如：
+
+Layer 3 已经知道：
+    Task A 和 Task B 都要用 corridor C
+    所以不要让它们同时执行
+
+Layer 4 具体处理：
+    agent 0 在 t=8 要进 cell (3,4)
+    agent 1 在 t=8 也要进 cell (3,4)
+    所以让 agent 1 NoOp / yield / park
+
+这对应课程里的：
+
+Slides 06 PP:
+    高优先级 agent 先走
+    低优先级 agent 避让
+
+Slides 07 CBS:
+    发现冲突后加 constraint
+    然后重新规划
+
+你们当前代码里也把 ConflictResolver、ConflictDetector、AgentCoordinator、DeadlockBreaker 放在 strategy / coordination 相关位置，这正是 Layer 4 的职责。
+
+4. 最好记的层级模型
+4.1 一句话记忆法
+
+Layer 1 定义世界，Layer 2 找一条路，Layer 3 决定先做什么，Layer 4 决定大家怎么不撞，Layer 5 决定执行中要不要改计划。
+
+4.2 对应课程内容
+Layer	你要记的核心问题	对应课程	在你们项目里对应什么
+Layer 1 Domain	世界规则是什么？	Slides 02 PDDL	State, Action, Level, color constraint, push/pull rules
+Layer 2 Search	单个子任务怎么走？	Slides 01, 03, 05	A*, heuristic, IW(1), BoxSearchPlanner
+Layer 3 Task Decomposition	哪个箱子先去哪个 goal？哪些任务会堵住彼此？	Slides 04, 06	LevelAnalyzer, SubgoalManager, DependencyAnalyzer, resourceGraph
+Layer 4 Coordination	多个 agent 执行时怎么避免撞车？	Slides 06, 07	PP, ConflictResolver, CBSR, AgentCoordinator
+Layer 5 Execution / Monitoring	计划执行失败后怎么更新？	Slides 08	Client loop, FailureReport, replanning
+5. 用字符画把 Layer 3 和 Layer 4 的区别画清楚
+5.1 Layer 3：任务层看的是“资源会不会被共享”
+Task A: move box A to goal A
+        needs corridor C
+
+Task B: move box B to goal B
+        also needs corridor C
+
+
+        [Task A]
+            |
+            v
+      +-------------+
+      | corridor C  |
+      +-------------+
+            ^
+            |
+        [Task B]
+
+
+Layer 3 结论：
+    Task A 和 Task B 不能随便并行。
+    Dispatcher 应该给它们排序，或者安排一个 agent 先 park。
+5.2 Layer 4：协调层看的是“具体 timestep 会不会撞”
+time = 12
+
+agent 0 wants:
+    Move(E) into cell X
+
+agent 1 wants:
+    Move(W) into cell X
+
+
+        agent 0 ---> X <--- agent 1
+
+
+Layer 4 结论：
+    当前 joint action 冲突。
+    需要 NoOp / yield / reservation / replan。
+6. 你现在这两句话应该怎么改成更准确的工程目标？
+6.1 原句 1 的升级版
+
+原句：
+
+目前 dispatcher 的策略空间仍然主要是 PP 的不同 ordering mode。它更像“PP 多次尝试器”，还不完全是“结构化调度器”。
+
+可以改成：
+
+当前 dispatcher 已经具备 PP 多轮尝试、CBSR 修复和随机多样化能力，但它的调度依据仍然偏向 goal ordering；下一步应把它升级为基于 TaskGraph 和 ResourceGraph 的结构化调度器，使每次重试都对应一个明确的任务依赖或资源冲突修复，而不是只更换 ordering mode。
+
+6.2 原句 2 的升级版
+
+原句：
+
+当前更像一组静态 feature，而不是完整的“可调度任务图”。Dispatcher 可能仍然只能拿到粗粒度顺序和 coupling，而不是完整资源冲突模型。
+
+可以改成：
+
+当前 LevelAnalyzer 已经能提取 dependency、executionOrder、immovable box、cross-color barrier 和 coupling degree，但这些信息还需要进一步组织成可调度的 TaskGraph / ResourceGraph；其中 TaskGraph 属于 Layer 3 的任务分解，ResourceGraph 也主要在 Layer 3 建模，而 Layer 4 只负责根据这些结构处理实际执行中的时空冲突。
+
+7. 最后给你一个最适合记忆的总模型
+7.1 课程到项目的一段话总结
+
+这个项目最本质的设计不是“多加几个高级算法”，而是用 PDDL 思想定义正确世界，用 A / heuristic / IW 解决单个子任务，用 HTN / POP / Subgoal Serialization 把整关拆成有依赖的 box-to-goal task，用 PP / CBSR 处理多 agent 冲突，最后用 BDI 式反馈把失败转化成新的 ordering constraint；因此，dispatcher 的升级方向不是“多试几个 PP mode”，而是让 LevelAnalyzer 输出 TaskGraph 和 ResourceGraph，让每一次调度都有明确的任务结构理由。*
+
+7.2 最短记忆版
+
+Layer 3 负责“看懂任务结构并预判资源冲突”，Layer 4 负责“执行时解决真实碰撞”；dispatcher 真正要升级的地方，是从“换 PP 顺序”变成“根据任务图和资源图做调度”。

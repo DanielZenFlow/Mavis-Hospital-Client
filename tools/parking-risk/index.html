@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parking Risk Viewer</title>
+  <link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+  <main class="app">
+    <aside class="panel">
+      <h1>Parking Risk</h1>
+
+      <label class="filePick">
+        <input id="fileInput" type="file" accept=".lvl,text/plain">
+        Load &amp; Compute
+      </label>
+
+      <div id="meta" class="meta">No report loaded</div>
+
+      <div class="groupTabs" id="groupTabs">
+        <button data-group="all"        class="groupBtn active">All</button>
+        <button data-group="levels"     class="groupBtn">levels</button>
+        <button data-group="complevels" class="groupBtn">complevels</button>
+      </div>
+
+      <div id="reportList" class="reportList">Loading reports...</div>
+
+      <section class="controls">
+        <h2>Layers</h2>
+        <label><input type="checkbox" id="showSafe" checked> Safe cells</label>
+        <label><input type="checkbox" id="showCaution" checked> Caution cells</label>
+        <label><input type="checkbox" id="showDanger" checked> Danger cells</label>
+        <label><input type="checkbox" id="showGoals" checked> Goals</label>
+        <label><input type="checkbox" id="showObjects" checked> Initial boxes and agents</label>
+      </section>
+
+      <section class="legend">
+        <div><span class="swatch safe"></span>Safe candidate</div>
+        <div><span class="swatch caution"></span>Caution: current door or corner</div>
+        <div><span class="swatch danger"></span>Danger: static door</div>
+        <div><span class="swatch danger"></span>Occupied door/blocker or gate</div>
+        <div><span class="swatch goal"></span>Goal cell: no parking</div>
+      </section>
+    </aside>
+
+    <section class="boardWrap">
+      <div class="toolbar">
+        <button id="togglePanel" class="toolbarBtn" title="Hide / show sidebar">&laquo;</button>
+        <span id="hoverInfo">Hover a cell</span>
+        <span class="spacer"></span>
+        <button id="resetView" class="toolbarBtn" title="Reset view">Reset</button>
+        <span id="zoomInfo">100%</span>
+      </div>
+      <div id="boards" class="boards">
+        <div id="axisCorner" class="axisCorner"></div>
+        <div id="axisTop" class="axisTop"><div id="axisTopInner" class="axisInner"></div></div>
+        <div id="axisLeft" class="axisLeft"><div id="axisLeftInner" class="axisInner"></div></div>
+        <div id="panViewport" class="panViewport">
+          <div id="panSurface" class="panSurface"></div>
+        </div>
+        <div id="hoverTip" class="hoverTip"></div>
+      </div>
+    </section>
+  </main>
+  <script src="parking-risk-data.js"></script>
+  <script src="viewer.js"></script>
+</body>
+</html>

@@ -237,11 +237,11 @@ public class PlanMerger {
     }
 
     /**
-     * Apply a joint action and return the new state.
-     * Per CLAUDE.md: actions are simultaneous — cell occupancy evaluated at START.
+     * Legacy overload kept for source compatibility. Official joint-action
+     * semantics require a Level for applicability checks.
      */
     public State applyJointAction(Action[] jointAction, State state, int numAgents) {
-        return state.applyJointAction(jointAction, null);
+        throw new IllegalArgumentException("Level is required for official joint-action semantics");
     }
     
     /**

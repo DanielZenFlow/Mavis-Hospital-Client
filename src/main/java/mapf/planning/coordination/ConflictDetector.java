@@ -8,7 +8,7 @@ import java.util.*;
  * Detects conflicts between multiple agents when executing actions simultaneously.
  * 
  * Conflict types:
- * 1. Vertex conflict: Two agents want to occupy the same cell
+ * 1. Vertex conflict: Two moving objects want to occupy the same cell
  * 2. Edge conflict: Two agents want to swap positions (cross each other)
  * 3. Box conflict: Two agents want to move the same box
  * 
@@ -58,7 +58,7 @@ public class ConflictDetector {
      * Types of conflicts.
      */
     public enum ConflictType {
-        /** Two agents want to occupy the same cell */
+        /** Two moving objects want to occupy the same cell */
         VERTEX,
         
         /** Two agents want to swap positions */
@@ -79,7 +79,8 @@ public class ConflictDetector {
     public List<Conflict> detectConflicts(State state, Action[] actions, Level level) {
         List<Conflict> conflicts = new ArrayList<>();
         
-        // Calculate resulting positions for each agent
+        // Calculate intended destinations for individually applicable actions only.
+        // Inapplicable actions are equivalent to NoOp under the hospital domain.
         Position[] currentPositions = new Position[actions.length];
         Position[] newPositions = new Position[actions.length];
         Position[] boxFromPositions = new Position[actions.length]; // Where box was
@@ -95,6 +96,10 @@ public class ConflictDetector {
             }
             
             Action action = actions[i];
+            if (action.type != Action.ActionType.NOOP && !state.isApplicable(action, i, level)) {
+                newPositions[i] = agentPos;
+                continue;
+            }
             
             switch (action.type) {
                 case NOOP:
@@ -122,7 +127,8 @@ public class ConflictDetector {
         // Check for vertex conflicts (two agents in same cell)
         for (int i = 0; i < actions.length; i++) {
             for (int j = i + 1; j < actions.length; j++) {
-                if (newPositions[i] != null && newPositions[i].equals(newPositions[j])) {
+                if (isMoving(actions[i]) && isMoving(actions[j])
+                        && newPositions[i] != null && newPositions[i].equals(newPositions[j])) {
                     conflicts.add(new Conflict(ConflictType.VERTEX, i, j, newPositions[i]));
                 }
             }
@@ -152,6 +158,16 @@ public class ConflictDetector {
                 }
             }
         }
+
+        // Check for box destination conflicts (two boxes into the same cell)
+        for (int i = 0; i < actions.length; i++) {
+            for (int j = i + 1; j < actions.length; j++) {
+                if (boxToPositions[i] != null && boxToPositions[j] != null &&
+                    boxToPositions[i].equals(boxToPositions[j])) {
+                    conflicts.add(new Conflict(ConflictType.VERTEX, i, j, boxToPositions[i]));
+                }
+            }
+        }
         
         // Check for agent-box conflicts (agent moves into box destination)
         for (int i = 0; i < actions.length; i++) {
@@ -166,6 +182,10 @@ public class ConflictDetector {
         }
         
         return conflicts;
+    }
+
+    private static boolean isMoving(Action action) {
+        return action != null && action.type != Action.ActionType.NOOP;
     }
     
     /**

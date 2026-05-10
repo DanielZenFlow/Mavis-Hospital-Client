@@ -242,7 +242,7 @@ public class JointAStar {
      * Per CLAUDE.md: cell occupancy evaluated at START of timestep.
      */
     private State applyJointAction(State state, Action[] actions) {
-        return state.applyJointAction(actions, null);
+        return state.applyJointAction(actions, level);
     }
     
     /**

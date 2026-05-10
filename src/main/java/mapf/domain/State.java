@@ -313,84 +313,134 @@ public class State {
      * @return the new state after all actions are applied simultaneously
      */
     public State applyJointAction(Action[] jointAction, Level level) {
+        if (level == null) {
+            throw new IllegalArgumentException("Level is required for official joint-action semantics");
+        }
+
         Position[] newAgentPositions = Arrays.copyOf(agentPositions, agentPositions.length);
         Map<Position, Character> newBoxes = new HashMap<>(boxes);
-        
-        // Phase 1: Compute all moves based on the CURRENT state (before any changes)
-        // Store deferred box operations to apply atomically
-        List<Position> boxRemovePositions = new ArrayList<>();
-        List<Position> boxAddPositions = new ArrayList<>();
-        List<Character> boxAddTypes = new ArrayList<>();
-        
+
+        boolean[] applicable = new boolean[jointAction.length];
+        boolean[] conflicted = new boolean[jointAction.length];
+        Position[] agentToPositions = new Position[jointAction.length];
+        Position[] boxFromPositions = new Position[jointAction.length];
+        Position[] boxToPositions = new Position[jointAction.length];
+        Character[] boxTypes = new Character[jointAction.length];
+
+        // Phase 1: evaluate every individual action against the START state.
         for (int agentId = 0; agentId < jointAction.length; agentId++) {
             Action action = jointAction[agentId];
             if (action == null || action.type == Action.ActionType.NOOP) {
-                continue;
-            }
-            
-            Position agentPos = agentPositions[agentId]; // Always read from ORIGINAL state
-
-            // Defensive: skip joint-action entries that would push the agent / box
-            // OUT OF GRID. applyJointAction historically trusted callers, and the
-            // legacy stuck-recovery flow expects "occupied-cell" inapplicability to
-            // pass through (so it can detect a stall and recover). But out-of-grid
-            // moves silently corrupt the state (e.g. agent at row=-8) and poison
-            // every downstream BSP / heuristic lookup with ArrayIndexOutOfBoundsException.
-            // We only block out-of-grid here; other inapplicabilities are left alone.
-            if (isJointActionOutOfGrid(action, agentPos, level)) {
-                logOutOfGridJointActionOnce(agentId, action, agentPos, level);
+                applicable[agentId] = true;
                 continue;
             }
 
+            Position agentPos = agentPositions[agentId];
+            if (agentPos == null) {
+                logInapplicableJointActionOnce(agentId, action, null);
+                continue;
+            }
+
+            if (!isApplicable(action, agentId, level)) {
+                if (isJointActionOutOfGrid(action, agentPos, level)) {
+                    logOutOfGridJointActionOnce(agentId, action, agentPos, level);
+                } else if ((action.type == Action.ActionType.PUSH || action.type == Action.ActionType.PULL)
+                        && !hasBoxAt(getJointActionBoxSource(action, agentPos))) {
+                    logBoxMismatchOnce(agentId, action, agentPos, getJointActionBoxSource(action, agentPos));
+                } else {
+                    logInapplicableJointActionOnce(agentId, action, agentPos);
+                }
+                continue; // Official semantics: inapplicable action is NoOp.
+            }
+
+            applicable[agentId] = true;
             switch (action.type) {
-                case MOVE: {
-                    newAgentPositions[agentId] = agentPos.move(action.agentDir);
+                case MOVE:
+                    agentToPositions[agentId] = agentPos.move(action.agentDir);
                     break;
-                }
-                case PUSH: {
+                case PUSH:
                     Position boxPos = agentPos.move(action.agentDir);
-                    Position newBoxPos = boxPos.move(action.boxDir);
-                    newAgentPositions[agentId] = boxPos;
-                    // Read box type from ORIGINAL boxes map
-                    Character boxType = boxes.get(boxPos);
-                    if (boxType != null) {
-                        boxRemovePositions.add(boxPos);
-                        boxAddPositions.add(newBoxPos);
-                        boxAddTypes.add(boxType);
-                    } else {
-                        logBoxMismatchOnce(agentId, action, agentPos, boxPos);
-                    }
+                    agentToPositions[agentId] = boxPos;
+                    boxFromPositions[agentId] = boxPos;
+                    boxToPositions[agentId] = boxPos.move(action.boxDir);
+                    boxTypes[agentId] = boxes.get(boxPos);
                     break;
-                }
-                case PULL: {
-                    Position newAgentPos = agentPos.move(action.agentDir);
-                    Position boxPos = agentPos.move(action.boxDir.opposite());
-                    newAgentPositions[agentId] = newAgentPos;
-                    // Read box type from ORIGINAL boxes map
-                    Character boxType = boxes.get(boxPos);
-                    if (boxType != null) {
-                        boxRemovePositions.add(boxPos);
-                        boxAddPositions.add(agentPos); // Box moves to agent's old position
-                        boxAddTypes.add(boxType);
-                    } else {
-                        logBoxMismatchOnce(agentId, action, agentPos, boxPos);
-                    }
+                case PULL:
+                    agentToPositions[agentId] = agentPos.move(action.agentDir);
+                    boxFromPositions[agentId] = agentPos.move(action.boxDir.opposite());
+                    boxToPositions[agentId] = agentPos;
+                    boxTypes[agentId] = boxes.get(boxFromPositions[agentId]);
                     break;
-                }
                 default:
                     break;
             }
         }
-        
-        // Phase 2: Apply all box changes atomically
-        for (Position removePos : boxRemovePositions) {
-            newBoxes.remove(removePos);
+
+        // Phase 2: conflicts are also evaluated over intended destinations from
+        // the START state. Any involved agent fails and therefore performs NoOp.
+        for (int i = 0; i < jointAction.length; i++) {
+            if (!applicable[i] || isNoOp(jointAction[i])) continue;
+            for (int j = i + 1; j < jointAction.length; j++) {
+                if (!applicable[j] || isNoOp(jointAction[j])) continue;
+
+                if (sameNonNull(boxFromPositions[i], boxFromPositions[j])
+                        || movingObjectsShareDestination(agentToPositions[i], boxToPositions[i],
+                                                         agentToPositions[j], boxToPositions[j])) {
+                    conflicted[i] = true;
+                    conflicted[j] = true;
+                }
+            }
         }
-        for (int i = 0; i < boxAddPositions.size(); i++) {
-            newBoxes.put(boxAddPositions.get(i), boxAddTypes.get(i));
+
+        // Phase 3: apply every individually applicable, non-conflicting action atomically.
+        for (int agentId = 0; agentId < jointAction.length; agentId++) {
+            if (!applicable[agentId] || conflicted[agentId] || isNoOp(jointAction[agentId])) {
+                continue;
+            }
+
+            Action action = jointAction[agentId];
+            switch (action.type) {
+                case MOVE:
+                    newAgentPositions[agentId] = agentToPositions[agentId];
+                    break;
+                case PUSH:
+                case PULL:
+                    newAgentPositions[agentId] = agentToPositions[agentId];
+                    newBoxes.remove(boxFromPositions[agentId]);
+                    newBoxes.put(boxToPositions[agentId], boxTypes[agentId]);
+                    break;
+                default:
+                    break;
+            }
         }
-        
+
         return new State(newAgentPositions, newBoxes, true);
+    }
+
+    private static boolean isNoOp(Action action) {
+        return action == null || action.type == Action.ActionType.NOOP;
+    }
+
+    private static boolean sameNonNull(Position a, Position b) {
+        return a != null && a.equals(b);
+    }
+
+    private static boolean movingObjectsShareDestination(Position agentToA, Position boxToA,
+                                                        Position agentToB, Position boxToB) {
+        return sameNonNull(agentToA, agentToB)
+                || sameNonNull(agentToA, boxToB)
+                || sameNonNull(boxToA, agentToB)
+                || sameNonNull(boxToA, boxToB);
+    }
+
+    private static Position getJointActionBoxSource(Action action, Position agentPos) {
+        if (action.type == Action.ActionType.PUSH) {
+            return agentPos.move(action.agentDir);
+        }
+        if (action.type == Action.ActionType.PULL) {
+            return agentPos.move(action.boxDir.opposite());
+        }
+        return null;
     }
 
     /** First-time stderr warning when a joint action contains a non-applicable entry. */
@@ -463,7 +513,7 @@ public class State {
         System.err.println("[State.applyJointAction] Box-source mismatch: agent " + agentId
                 + " at " + agentPos + " ; action=" + action
                 + " ; expected box at " + boxPos + " but none found"
-                + " -- treating as NoOp for the box effect.");
+                + " -- treating action as NoOp.");
         StackTraceElement[] st = Thread.currentThread().getStackTrace();
         int n = Math.min(st.length, 12);
         for (int i = 1; i < n; i++) {

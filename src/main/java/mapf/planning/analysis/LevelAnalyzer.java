@@ -264,20 +264,21 @@ public class LevelAnalyzer {
                 : immovableBoxes;
             
             boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0);
-            Position localRoot = findLocalRoot(goalJ, level, effectiveImpassable);
-            if (localRoot == null) continue;
+            List<Position> serviceRoots = findServiceRoots(goalJ, level, state,
+                    servicingColor, effectiveImpassable);
+            if (serviceRoots.isEmpty()) continue;
             
             for (Position goalI : goals) {
                 if (goalI.equals(goalJ)) continue;
                 
                 boolean canReachGoalJ;
                 if (isAgentGoal) {
-                    canReachGoalJ = isReachableWithHypotheticalBlock(
-                        localRoot, goalJ, level, goalI, Collections.emptySet(), effectiveImpassable);
+                    canReachGoalJ = anyRootReachableWithHypotheticalBlock(
+                        serviceRoots, goalJ, level, goalI, Collections.emptySet(), effectiveImpassable);
                 } else {
                     List<Position> candidateBoxes = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
-                    canReachGoalJ = canPushBoxToGoalWithBlock(goalJ, goalI, level, Collections.emptySet(), 
-                                                              effectiveImpassable, localRoot, candidateBoxes);
+                    canReachGoalJ = canPushBoxToGoalWithBlockAnyRoot(goalJ, goalI, level, Collections.emptySet(),
+                                                              effectiveImpassable, serviceRoots, candidateBoxes);
                 }
                 
                 if (!canReachGoalJ) {
@@ -319,13 +320,13 @@ public class LevelAnalyzer {
                         blockedPair.add(agentBodyPos);
                         boolean canReachWithBody;
                         if (isAgentGoal) {
-                            canReachWithBody = isReachableWithMultipleBlocks(
-                                localRoot, goalJ, level, blockedPair, Collections.emptySet(), effectiveImpassable);
+                            canReachWithBody = anyRootReachableWithMultipleBlocks(
+                                serviceRoots, goalJ, level, blockedPair, Collections.emptySet(), effectiveImpassable);
                         } else {
                             List<Position> candidateBoxes2 = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
-                            canReachWithBody = canPushBoxToGoalWithMultipleBlocks(
+                            canReachWithBody = canPushBoxToGoalWithMultipleBlocksAnyRoot(
                                 goalJ, blockedPair, level, Collections.emptySet(),
-                                effectiveImpassable, localRoot, candidateBoxes2);
+                                effectiveImpassable, serviceRoots, candidateBoxes2);
                         }
                         if (canReachWithBody) {
                             allBodyPositionsBlock = false;
@@ -381,8 +382,9 @@ public class LevelAnalyzer {
                 ? effectiveImpassableByColor.get(servicingColor) 
                 : immovableBoxes;
              
-             Position localRoot = findLocalRoot(goalJ, level, effectiveImpassable);
-             if (localRoot == null) continue;
+             List<Position> serviceRoots = findServiceRoots(goalJ, level, state,
+                     servicingColor, effectiveImpassable);
+             if (serviceRoots.isEmpty()) continue;
              
              boolean isAgentGoal = (level.getAgentGoal(goalJ.row, goalJ.col) >= 0);
 
@@ -403,12 +405,12 @@ public class LevelAnalyzer {
                      
                      boolean canReachGoalJ;
                      if (isAgentGoal) {
-                          canReachGoalJ = isReachableWithHypotheticalBlock(
-                            localRoot, goalJ, level, null, tempWalls, effectiveImpassable);
+                          canReachGoalJ = anyRootReachableWithHypotheticalBlock(
+                            serviceRoots, goalJ, level, null, tempWalls, effectiveImpassable);
                      } else {
                           List<Position> candidateBoxes = findCandidateBoxes(goalJ, level, state, effectiveImpassable);
-                          canReachGoalJ = canPushBoxToGoalWithBlock(goalJ, null, level, tempWalls, 
-                                                                  effectiveImpassable, localRoot, candidateBoxes);
+                          canReachGoalJ = canPushBoxToGoalWithBlockAnyRoot(goalJ, null, level, tempWalls,
+                                                                  effectiveImpassable, serviceRoots, candidateBoxes);
                      }
                      
                      if (canReachGoalJ) {
@@ -738,6 +740,41 @@ public class LevelAnalyzer {
         }
         return null;
     }
+
+    /**
+     * Dependency checks must start from the side where a real servicing agent can
+     * stand. A local root inside a sealed pocket makes pocket goals look reachable
+     * even when the entrance goal has already been filled and frozen.
+     */
+    private static List<Position> findServiceRoots(Position goalPos, Level level, State state,
+                                                   Color servicingColor,
+                                                   Set<Position> effectiveImpassable) {
+        List<Position> roots = new ArrayList<>();
+        Set<Position> seen = new HashSet<>();
+
+        int agentGoal = level.getAgentGoal(goalPos.row, goalPos.col);
+        if (agentGoal >= 0) {
+            addServiceRoot(roots, seen, state.getAgentPosition(agentGoal), level, effectiveImpassable);
+        } else if (servicingColor != null) {
+            for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+                if (servicingColor.equals(level.getAgentColor(agentId))) {
+                    addServiceRoot(roots, seen, state.getAgentPosition(agentId), level, effectiveImpassable);
+                }
+            }
+        }
+
+        if (roots.isEmpty()) {
+            Position localRoot = findLocalRoot(goalPos, level, effectiveImpassable);
+            if (localRoot != null) roots.add(localRoot);
+        }
+        return roots;
+    }
+
+    private static void addServiceRoot(List<Position> roots, Set<Position> seen,
+                                       Position pos, Level level, Set<Position> effectiveImpassable) {
+        if (pos == null || level.isWall(pos) || effectiveImpassable.contains(pos)) return;
+        if (seen.add(pos)) roots.add(pos);
+    }
     
     /**
      * Finds a local root within the same connected component as goalPos,
@@ -831,6 +868,18 @@ public class LevelAnalyzer {
         }
 
         return anyBoxViable;
+    }
+
+    private static boolean canPushBoxToGoalWithBlockAnyRoot(Position goalPos, Position blockedPos,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes,
+            List<Position> openSpaceRoots, List<Position> candidateBoxes) {
+        for (Position root : openSpaceRoots) {
+            if (canPushBoxToGoalWithBlock(goalPos, blockedPos, level, movableBoxPositions,
+                    immovableBoxes, root, candidateBoxes)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -944,6 +993,17 @@ public class LevelAnalyzer {
         return false;
     }
 
+    private static boolean anyRootReachableWithHypotheticalBlock(List<Position> starts, Position target,
+            Level level, Position blockedPos, Set<Position> movableBoxPositions, Set<Position> immovableBoxes) {
+        for (Position start : starts) {
+            if (isReachableWithHypotheticalBlock(start, target, level, blockedPos,
+                    movableBoxPositions, immovableBoxes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Checks if target is reachable from start with MULTIPLE hypothetical blocks.
      * Used for agent-body dependency detection: when Pulling a box to a goal position,
@@ -979,6 +1039,18 @@ public class LevelAnalyzer {
         }
         return false;
     }
+
+    private static boolean anyRootReachableWithMultipleBlocks(List<Position> starts, Position target,
+            Level level, Set<Position> blockedPositions, Set<Position> movableBoxPositions,
+            Set<Position> immovableBoxes) {
+        for (Position start : starts) {
+            if (isReachableWithMultipleBlocks(start, target, level, blockedPositions,
+                    movableBoxPositions, immovableBoxes)) {
+                return true;
+            }
+        }
+        return false;
+    }
     
     /**
      * Checks if a box can reach its goal with MULTIPLE hypothetical blocks.
@@ -1006,6 +1078,18 @@ public class LevelAnalyzer {
             // Local feasibility check with multiple blocks
             if (checkLocalEntryFeasibilityMultiBlock(goalPos, blockedPositions, level,
                     movableBoxPositions, immovableBoxes, openSpaceRoot)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean canPushBoxToGoalWithMultipleBlocksAnyRoot(Position goalPos, Set<Position> blockedPositions,
+            Level level, Set<Position> movableBoxPositions, Set<Position> immovableBoxes,
+            List<Position> openSpaceRoots, List<Position> candidateBoxes) {
+        for (Position root : openSpaceRoots) {
+            if (canPushBoxToGoalWithMultipleBlocks(goalPos, blockedPositions, level,
+                    movableBoxPositions, immovableBoxes, root, candidateBoxes)) {
                 return true;
             }
         }

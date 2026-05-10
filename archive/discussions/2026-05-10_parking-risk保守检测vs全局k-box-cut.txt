@@ -1,0 +1,329 @@
+1. 先给严格结论
+1.1 你的怀疑是对的
+
+“看两个 box 是否共同堵门”如果被做成全局枚举规则，确实很弱，而且会立刻滑向一个无底洞：既然看 2 个，那为什么不看 3 个、4 个、5 个？这条路不应该作为主设计。
+
+所以我现在会修正前面的说法：
+
+不要把 parking_risk.py 扩展成“枚举多个 box 共同形成割集”的全局分析器。原来的 py 文件作为一个保守的 parking-risk 检测器是比较稳妥的，应该保留它的主逻辑；真正需要补的不是全局 k-box cut 检测，而是在具体任务和具体 P_temp 上做 task-conditioned 检查。
+
+2. 原来的 py 文件到底稳妥在哪里？
+2.1 它的目标很窄，所以相对稳妥
+
+parking_risk.py 的说明写得很清楚：它是为了调试 temporary box parking choices，也就是调试“临时把箱子停在哪里是否危险”；它标记的是“如果把箱子停在那里，会不会关闭 door-like cell”的风险。
+
+这说明它原本不是完整的 Layer 3 依赖分析器，也不是完整的 ResourceGraph。
+
+它更像一个工具：
+
+给我一张地图。
+告诉我哪些空格不适合拿来当 P_temp。
+
+这个定位是合理的。
+
+2.2 它的检测逻辑是保守的
+
+它主要做了几件事：
+
+1. static_ap:
+   在墙体结构里找单格门口。
+
+2. dynamic_ap:
+   把初始 boxes 当作障碍，再找当前布局下的单格门口。
+
+3. occupied_risks:
+   对已经被 box / agent / goal 占住的位置做有限检查。
+
+代码里 static_ap = articulation_points(rows, cols, walls, immovable)，dynamic_ap = articulation_points(rows, cols, walls, boxes)，说明它主要使用的是“单个格子是不是 articulation point”的检测；occupied cell 也只是做单格 opened test，例如 component_sizes_if_opened(cell, ...)。
+
+这个设计的优点是：
+
+低噪音。
+容易解释。
+不会陷入组合爆炸。
+适合作为 offline report。
+
+所以，作为 parking-risk report，它是稳妥的。
+
+3. 它不稳妥的地方在哪里？
+3.1 它不是完整任务依赖分析
+
+它会漏掉一些人类看起来明显的结构风险，比如“两个 box 一起堵住一条门”。但这不是因为它写错了，而是因为它的任务本来就不是完整判断“哪些 box 必须先移开”。
+
+Hospital domain 里，一个 cell 当前是否 free 取决于它有没有 wall、agent、box；Move、Push、Pull 都依赖当前 occupied / free 状态。也就是说，box 和 agent 的确会在某个状态里阻塞行动。
+
+但是 box 又不是墙，因为它可以被同色 agent push / pull。claude.md 也强调 agent 只能移动同色 box，并且 push / pull / NoOp 是正式动作。
+
+所以不能简单说：
+
+这个 box 在门口，所以它一定是危险点。
+
+更严谨的说法是：
+
+这个 box 当前占据了一个可能重要的位置。
+但它是否真的必须被移开，要看具体任务是否需要经过这里。
+4. 为什么“检测两个 box 共同堵门”会把我们带进漏洞？
+4.1 这个漏洞叫“全局结构枚举陷阱”
+
+如果我们加一个规则：
+
+检测两个相邻 box 是否共同堵门。
+
+下一步马上会出现：
+
+那三个 box 呢？
+四个 box 呢？
+一排 box 呢？
+一个 L 形 box cluster 呢？
+一个 agent + 两个 box 呢？
+不同颜色的 box 组合呢？
+
+这就是你说的“无限递归”的感觉。
+
+严格图论上，这不是递归，而是 k-vertex cut 枚举问题。简单说：
+
+1 个点造成断开：割点。
+2 个点造成断开：2 点割集。
+3 个点造成断开：3 点割集。
+k 个点造成断开：k 点割集。
+
+如果你想在全图里枚举所有 k 点割集，复杂度会迅速爆炸，而且会产生很多与任务无关的结果。
+
+4.2 它还会制造大量误报
+
+假设某三个 box 的确隔开了一个区域。
+
+但这个区域里可能没有：
+
+未完成 goal
+需要搬的 box
+需要通过的 agent
+push / pull 操作位
+
+那它从图论上是一个 cut，但从任务上没有意义。
+
+所以全局枚举会让系统得到很多“看起来很聪明但实际没用”的风险点。
+
+这正是我们要避免的。
+
+5. 跳出来看：我们真正要解决的不是“找所有门”
+5.1 真正问题是什么？
+
+真正问题不是：
+
+地图上所有可能的门在哪里？
+
+真正问题是：
+
+对于当前要完成的任务，哪些位置不能被占？
+对于当前选的 P_temp，放一个 box 上去会不会让未完成任务做不了？
+对于当前卡住的任务，哪个具体 box 是 blocker？
+
+这三个问题才是 planner 需要的。
+
+5.2 所以判断应该从“全局图论”转向“任务条件”
+
+你应该把分析方式从：
+
+全局找所有危险结构
+
+改成：
+
+对具体任务做可达性检查
+
+比如当前任务是：
+
+agent 8 要移动 A box 到 A goal
+
+那我们只问：
+
+agent 8 能不能到 A box 的操作位置？
+A box 能不能到 A goal？
+必要的 push / pull 站位是否可达？
+如果把 candidate P_temp 当成障碍，这些还成立吗？
+
+这个叫 task-conditioned check。
+
+中文可以记成：
+
+带着任务去检查，而不是脱离任务去猜危险点。
+
+6. 那 (14,6)、(14,7) 应该怎么处理？
+6.1 不要把它们当成两个普通 danger cell
+
+如果它们初始就是 box 位置，那它们不是普通可选 P_temp。它们本来就被占着。
+
+所以不要粗暴输出：
+
+(14,6) danger
+(14,7) danger
+
+这会混淆语义。
+
+6.2 也不要全局枚举“两个 box 共同堵门”
+
+这条路会进入 k-cut 枚举陷阱。
+
+所以不要做成：
+
+遍历所有 2 个 box 组合。
+再遍历所有 3 个 box 组合。
+再遍历所有 4 个 box 组合。
+
+这个方向应该停下。
+
+6.3 正确做法：只在具体任务失败时验证它们是否是 blocker
+
+如果某个任务失败，比如：
+
+agent 8 到不了目标区域
+
+这时再问：
+
+如果把 (14,6) 的 K 移开，任务是否恢复？
+如果把 (14,7) 的 L 移开，任务是否恢复？
+如果两个都移开才恢复，那么它们是这个任务的 blocking set。
+
+注意，这不是全局风险枚举，而是围绕一个失败任务做诊断。
+
+这就严谨很多。
+
+7. 应该保留原 py 文件吗？
+7.1 我的判断
+
+应该保留原 py 文件的主逻辑，不要把它大改成多 box 割集枚举器。
+
+因为它现在做的是：
+
+单格门口风险
+当前布局下的单格门口
+单个 occupied box 打开后是否连接区域
+corner risk
+
+这些都是低成本、可解释、低噪音的检查。代码里对 free candidate 会记录 static-door、current-door、corner 等原因，对 occupied cell 也只在有明确理由时进入 occupiedRisks。
+
+这很适合作为 parking report。
+
+7.2 但是要改它的说明边界
+
+它不应该被理解成：
+
+完整 ResourceGraph
+完整依赖分析
+完整 blocker detector
+
+它应该被理解成：
+
+parking candidate 的静态风险预筛器
+
+也就是说，它只负责给 P_temp 选择提供静态 warning，不负责决定“哪些 box 必须先搬”。
+
+8. 真正应该补在哪里？
+8.1 补在 P_temp validator
+
+当系统想把某个 blocker 停到 P_temp 时，不要问：
+
+这个 P_temp 是不是全局危险点？
+
+而要问：
+
+把 box 放到这个 P_temp 后，所有未完成真实任务是否仍然可服务？
+
+这个检查更直接，也更有价值。
+
+例如：
+
+candidate P_temp = X
+
+临时把 X 当成 blocked。
+然后检查：
+    未完成 goal 的服务路径是否还存在？
+    agent 是否还能到同色 box？
+    box 是否还有到 goal 的路径？
+    push / pull 操作位是否还可达？
+
+这比枚举 2-box、3-box、4-box cut 更稳。
+
+8.2 补在 BlockerReliefSynthesizer
+
+当某个任务卡住时，NAMO 不应该全局找“可能的门”。
+
+它应该围绕失败任务生成证据：
+
+当前任务 T 失败。
+失败原因是 agent 到不了某个区域。
+BFS frontier 被哪些 occupied cells 挡住？
+这些 occupied cells 中，哪些是可移动 box？
+移开哪个 box 后，T 的可达性恢复？
+
+这样得到的 blocker 是“有证据的 blocker”，而不是全局猜出来的 blocker。
+
+8.3 补在 failure memory
+
+如果某个 P_temp 失败了，就记录：
+
+bad P_temp:
+    box = L
+    pTemp = X
+    reason = blocks task T
+
+这比记录“某个位置是全局危险点”更准确。
+
+9. 严谨设计应该是三层，而不是一个大检测器
+9.1 第一层：静态预筛
+
+这一层就是现在的 parking_risk.py。
+
+目的：
+    快速找明显不适合停车的位置。
+
+方法：
+    单点 articulation
+    当前 box 作为障碍的 dynamic articulation
+    corner risk
+    单 box opened test
+
+保留。
+
+9.2 第二层：候选 P_temp 验证
+
+这一层在 planner 里做，不是 offline report。
+
+目的：
+    判断这个具体 P_temp 能不能用。
+
+方法：
+    把 candidate P_temp 当障碍。
+    检查未完成任务是否仍可服务。
+
+这是现在最该补的。
+
+9.3 第三层：失败后的 blocker 诊断
+
+这一层在 NAMO / Layer 3.5 做。
+
+目的：
+    当前任务被挡住时，找出真正 blocker。
+
+方法：
+    不是全图枚举 cut。
+    而是围绕失败任务，测试哪些 occupied cells 导致不可达。
+
+这才是严谨 blocker evidence。
+
+10. 最终结论
+10.1 一句话结论
+
+不要把 parking_risk.py 升级成“检测 2 个、3 个、4 个 box 共同堵门”的全局割集分析器；这会进入组合爆炸和误报陷阱。原来的单点风险检测作为 parking 预筛是稳妥的，应该保留。真正要补的是：在具体 P_temp 被选择时做任务可服务性检查，在具体任务失败时做 blocker evidence 诊断。
+
+10.2 对你这个质疑的评价
+
+你的质疑非常有价值，因为你指出了我们刚才分析里的一个危险倾向：
+
+我们试图用越来越复杂的全局图论检测，去解决本来应该由“具体任务可达性检查”解决的问题。
+
+这就是要跳出来看的点。
+
+10.3 最短记忆版
+
+py 文件负责“预警”，不要负责“判案”；真正判定某个 box 是否堵门，必须带着具体任务去检查。

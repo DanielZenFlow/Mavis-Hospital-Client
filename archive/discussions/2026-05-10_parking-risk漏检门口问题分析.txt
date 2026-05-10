@@ -1,0 +1,213 @@
+1. 先给你一个客观结论
+1.1 你的质疑是有道理的
+
+你的质疑基本成立：这个 parking_risk.py 的当前分析逻辑确实容易漏掉“初始时被 box / agent 占据的关键门口”。尤其是 (14,6) 和 (14,7) 这种位置，如果从人类视角看它们是一个被箱子占住的通道入口，那么它们不一定会被当前的 articulation-point 检测标成关节点。
+
+但我会更精确地说：
+
+问题不只是“没有把一开始被 agent / box 占据的位置作为 risk spot”，而是当前代码主要检测“单个空格被占后会不会切断地图”，以及“单个已占格打开后会不会连接区域”；它还不够检测“两个相邻已占格共同构成一个门 / bottleneck / blocked gate”。
+
+2. 具体到 (14,6) 和 (14,7)：它们是什么？
+2.1 ISO 初始地图里这两个格子不是空格
+
+我检查了生成出来的 ISO report。第 14 行是：
+
+++++++KL++                    ++            +
+
+所以：
+
+(14,6) = K box
+(14,7) = L box
+
+也就是说，(14,6) 和 (14,7) 不是普通 free cell，而是初始时就被两个 box 占住的格子。
+
+这点很关键，因为当前代码会把 initial 里的数字识别为 agent，把大写字母识别为 box，并把这些坐标放进 _sets["boxes"] 和 _sets["agents"]。
+
+3. 为什么代码可能漏掉它们？
+3.1 第一层原因：dynamic_ap 把 box 当作墙，所以 box 所在格子不会成为图里的点
+
+代码这里做了两种 articulation point：
+
+static_ap = articulation_points(rows, cols, walls, immovable)
+dynamic_ap = articulation_points(rows, cols, walls, boxes)
+
+static_ap 只把墙和 immovable box 当障碍；dynamic_ap 把所有初始 boxes 都当障碍。
+
+而 articulation_points() 只会把 passable() 的格子加入图。passable() 的定义是：这个格子不能是 wall，也不能在 extra_walls 里。
+
+所以在 dynamic_ap 里，(14,6) 和 (14,7) 因为是 box，被放进 extra_walls = boxes，它们根本不作为图里的节点存在。
+
+换句话说：
+
+dynamic articulation 检测的是“当前箱子布局下，哪些空格是门口”，不是“哪些被箱子占住的位置本身是门口”。
+
+3.2 第二层原因：occupied cell 分支只做了很有限的补救
+
+代码确实有一段逻辑会处理 occupied cell：
+
+if p in boxes or p in agents or p in goals:
+    ...
+
+但它只在两个情况下把 occupied cell 加入 occupied_risks：
+
+情况一：
+    p 本身在 static_ap 里
+
+情况二：
+    p 是 box，并且打开这个 box 后，会连接两个以上 separated walking regions
+
+也就是说，它不是无条件把“初始被 box / agent 占据的门口”标成风险，而是要求它满足很特定的图论条件。
+
+这就会漏掉一种很常见的人类直觉风险：
+
+两个 box 一起堵住一个 2-cell gate：
+    (14,6) = K
+    (14,7) = L
+
+如果只临时打开 (14,6)，(14,7) 还堵着；如果只打开 (14,7)，(14,6) 还堵着。于是单格测试可能看不出明显分裂或连接。
+
+但是人类会看到：
+
+这两个格子作为一组，是一个被堵住的门口。
+
+4. 所以你的判断具体哪里对？
+4.1 你说“代码没有考虑一开始被 agent / box 占据的位置应该作为 risk spot”，这句话大方向对
+
+当前代码对 free cell 的风险分析更强，对 occupied cell 的风险分析更弱。
+
+它对 free cell 会检查：
+
+static articulation
+dynamic articulation
+corner
+
+但对 occupied cell，它不会继续作为普通 candidate 分析，而是进入 occupied 分支；如果没有触发 p in static_ap 或 component_sizes_if_opened(p) >= 2，它就直接跳过。
+
+所以你的质疑可以改得更精确一点：
+
+当前代码没有充分把“初始被 movable box / agent 占据的关键通道格”建模为 risk spot，尤其没有检测一组 occupied cells 共同构成的门口风险。
+
+这比单纯说“没有考虑 occupied position”更准确。
+
+5. 为什么人类会觉得 (14,6) 和 (14,7) 是割点，但代码不觉得？
+5.1 因为人类看的不是数学上的“单点割点”
+
+你的人类视角很可能看的是：
+
+这两个格子堵住了一条关键通道。
+如果它们不处理，某些区域就过不去。
+如果以后把别的箱子停在这里，也会很危险。
+
+但代码里的 articulation point 是更狭窄的定义：
+
+移除单个 passable cell 后，图是否分裂？
+
+这两者不完全一样。
+
+5.2 (14,6) 和 (14,7) 更像“割集”而不是“割点”
+
+这是最关键的概念。
+
+割点：
+    一个格子单独决定连通性
+
+割集：
+    一组格子共同决定连通性
+
+(14,6) 和 (14,7) 很可能不是单独一个格子的割点，而是：
+
+两个格子共同构成一个 2-cell gate / 2-cell cut。
+
+代码现在主要检测单点 articulation，不检测 2-cell cut。所以它漏掉你人类视角看到的风险是很合理的。
+
+6. 这是不是说明 py 文件错了？
+6.1 不是“完全错”，而是“检测目标太窄”
+
+这个脚本的 docstring 说它是为了 debug temporary box parking choices，标出“parking a box there would close a door-like cell”的风险。
+
+所以它目前更像一个：
+
+parking risk detector
+
+不是完整的：
+
+blocked gate / occupied chokepoint / resource graph detector
+
+它能发现很多“不要把箱子停在这个空格”的风险，但对“初始就被箱子占住的一组关键格子”还不够强。
+
+7. 我建议怎么改？
+7.1 不要只加一个 if，要补一个新的分析类别
+
+你不应该只写：
+
+if p in boxes or p in agents:
+    mark risk
+
+因为不是所有初始 box / agent 都是 risk spot。那样会产生太多噪音。
+
+更合理的是增加一个新类别：
+
+occupied gate risk
+
+它专门回答：
+
+这个初始被占据的位置，或者这一组初始被占据的位置，是不是堵住了重要通道？
+
+7.2 最小可行改法
+7.2.1 单格版本
+
+对每个 occupied cell，做两个测试：
+
+测试 A：如果把这个 occupied cell 当成 opened，它是否连接两个区域？
+测试 B：如果把这个 occupied cell 当成 blocked，它是否位于两个大区域之间？
+
+代码里已经有 component_sizes_if_opened()，但目前只对 box 做，并且只看单个 cell。
+
+这个可以保留，但要加强输出，不要只叫 occupied-current-blocker，还要记录它可能是：
+
+occupied-gate-cell
+occupied-door-candidate
+occupied-bottleneck-member
+7.2.2 双格 / 小割集版本
+
+专门检查相邻 occupied cells：
+
+对每一对相邻的 occupied cells:
+    如果同时打开它们，会连接两个大区域
+    或者如果同时堵住它们，会切断两个大区域
+    那么这两个 cell 作为一个 gate cluster 标记为 risk
+
+对于你的例子，就是：
+
+cluster = {(14,6), (14,7)}
+occupants = K, L
+riskType = occupied-two-cell-gate
+
+这样人类视角看到的“这两个格子绝对关键”才会被代码捕捉。
+
+7.3 进一步改法：把它接到 ResourceGraph
+
+这个脚本现在只是 report。但真正有价值的是把结果喂给 planner：
+
+ResourceGraph:
+    gate G1 = {(14,6), (14,7)}
+    occupiedBy = K, L
+    risk = high
+    rule:
+        不允许 P_temp 停在这里
+        如果这里被 blocker 占住，优先生成 relief evidence
+
+这样它就不只是可视化报告，而是能影响 NAMO / P_temp 选择。
+
+8. 最终判断
+8.1 客观评价你的质疑
+
+你的质疑是有道理的，而且你抓到了这个脚本的一个真实盲区：它把“空格被停车后是否危险”分析得比较多，但对“初始已被 box / agent 占住的关键通道位置”分析不够，尤其漏掉了两个或多个 occupied cells 共同形成的 gate / cut。
+
+8.2 最准确的问题描述
+
+你可以把问题这样写进 issue：
+
+parking_risk.py currently detects single-cell articulation risks well, but it under-detects occupied chokepoints. In ISO, cells (14,6) and (14,7) are initially occupied by boxes K and L; from a human perspective they form a critical gate, but they are not reported as articulation/risk spots because dynamic articulation excludes occupied box cells from the graph, and occupied-risk detection only tests single-cell static articulation or single-box opening effects. We should add occupied gate / small cut-set detection, especially for adjacent occupied cells.
+
+这句话非常准确，也很工程化。

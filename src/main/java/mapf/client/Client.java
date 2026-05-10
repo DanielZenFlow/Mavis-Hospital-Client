@@ -2,6 +2,7 @@ package mapf.client;
 
 import mapf.domain.*;
 import mapf.planning.*;
+import mapf.planning.diag.ReplayRecorder;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
@@ -151,11 +152,15 @@ public class Client {
      * @throws IOException if communication fails
      */
     private void planAndExecute() throws IOException {
+        ReplayRecorder replayRecorder = ReplayRecorder.start(level, currentState);
+
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
 
         if (plan == null || plan.isEmpty()) {
             debugOut.println("ERROR: No plan found with any strategy!");
+            replayRecorder.finish(false, 0, 0);
+            writeReplay(replayRecorder);
             return;
         }
 
@@ -192,8 +197,19 @@ public class Client {
 
             // Update state based on successful actions
             updateState(actions, results);
+            replayRecorder.recordStep(step, actions, results, currentState);
 
             step++;
+        }
+        replayRecorder.finish(currentState.isGoalState(level), step, plan.size());
+        writeReplay(replayRecorder);
+    }
+
+    private void writeReplay(ReplayRecorder replayRecorder) {
+        java.nio.file.Path file = replayRecorder.writeDefault();
+        if (file != null) {
+            debugOut.println("[REPLAY] wrote " + file);
+            debugOut.println("[REPLAY] viewer target\\diagnostics\\replay-viewer\\index.html");
         }
     }
 

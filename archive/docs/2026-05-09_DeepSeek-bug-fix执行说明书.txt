@@ -1,0 +1,324 @@
+# DEEPSEEK BUG FIX TASK — IDE AI 执行说明书
+
+> 目的：根据 `deepseek-bug.txt` 同行评审结论，在新分支上**逐项**修复全部 8 项问题。
+> 风格对齐 `claude.md`，架构判断对齐 `claudeopus47.txt`（五层架构 L1–L5）。
+> 本文件**就是给 IDE AI 的提示词**。AI 必须严格按"步骤"顺序执行；每完成一步就跑一次回归再进入下一步。
+
+---
+
+## 0. 全局上下文（IDE AI 必读）
+
+### 项目速览
+- 仓库：`mavis-hospital-client`（Java 17 + Maven）
+- 入口：`mapf.client.Client`
+- 五层架构（来源 `claudeopus47.txt §1.2`）：
+  - **L1 领域层** — `mapf.domain.{State, Action, Level, Position, Direction, Color}`
+  - **L2 单 Agent 求解** — `mapf.planning.heuristic.*` + `BoxSearchPlanner` + `IW1Planner`
+  - **L3 任务分解** — `LevelAnalyzer`, `SubgoalManager`, `EscapeSubgoalSynthesizer`, `BlockerReliefSynthesizer`
+  - **L4 协调** — `PriorityPlanningStrategy`, `ConflictResolver`, `ConflictDetector`, `AgentCoordinator`, `DeadlockBreaker`
+  - **L5 执行/监控** — `Client.runAgent`, `PortfolioController`
+- 回归命令（每完成一步必跑）：
+  ```powershell
+  mvn -q compile
+  java -jar server.jar -l levels/SAbotbot.lvl  -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+  java -jar server.jar -l levels/MAsimple1.lvl -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+  ```
+  通过判据：两关都 `Level solved: Yes`，动作数与基线相比不退化（SAbotbot ≈ 63，MAsimple1 ≈ 27）。
+
+### 同行评审结论一览（来自本次评审）
+| # | 严重度 | 评审结论 | 处置 |
+|---|---|---|---|
+| 1 ConflictResolver 高编号 NoOp | 🟡 中 | 属实，但仅为兜底 | **改进**（步骤 4） |
+| 2 IW1 仅用于 escape | 🟡 中 | **deepseek 错误** — P4b 已存在 find-route 分支 | 仅添加文档注释（步骤 7） |
+| 3 `adjustOrderForBottlenecks` 死代码 | 🟢 低 | 属实 | ✅ 已修（步骤 1 验证） |
+| 4 `findAgentForColor` 死代码 | 🟢 低 | 属实 | ✅ 已修（步骤 1 验证） |
+| 5 `hasAgentAt` 注释误导 | 🟡 中 | 属实，纯文档 | ✅ 已修（步骤 1 验证） |
+| 6 `applyJointAction` 静默通过非适用 | 🟡 中 | 属实但属设计 | **加日志可观测**（步骤 5） |
+| 7 Portfolio 全是 PP 变体 | 🔴 高 | 属实但属架构决策 | **不动；写 ADR**（步骤 8） |
+| 8 `Client.updateState` 用 `apply` | 🔴 最高 | 属实但被夸大 | ✅ 已修（步骤 1 验证） |
+
+> **重要**：上一会话已落地 #3/#4/#5/#8 的修复（在 `main` 工作树）。本任务要求**回退到干净基线后在新分支上重做全部 8 项**，确保提交链清晰、可审查。
+
+---
+
+## 1. 步骤 1 — 创建分支与基线快照
+
+**给 AI 的指令**：
+```powershell
+# 在仓库根目录执行
+git status                          # 确认工作树干净；若有未提交改动先 stash
+git stash push -m "deepseek-pre"   # 仅在工作树有改动时
+git checkout -b fix/deepseek-bug-review
+
+# 验证基线编译 + 回归通过（不要继续，直到下面两条都 PASS）
+mvn -q compile
+java -jar server.jar -l levels/SAbotbot.lvl  -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+java -jar server.jar -l levels/MAsimple1.lvl -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+```
+
+**完成判据**：分支创建成功；基线回归 PASS。
+**失败时**：不要继续后续步骤，先排查环境/编译问题。
+
+---
+
+## 2. 步骤 2 — Bug #8（L5）：`Client.updateState` 改为 joint 语义
+
+**位置**：`src/main/java/mapf/client/Client.java`，方法 `updateState(Action[], boolean[])`。
+
+**问题陈述**：
+- 现状：循环调用 `currentState.apply(actions[i], i)`，逐 agent 串行更新。
+- 风险：(a) 与 planner 内部一律使用 `applyJointAction` 的 joint 语义不一致；(b) 缺少 out-of-grid 防御，server 一旦误报 `results[i]=true` 即污染状态；(c) 维护者易踩坑。
+- `claudeopus47.txt §1.2.5` 强调 L5 应忠实反映 server 同步语义。
+
+**给 AI 的指令**：把方法改写为：把失败的动作 mask 成 `Action.noOp()`，然后 **一次** 调用 `currentState.applyJointAction(effective, level)`。保留 `MAVIS_LOG_REJECTED=1` 环境变量行为。
+
+**精确补丁模板**（替换 `updateState` 整个方法体）：
+```java
+private void updateState(Action[] actions, boolean[] results) {
+    // Mirror server semantics: actions are evaluated synchronously against the
+    // state at the START of the timestep. Mask rejected actions to NoOp and
+    // hand the whole array to applyJointAction, which (a) reads every agent
+    // position from the original state (no order-dependent shadow updates) and
+    // (b) defensively rejects out-of-grid effects.
+    boolean logRejected = "1".equals(System.getenv("MAVIS_LOG_REJECTED"));
+    Action[] effective = new Action[actions.length];
+    for (int i = 0; i < actions.length; i++) {
+        boolean ok = i < results.length && results[i];
+        if (ok) {
+            effective[i] = actions[i];
+        } else {
+            effective[i] = Action.noOp();
+            if (logRejected) {
+                debugOut.println("Warning: Action for agent " + i + " failed: " + actions[i]);
+            }
+        }
+    }
+    currentState = currentState.applyJointAction(effective, level);
+}
+```
+
+**完成判据**：编译通过；回归两关 PASS。
+**提交**：`git add src/main/java/mapf/client/Client.java && git commit -m "fix(L5): Client.updateState uses applyJointAction for synchronous semantics (#8)"`
+
+---
+
+## 3. 步骤 3 — Bug #5（L1）：修正误导性注释
+
+**位置**：`src/main/java/mapf/domain/State.java`，方法 `hasAgentAt` 与 `getAgentAt` 上方注释。
+
+**问题陈述**：原注释声称"Position flyweight cache, equals() short-circuits via =="，但**整体仍是 O(numAgents) 线性扫描**。flyweight 只是把单次 `equals()` 优化为引用比较，并不改变循环复杂度。
+
+**给 AI 的指令**：把两段注释修正为如下措辞：
+
+```java
+/**
+ * Checks if there is an agent at the specified position.
+ * O(numAgents) linear scan; numAgents <= 10 per problem spec, so the
+ * Position flyweight (interned via Position.of) lets equals() short-circuit
+ * to a reference compare per probe, but the scan itself is still linear.
+ */
+public boolean hasAgentAt(Position pos) { ... }
+```
+`getAgentAt` 同理 — 只改注释，不改逻辑。
+
+**完成判据**：编译通过（无功能变更）。
+**提交**：`git commit -m "docs(L1): clarify O(n) scan in State.hasAgentAt/getAgentAt (#5)"`
+
+---
+
+## 4. 步骤 4 — Bug #3 / #4：删除已弃用死代码
+
+**位置 A**：`src/main/java/mapf/planning/analysis/LevelAnalyzer.java`，私有方法 `adjustOrderForBottlenecks(...)`。L136 注释明示已废弃。
+**位置 B**：`src/main/java/mapf/planning/strategy/SubgoalManager.java`，私有方法 `findAgentForColor(...)`。注释自标 "Legacy method"。
+
+**给 AI 的指令**：
+1. **先验证无外部引用**：
+   ```
+   grep -r "adjustOrderForBottlenecks" src/
+   grep -rn "findAgentForColor" src/    # 注意：GoalChecker 中有同名 public static 方法，需保留
+   ```
+2. 仅删除上述两个 **private** 方法。`GoalChecker.findAgentForColor` 是另一处 public 实用方法，**保留**。
+
+**完成判据**：编译通过；回归 PASS。
+**提交**：`git commit -m "chore: remove dead methods adjustOrderForBottlenecks, SubgoalManager.findAgentForColor (#3,#4)"`
+
+---
+
+## 5. 步骤 5 — Bug #1（L4）：ConflictResolver 优先级改进
+
+**位置**：`src/main/java/mapf/planning/strategy/ConflictResolver.java`，方法 `resolveConflicts(Action[], State, Level)` (~L52-L70)。
+
+**问题陈述**：
+- 现状：发生冲突时 `int higher = Math.max(agent1, agent2); resolved[higher] = NoOp;` —— 纯按 ID 排序。
+- `claudeopus47.txt §1.2.4` 指出 PP 的经典失败模式是环形依赖；naive ID 优先级会放大这种风险。
+- 但本类是 PP 之后的最后兜底，触发不多，因此**最小改动**：用一个稳定但有意义的 priority key 替代 ID。
+
+**给 AI 的指令**：把"按 agent ID 选谁让"改为"按动态优先级选谁让"，规则（按从高到低优先级排序保持，不是越界重写）：
+1. **正在执行 PUSH/PULL 的 agent 优先**（已经握住 box，更难重新启动）。
+2. **agent 已在自身 goal 上者降级**（已完成的不该再被推进）。
+3. **平手时**仍按 agent ID（更高 ID 让），保持现行回退确定性。
+
+**精确补丁模板**：
+```java
+public Action[] resolveConflicts(Action[] jointAction, State state, Level level) {
+    callCount++;
+    List<ConflictDetector.Conflict> conflicts =
+            conflictDetector.detectConflicts(state, jointAction, level);
+    if (conflicts.isEmpty()) return jointAction;
+    conflictingCallCount++;
+
+    Action[] resolved = jointAction.clone();
+    for (ConflictDetector.Conflict conflict : conflicts) {
+        int loser = pickYielder(conflict.agent1, conflict.agent2,
+                                jointAction, state, level);
+        resolved[loser] = Action.noOp();
+    }
+    return resolved;
+}
+
+/** Lower returned priority => loser (yields). Tie -> higher agent ID yields. */
+private int pickYielder(int a1, int a2, Action[] joint, State state, Level level) {
+    int p1 = priorityOf(a1, joint, state, level);
+    int p2 = priorityOf(a2, joint, state, level);
+    if (p1 != p2) return (p1 < p2) ? a1 : a2;
+    return Math.max(a1, a2);
+}
+
+private int priorityOf(int agentId, Action[] joint, State state, Level level) {
+    int p = 0;
+    Action a = (agentId < joint.length) ? joint[agentId] : null;
+    if (a != null && (a.type == Action.ActionType.PUSH
+                   || a.type == Action.ActionType.PULL)) p += 10;  // holding a box
+    Position pos = state.getAgentPosition(agentId);
+    if (pos != null && level.getAgentGoal(pos.row, pos.col) == agentId) p -= 5; // already home
+    return p;
+}
+```
+
+**完成判据**：编译通过；回归两关 PASS（动作数允许 ±5 浮动）。如果 MAsimple1 退化超过 5 步，回退本步骤并改用最小化版本（仅条件 1）。
+**提交**：`git commit -m "feat(L4): ConflictResolver picks yielder by holding-box / on-goal priority (#1)"`
+
+---
+
+## 6. 步骤 6 — Bug #6（L1）：`applyJointAction` 提供可观测性
+
+**位置**：`src/main/java/mapf/domain/State.java`，方法 `applyJointAction`。
+
+**问题陈述**：
+- 现状：仅防御 out-of-grid，其他不适用动作（占用格、错色 box）静默通过。
+- 设计意图：legacy stuck-recovery 需要"占用格"型不适用静默走 NoOp 路径。**保留行为**。
+- 风险：任何上游 planner bug 都会被掩盖 → 增加可观测性而非改变行为。
+
+**给 AI 的指令**：在 PUSH/PULL 分支里检测"原 box 位置无 box"或"目标格被占且非自己"的情形，仅写一次性 stderr 警告（沿用 `INAPPLICABLE_LOGGED` 模式或新增 `BOX_MISMATCH_LOGGED` 静态 flag）。**不要改变效果语义**。
+
+**完成判据**：编译通过；回归 PASS；stderr 中默认无新增噪声（仅在真正出现误用时才打印一次）。
+**提交**：`git commit -m "feat(L1): applyJointAction logs once when push/pull source has no box (#6)"`
+
+---
+
+## 7. 步骤 7 — Bug #2（L2）：澄清 IW1 用法的文档
+
+**位置**：`src/main/java/mapf/planning/strategy/PriorityPlanningStrategy.java`，常量 `IW1_FINDROUTE_MIN_MANHATTAN` / `IW1_FINDROUTE_MAX_MANHATTAN` 附近，以及 P4b 分支头注释（约 L3700）。
+
+**问题陈述**：deepseek 误判 IW1 仅用于 escape；实际 P4b 已实现 find-route 分支。但常量和分支文档不够显眼，导致评审者漏看。
+
+**给 AI 的指令**：在常量声明上方加一行注释，明确指向 P4b 使用点；并在 P4b 分支顶部加一行 `// IW(1) FIND-ROUTE FALLBACK (per claudeopus47 §1.2.2 / §3.2)`，便于后续审查。**只改注释，不改逻辑**。
+
+**完成判据**：编译通过；回归 PASS。
+**提交**：`git commit -m "docs(L2): cross-reference IW1 find-route usage from constants (#2)"`
+
+---
+
+## 8. 步骤 8 — Bug #7：Portfolio 架构决策记录（ADR）
+
+**位置**：在仓库根新建 `docs/adr/0001-portfolio-pp-only.md`（如已存在 `docs/`，否则创建）。
+
+**问题陈述**：deepseek 指出"所有策略都是 PP 变体"。`CLAUDE.md L132` 与 `claudeopus47.txt §3` 已说明：CBS 在 push-pull Sokoban 域里实现成本与收益不匹配，**有意保留单一 PP+多种排序模式**作为协调层。本步骤把这一决策固化为 ADR，避免反复被当成 bug。
+
+**给 AI 的指令**：创建 ADR 文件，结构：
+```markdown
+# ADR 0001: Portfolio Uses Only PP Variants
+
+## Status
+Accepted (2026-05-09)
+
+## Context
+Hospital domain is Cooperative Multi-Agent Sokoban with Pull, not vanilla MAPF.
+Vanilla CBS assumes point agents + static environment; both fail here
+(see claudeopus47.txt §3.1.2). A full CBS port targeting push/pull is
+estimated at PhD-thesis effort.
+
+## Decision
+PortfolioController offers strictly PP variants differing in subgoal
+ORDERING (TOPOLOGICAL / DISTANCE_GREEDY / RANDOM with multi-seed).
+CBS / JointAStar are explicitly excluded from the top-level sequence;
+CBS is retained only as PP-internal cycle fallback.
+
+## Consequences
+- Pro: avoids brittle Sokoban-CBS port; cycle-breaking via multi-seed RANDOM.
+- Con: levels with hard cyclic coupling depend on luck of seed.
+- Future-proofing: if a real heterogeneous solver is added, expose it as
+  a new StrategyConfig entry rather than rewriting the controller.
+
+## References
+- claudeopus47.txt §1.2.4, §3
+- CLAUDE.md "Strategy Selection Flow"
+- deepseek-bug.txt #7 (peer-reviewed as architectural decision, not bug)
+```
+
+**完成判据**：文件创建；编译/回归不受影响。
+**提交**：`git commit -m "docs: ADR-0001 record portfolio-uses-PP-only decision (#7)"`
+
+---
+
+## 9. 步骤 9 — 终验与合并准备
+
+**给 AI 的指令**：
+```powershell
+mvn -q clean compile
+java -jar server.jar -l levels/SAbotbot.lvl   -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+java -jar server.jar -l levels/MAsimple1.lvl  -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 30
+java -jar server.jar -l levels/MAsimple2.lvl  -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 60
+java -jar server.jar -l complevels/help.lvl   -c "java -Xmx4g -cp target/classes mapf.client.Client" -t 60
+```
+
+汇总 `git log --oneline fix/deepseek-bug-review ^main` 应包含 6 条提交（步骤 2/3/4/5/6/7/8 中 #5 与 #2/#7 是文档变更，亦应单独提交）。最终：
+```powershell
+git log --oneline fix/deepseek-bug-review ^main
+# 期望（顺序可能不同）：
+#   fix(L5): Client.updateState uses applyJointAction ...           (#8)
+#   docs(L1): clarify O(n) scan in State.hasAgentAt/getAgentAt      (#5)
+#   chore: remove dead methods ...                                  (#3,#4)
+#   feat(L4): ConflictResolver picks yielder by ... priority        (#1)
+#   feat(L1): applyJointAction logs once when push/pull source ...  (#6)
+#   docs(L2): cross-reference IW1 find-route usage from constants   (#2)
+#   docs: ADR-0001 record portfolio-uses-PP-only decision           (#7)
+```
+
+**不要自动 push 或 merge**。等待人工审查后再 `git push -u origin fix/deepseek-bug-review`。
+
+---
+
+## 附录 A — 出错时的回滚
+
+任何一步回归失败都按下面回滚，**不要尝试硬塞**：
+```powershell
+git restore --staged .
+git restore .
+# 如已 commit 但失败：
+git reset --hard HEAD~1
+```
+然后停止任务，把当时的回归输出贴回给用户判定。
+
+## 附录 B — 五层架构对照（提交 message 用的 scope 标签）
+- `L1`: domain (`State`, `Action`, `Level`, `Position`)
+- `L2`: single-agent solver (`BoxSearchPlanner`, `IW1Planner`, heuristics)
+- `L3`: task decomposition (`LevelAnalyzer`, `SubgoalManager`, synthesizers)
+- `L4`: coordination (`ConflictResolver`, `AgentCoordinator`, `DeadlockBreaker`, `PriorityPlanningStrategy`)
+- `L5`: execution (`Client`, `PortfolioController`)
+
+## 附录 C — 必须遵守的硬约束（来自 CLAUDE.md）
+- 颜色约束：`level.getAgentColor(a) == level.getBoxColor(b)`
+- 同步联合动作；冲突双方各 NoOp
+- 硬限：3 分钟、20 000 joint actions、50×50、≤10 agents
+- 状态不可变；stderr 才打日志（stdout 是 server 协议）
