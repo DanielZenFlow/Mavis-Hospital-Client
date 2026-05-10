@@ -2693,7 +2693,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             // Fall through to normal goal verification and completion
                         } else {
                             // Original rollback: 2+ regressions or subgoal not reached
-                            logNormal(getName() + ": [REGRESS] Path for " 
+                            logVerbose(getName() + ": [REGRESS] Path for " 
                                     + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
                                     + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
                                     + " completed goal(s): " + regressedGoals + " — rollback");
@@ -2914,7 +2914,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         List<Position> regressedGoals = detectRegressedGoals(tempState, level);
                         regressedGoals.removeAll(displacedGoals);
                         if (!regressedGoals.isEmpty()) {
-                            logNormal(getName() + ": [REGRESS] Cleared path disturbed " 
+                            logVerbose(getName() + ": [REGRESS] Cleared path disturbed " 
                                     + regressedGoals.size() + " goal(s) — rollback");
                             while (fullPlan.size() > planSizeBefore) {
                                 fullPlan.remove(fullPlan.size() - 1);
@@ -5200,7 +5200,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (boxAtGoal != null && boxAtGoal == remaining.boxType) continue;
 
             if (!canServiceGoalNeighborhood(remaining, afterState, level, frozen)) {
-                logNormal("[PP][SEAL-REJECT] " + completedSubgoal.boxType + " -> "
+                logVerbose("[PP][SEAL-REJECT] " + completedSubgoal.boxType + " -> "
                         + completedSubgoal.goalPos + " would seal "
                         + remaining.boxType + " -> " + remaining.goalPos
                         + " with frozen=" + formatPositions(frozen));
@@ -5310,7 +5310,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             verdict = "ACCEPTED";
         }
 
-        logNormal("[PP][SUBGOAL-EVAL] phase=" + phase
+        String msg = "[PP][SUBGOAL-EVAL] phase=" + phase
                 + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
                 + " actions=" + Math.max(0, planEnd - planStart)
                 + " subgoal=" + subgoalLabel(subgoal)
@@ -5321,7 +5321,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 + " totalReach=" + before.totalReachable + "->" + after.totalReachable
                 + " goalAdj=" + before.goalAdjacentReachable + "->" + after.goalAdjacentReachable
                 + (subgoal.isSyntheticRelief() ? " cert=" + reliefCertificateLabel(subgoal) : "")
-                + (subgoal.isAgentGoal ? "" : " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions));
+                + (subgoal.isAgentGoal ? "" : " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+        if ("ACCEPTED".equals(verdict)) {
+            logVerbose(msg);
+        } else {
+            logNormal(msg);
+        }
     }
 
     private String subgoalLabel(Subgoal subgoal) {
