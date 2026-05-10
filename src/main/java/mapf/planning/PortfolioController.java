@@ -423,7 +423,8 @@ public class PortfolioController implements SearchStrategy {
                     // instead of initialState. Without this, recursive NAMO is dormant
                     // because the synthesizer keeps seeing the same untouched world and
                     // re-emits the same already-completed reliefs.
-                    if (features != null) {
+                    boolean enablePortfolioNamoSynthesis = false;
+                    if (enablePortfolioNamoSynthesis && features != null) {
                         Set<Position> immovable = (features.taskFilter != null)
                                 ? features.taskFilter.immovableBoxes : Collections.emptySet();
                         State stateForNAMO = initialState;
