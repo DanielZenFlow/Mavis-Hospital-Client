@@ -196,6 +196,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> trapBlacklist = new HashSet<>();
 
     /**
+     * Dynamic L3 soft-deferral: a real goal that is theoretically prerequisite
+     * in the static dependency graph, but was just proven unavailable in the
+     * current state after blocker relief and path clearing both failed.
+     *
+     * Treating such a goal as a hard prerequisite can lock PP into retrying the
+     * same blocked root forever. Soft-deferral lets dependent goals make progress
+     * first, while the deferred goal stays in the queue and is retried once the
+     * world changes.
+     */
+    private Set<Position> deferredBlockedGoals = new HashSet<>();
+
+    /**
      * Synthetic box targets (P_temp relief/escape cells) rejected in this PP run
      * because they did not satisfy their concrete relief certificate. These are
      * not real Hospital box goals; accepting them without releasing the blocker
@@ -671,6 +683,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         lastComputedPlanSize = 0;
         dynamicBarrierRounds = 0;
         trapBlacklist.clear();
+        deferredBlockedGoals.clear();
         syntheticReliefBlacklist.clear();
         taskReliefNogoods.clear();
         regressDisturbCount.clear();
@@ -2275,6 +2288,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Normal path: some goals have all dependencies met
         if (!strictRemaining.isEmpty()) {
+            moveDeferredGoalsToTail(strictRemaining);
             return strictRemaining;
         }
         
@@ -2301,6 +2315,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return 0;
         int count = 0;
         for (Position dep : deps) {
+            if (deferredBlockedGoals.contains(dep)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) count++;
@@ -2320,6 +2335,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return true;
 
         for (Position dep : deps) {
+            if (deferredBlockedGoals.contains(dep)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) return false;
@@ -2331,6 +2347,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return true;
+    }
+
+    private void moveDeferredGoalsToTail(List<Subgoal> subgoals) {
+        if (deferredBlockedGoals.isEmpty() || subgoals.size() < 2) return;
+        List<Subgoal> active = new ArrayList<>(subgoals.size());
+        List<Subgoal> deferred = new ArrayList<>();
+        for (Subgoal sg : subgoals) {
+            if (deferredBlockedGoals.contains(sg.goalPos)) deferred.add(sg);
+            else active.add(sg);
+        }
+        if (!deferred.isEmpty() && !active.isEmpty()) {
+            subgoals.clear();
+            subgoals.addAll(active);
+            subgoals.addAll(deferred);
+        }
     }
     
     /** Sort subgoals based on the current OrderingMode. */
@@ -2530,6 +2561,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (goalDependsOn.containsKey(subgoal.goalPos)) {
                 boolean depMet = true;
                 for (Position dep : goalDependsOn.get(subgoal.goalPos)) {
+                    if (deferredBlockedGoals.contains(dep)) continue;
                     boolean isBoxG = level.getBoxGoal(dep.row, dep.col) != '\0';
                     if (isBoxG && !completedBoxGoals.contains(dep)) {
                         depMet = false;
@@ -2741,6 +2773,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
+                        deferredBlockedGoals.remove(subgoal.goalPos);
                         // NOTE: displacedGoals NOT cleared here. Barrier-displaced goals
                         // stay deferred until the phase switch (all non-displaced goals
                         // satisfied) to prevent PP from undoing barrier clearing.
@@ -2910,6 +2943,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 planSizeBefore, fullPlan.size());
                         if (!subgoal.isAgentGoal) {
                             completedBoxGoals.add(subgoal.goalPos);
+                            deferredBlockedGoals.remove(subgoal.goalPos);
                             // NOTE: displacedGoals NOT cleared here — see phase switch.
                             int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
                             goalCompletionCount.put(subgoal.goalPos, count);
@@ -2947,6 +2981,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     storedPlanSubgoals.clear();
                     continue;
                 }
+
+                deferBlockedGoal(subgoal, currentState, level, subgoals);
             }
         }
         // ============ CYCLE-AWARE DEPENDENCY RELAXATION ============
@@ -3108,6 +3144,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         logVerbose("[PP] tryExecuteSubgoals: no progress (skippedByDeps=" + skippedByDeps 
                 + ", total=" + subgoals.size() + ")");
         return false;
+    }
+
+    private void deferBlockedGoal(Subgoal subgoal, State state, Level level,
+                                  List<Subgoal> allSubgoals) {
+        if (subgoal == null || subgoal.goalPos == null) return;
+        if (subgoal.isSyntheticRelief() || isSyntheticBoxTarget(subgoal, level)) return;
+        if (deferredBlockedGoals.add(subgoal.goalPos)) {
+            List<Position> blockers = findAccessBlockersForTask(subgoal, state, level, allSubgoals);
+            recordFailureSignal(subgoal.isAgentGoal
+                            ? FailureReport.Cause.AGENT_GOAL_BLOCKED
+                            : FailureReport.Cause.BOX_GOAL_BLOCKED,
+                    Collections.singletonList(subgoal.goalPos), blockers);
+            logNormal("[PP][DEFER] " + subgoalLabel(subgoal)
+                    + " remains blocked after relief/clearing; softening as prerequisite"
+                    + (blockers.isEmpty() ? "" : " blockers=" + blockers));
+            cachedSubgoalOrder = null;
+        }
     }
     
     private State tryTaskConditionedBlockerRelief(Subgoal blockedSubgoal, State state, Level level,
