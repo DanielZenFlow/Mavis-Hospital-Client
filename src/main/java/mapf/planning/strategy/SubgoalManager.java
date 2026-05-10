@@ -75,9 +75,13 @@ public class SubgoalManager {
     
     /**
      * Gets all unsatisfied subgoals in priority order.
-     * Phase 1: Box goals (excluding already completed ones)
-     * Phase 2: Agent goals for agents whose own-color box tasks are done
-     *          (not deferred until ALL box goals complete)
+     * Phase 1: Box goals (excluding already completed ones).
+     * Phase 2: Agent goals, but only after all remaining box goals are satisfied.
+     *
+     * Agent goals are terminal placement tasks. Allowing an agent to park at its
+     * own goal while other box goals remain turns terminal cells into ordinary
+     * transit resources and can force NAMO relief to clear boxes that should be
+     * solved as first-class box goals instead.
      */
     public List<PriorityPlanningStrategy.Subgoal> getUnsatisfiedSubgoals(State state, Level level, Set<Position> completedBoxGoals) {
         List<PriorityPlanningStrategy.Subgoal> unsatisfied = new ArrayList<>();
@@ -86,15 +90,9 @@ public class SubgoalManager {
         
         // Phase 1: Box goals (skip completed ones - MAPF permanent obstacle)
         addBoxGoals(unsatisfied, state, level, staticGoals, completedBoxGoals);
-        
-        // Phase 2: Agent goals for agents that have completed their own box tasks.
-        // This allows agent goals to be attempted in parallel with other agents' box goals,
-        // rather than waiting for ALL box goals to complete first.
-        addCompletedAgentGoals(unsatisfied, state, level);
-        
-        // Phase 3: If no box goals remain at all, add ALL remaining agent goals
-        // (catches agent goals for agents that had no box tasks)
-        if (unsatisfied.isEmpty() || !hasAnyBoxGoals(unsatisfied)) {
+
+        // Phase 2: terminal agent goals only after all box goals are done.
+        if (unsatisfied.isEmpty()) {
             addAllAgentGoals(unsatisfied, state, level);
         }
         
