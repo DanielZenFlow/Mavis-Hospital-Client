@@ -517,7 +517,7 @@ public class BoxSearchPlanner {
 
         int h = getDistance(boxPos, targetPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, boxPos);
-        StateKey startKey = new StateKey(initialState, agentId, boxPos, boxType);
+        StateKey startKey = new StateKey(initialState, agentId, boxPos, level);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -536,14 +536,16 @@ public class BoxSearchPlanner {
                 if (action.type == Action.ActionType.NOOP) continue;
                 if (!current.state.isApplicable(action, agentId, level)) continue;
                 if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
-                // Protected positions: reject if non-target box would land on a protected cell
+                // Protected positions: reject if a non-target box would be moved
+                // from or into a protected cell. The target box is allowed to pass
+                // through protected cells while being displaced.
                 if (!protectedPositions.isEmpty() 
-                        && wouldPlaceBoxOnProtected(action, agentId, current.state, 
+                        && wouldMoveBoxOnProtected(action, agentId, current.state, 
                                 current.targetBoxPos, protectedPositions)) continue;
 
                 State newState = current.state.apply(action, agentId);
                 Position newTargetBoxPos = computeNewBoxPosition(action, agentId, current.state, current.targetBoxPos);
-                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, boxType);
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, level);
                 int newG = current.g + 1;
 
                 Integer existingG = bestG.get(newKey);
@@ -553,6 +555,83 @@ public class BoxSearchPlanner {
                 int newH = (newTargetBoxPos != null) ? getDistance(newTargetBoxPos, targetPos, level) : 0;
                 SearchNode newNode = new SearchNode(newState, current, action, newG, newH, newTargetBoxPos);
                 openList.add(newNode);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Plans a NAMO-style blocker release. Unlike ordinary displacement, the goal
+     * is not one exact parking cell; success means the target box has left every
+     * forbidden resource cell. This is useful for tight pull-push blockers where
+     * requiring a far-away P_temp makes an otherwise valid relief fail.
+     */
+    public List<Action> planBoxReleaseFromForbidden(int agentId, Position boxPos, char boxType,
+            State initialState, Level level,
+            Set<Position> forbiddenPositions,
+            Set<Position> unfreezePositions,
+            int maxStatesOverride,
+            Set<Position> protectedPositions) {
+
+        Character actualBox = initialState.getBoxAt(boxPos);
+        if (actualBox == null || actualBox != boxType) {
+            return null;
+        }
+
+        PriorityQueue<SearchNode> openList = new PriorityQueue<>();
+        Map<StateKey, Integer> bestG = new HashMap<>();
+
+        Set<Position> frozenGoals = new HashSet<>();
+        for (Position goalPosition : level.getAllBoxGoalPositions()) {
+            char goalTypeGoal = level.getBoxGoal(goalPosition);
+            char currentBox = initialState.getBoxAt(goalPosition);
+            if (currentBox == goalTypeGoal) {
+                frozenGoals.add(goalPosition);
+            }
+        }
+        frozenGoals.remove(boxPos);
+        if (unfreezePositions != null) {
+            frozenGoals.removeAll(unfreezePositions);
+        }
+
+        SearchNode startNode = new SearchNode(initialState, null, null, 0, 0, boxPos);
+        StateKey startKey = new StateKey(initialState, agentId, boxPos, level);
+        openList.add(startNode);
+        bestG.put(startKey, 0);
+
+        int exploredCount = 0;
+        while (!openList.isEmpty() && exploredCount < maxStatesOverride) {
+            SearchNode current = openList.poll();
+            exploredCount++;
+
+            Position currentBoxPos = findBoxPosition(current.state, boxType, current.targetBoxPos);
+            if (currentBoxPos != null
+                    && !forbiddenPositions.contains(currentBoxPos)
+                    && !frozenGoals.contains(currentBoxPos)) {
+                return reconstructPath(current);
+            }
+
+            for (Action action : PlanningUtils.getAllActions()) {
+                if (action.type == Action.ActionType.NOOP) continue;
+                if (!current.state.isApplicable(action, agentId, level)) continue;
+                if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
+                if (!protectedPositions.isEmpty()
+                        && wouldMoveBoxOnProtected(action, agentId, current.state,
+                                current.targetBoxPos, protectedPositions)) continue;
+
+                State newState = current.state.apply(action, agentId);
+                Position newTargetBoxPos = computeNewBoxPosition(
+                        action, agentId, current.state, current.targetBoxPos);
+                StateKey newKey = new StateKey(newState, agentId, newTargetBoxPos, level);
+                int newG = current.g + 1;
+
+                Integer existingG = bestG.get(newKey);
+                if (existingG != null && existingG <= newG) continue;
+                bestG.put(newKey, newG);
+
+                int newH = newTargetBoxPos != null && forbiddenPositions.contains(newTargetBoxPos) ? 1 : 0;
+                openList.add(new SearchNode(newState, current, action, newG, newH, newTargetBoxPos));
             }
         }
 
@@ -743,8 +822,8 @@ public class BoxSearchPlanner {
      * The target box (tracked by targetBoxPos) is allowed to pass through protected
      * positions as part of its displacement route.
      */
-    private boolean wouldPlaceBoxOnProtected(Action action, int agentId, State state,
-                                              Position targetBoxPos, Set<Position> protectedPositions) {
+    private boolean wouldMoveBoxOnProtected(Action action, int agentId, State state,
+                                             Position targetBoxPos, Set<Position> protectedPositions) {
         Position agentPos = state.getAgentPosition(agentId);
 
         if (action.type == Action.ActionType.PUSH) {
@@ -752,8 +831,8 @@ public class BoxSearchPlanner {
             Position boxNewPos = boxOldPos.move(action.boxDir);
             // If this is the target box being pushed, allow it (it's the one we're relocating)
             if (boxOldPos.equals(targetBoxPos)) return false;
-            // Non-target box: check if destination is protected
-            return protectedPositions.contains(boxNewPos);
+            // Non-target box: do not move it from or into protected positions.
+            return protectedPositions.contains(boxOldPos) || protectedPositions.contains(boxNewPos);
         }
 
         if (action.type == Action.ActionType.PULL) {
@@ -761,8 +840,8 @@ public class BoxSearchPlanner {
             Position boxNewPos = agentPos; // box follows to agent's previous position
             // If this is the target box, allow it
             if (boxOldPos.equals(targetBoxPos)) return false;
-            // Non-target box: check if destination is protected
-            return protectedPositions.contains(boxNewPos);
+            // Non-target box: do not move it from or into protected positions.
+            return protectedPositions.contains(boxOldPos) || protectedPositions.contains(boxNewPos);
         }
 
         return false;
@@ -798,32 +877,50 @@ public class BoxSearchPlanner {
     private static class StateKey {
         final Position agentPos;
         final Position targetBoxPos;
-        /** Sorted list of ALL same-type box positions for collision-resistant equality.
-         *  XOR hash is prone to collisions (e.g. {P1,P2} vs {P3,P4} can match).
-         *  Using a sorted list ensures deterministic, collision-free comparison. */
-        final List<Position> sameTypeBoxPositions;
+        /** Sorted tracked box layout for collision-resistant equality. */
+        final List<String> boxLayout;
         final int cachedHash;
 
         StateKey(State state, int agentId, Position targetBoxPos) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            this.sameTypeBoxPositions = Collections.emptyList();
-            this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
+            this.boxLayout = Collections.emptyList();
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, boxLayout);
         }
         
-        /** 4-arg constructor: tracks same-type box positions for obstacle-aware dedup. */
+        /** Tracks only target-letter boxes: fast default for ordinary subgoals. */
         StateKey(State state, int agentId, Position targetBoxPos, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
-            List<Position> positions = new ArrayList<>();
+            List<String> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
-                if (e.getValue() == boxType) {
-                    positions.add(e.getKey());
-                }
+                if (e.getValue() != boxType) continue;
+                Position p = e.getKey();
+                positions.add(e.getValue() + "@" + p.row + "," + p.col);
             }
-            positions.sort((a, b) -> a.row != b.row ? Integer.compare(a.row, b.row) : Integer.compare(a.col, b.col));
-            this.sameTypeBoxPositions = positions;
-            this.cachedHash = Objects.hash(agentPos, targetBoxPos, sameTypeBoxPositions);
+            Collections.sort(positions);
+            this.boxLayout = positions;
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, boxLayout);
+        }
+
+        /**
+         * Tracks all boxes movable by this agent. Use for barrier displacement,
+         * where moving another same-color letter can be necessary to create the
+         * pull-push route, but avoid it for ordinary subgoals because it is heavier.
+         */
+        StateKey(State state, int agentId, Position targetBoxPos, Level level) {
+            this.agentPos = state.getAgentPosition(agentId);
+            this.targetBoxPos = targetBoxPos;
+            List<String> positions = new ArrayList<>();
+            Color agentColor = level.getAgentColor(agentId);
+            for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
+                if (level.getBoxColor(e.getValue()) != agentColor) continue;
+                Position p = e.getKey();
+                positions.add(e.getValue() + "@" + p.row + "," + p.col);
+            }
+            Collections.sort(positions);
+            this.boxLayout = positions;
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, boxLayout);
         }
 
         @Override
@@ -833,7 +930,7 @@ public class BoxSearchPlanner {
             StateKey other = (StateKey) obj;
             return agentPos.equals(other.agentPos) &&
                     Objects.equals(targetBoxPos, other.targetBoxPos) &&
-                    sameTypeBoxPositions.equals(other.sameTypeBoxPositions);
+                    boxLayout.equals(other.boxLayout);
         }
 
         @Override
@@ -847,30 +944,30 @@ public class BoxSearchPlanner {
         final Position agentPos;
         final Position targetBoxPos;
         final int time;
-        final List<Position> sameTypeBoxPositions;
+        final List<String> boxLayout;
         final int cachedHash;
 
         StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
-            this.sameTypeBoxPositions = Collections.emptyList();
-            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxPositions);
+            this.boxLayout = Collections.emptyList();
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, boxLayout);
         }
         
         StateKeyWithTime(State state, int agentId, Position targetBoxPos, int time, char boxType) {
             this.agentPos = state.getAgentPosition(agentId);
             this.targetBoxPos = targetBoxPos;
             this.time = time;
-            List<Position> positions = new ArrayList<>();
+            List<String> positions = new ArrayList<>();
             for (Map.Entry<Position, Character> e : state.getBoxes().entrySet()) {
-                if (e.getValue() == boxType) {
-                    positions.add(e.getKey());
-                }
+                if (e.getValue() != boxType) continue;
+                Position p = e.getKey();
+                positions.add(e.getValue() + "@" + p.row + "," + p.col);
             }
-            positions.sort((a, b) -> a.row != b.row ? Integer.compare(a.row, b.row) : Integer.compare(a.col, b.col));
-            this.sameTypeBoxPositions = positions;
-            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, sameTypeBoxPositions);
+            Collections.sort(positions);
+            this.boxLayout = positions;
+            this.cachedHash = Objects.hash(agentPos, targetBoxPos, time, boxLayout);
         }
 
         @Override
@@ -880,7 +977,7 @@ public class BoxSearchPlanner {
             StateKeyWithTime other = (StateKeyWithTime) obj;
             return time == other.time && agentPos.equals(other.agentPos) &&
                     Objects.equals(targetBoxPos, other.targetBoxPos) &&
-                    sameTypeBoxPositions.equals(other.sameTypeBoxPositions);
+                    boxLayout.equals(other.boxLayout);
         }
 
         @Override

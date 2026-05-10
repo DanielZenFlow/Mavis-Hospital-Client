@@ -1,7 +1,9 @@
 package mapf.planning.synthesis;
 
 import mapf.domain.*;
+import mapf.planning.strategy.ArticulationPointFinder;
 import mapf.planning.strategy.PriorityPlanningStrategy.Subgoal;
+import mapf.planning.strategy.PriorityPlanningStrategy.ReliefCertificate;
 
 import java.util.*;
 
@@ -99,6 +101,10 @@ public final class BlockerReliefSynthesizer {
         Set<Position> allGoalCells = new HashSet<>();
         for (List<Position> gs : level.getBoxGoalsByType().values()) allGoalCells.addAll(gs);
         for (Position ag : level.getAgentGoalPositionMap().values()) allGoalCells.add(ag);
+        Set<Position> staticNoParkingCells =
+                ArticulationPointFinder.findArticulationPoints(level, immovableBoxes);
+        Set<Position> dynamicRiskParkingCells =
+                ArticulationPointFinder.findArticulationPoints(level, new HashSet<>(state.getBoxes().keySet()));
 
         int numAgents = state.getNumAgents();
         Map<Position, Character> boxes = state.getBoxes();
@@ -164,6 +170,8 @@ public final class BlockerReliefSynthesizer {
                             if (blockerPos.equals(boxPos)) continue;
                             ReliefNode n = tryEmitRelief(blockerPos, /*depth*/ 0,
                                     state, level, immovableBoxes, allGoalCells,
+                                    staticNoParkingCells, dynamicRiskParkingCells,
+                                    ReliefCertificate.boxCorridor(blockerPos, boxPos, goalPos),
                                     agentsByColor, emittedTemps, handledBlockerPositions);
                             if (n != null) {
                                 nodes.add(n);
@@ -193,6 +201,8 @@ public final class BlockerReliefSynthesizer {
                         if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
                         ReliefNode n = tryEmitRelief(blockerPos, /*depth*/ 0,
                                 state, level, immovableBoxes, allGoalCells,
+                                staticNoParkingCells, dynamicRiskParkingCells,
+                                ReliefCertificate.agentAccess(blockerPos, agentId, boxPos, goalPos),
                                 agentsByColor, emittedTemps, handledBlockerPositions);
                         if (n != null) {
                             nodes.add(n);
@@ -232,6 +242,8 @@ public final class BlockerReliefSynthesizer {
                 if (nodes.size() >= MAX_RELIEF_SUBGOALS) break;
                 ReliefNode child = tryEmitRelief(sb, parent.depth + 1,
                         state, level, immovableBoxes, allGoalCells,
+                        staticNoParkingCells, dynamicRiskParkingCells,
+                        ReliefCertificate.agentAccess(sb, helperId, parentBlocker, null),
                         agentsByColor, emittedTemps, handledBlockerPositions);
                 if (child != null) {
                     nodes.add(child);
@@ -278,6 +290,9 @@ public final class BlockerReliefSynthesizer {
                                             State state, Level level,
                                             Set<Position> immovableBoxes,
                                             Set<Position> allGoalCells,
+                                            Set<Position> staticNoParkingCells,
+                                            Set<Position> dynamicRiskParkingCells,
+                                            ReliefCertificate certificate,
                                             Map<Color, List<Integer>> agentsByColor,
                                             Set<Position> emittedTemps,
                                             Set<Position> handledBlockerPositions) {
@@ -300,12 +315,12 @@ public final class BlockerReliefSynthesizer {
         if (bestHelper < 0) return null;
 
         Position pTemp = findPTempBFS(blockerPos, state, level, immovableBoxes,
-                allGoalCells, emittedTemps);
+                allGoalCells, staticNoParkingCells, dynamicRiskParkingCells, emittedTemps, certificate);
         if (pTemp == null) return null;
 
         emittedTemps.add(pTemp);
         handledBlockerPositions.add(blockerPos);
-        return new ReliefNode(new Subgoal(bestHelper, blockerType, pTemp, false),
+        return new ReliefNode(new Subgoal(bestHelper, blockerType, pTemp, false, certificate),
                 blockerPos, depth);
     }
 
@@ -397,7 +412,12 @@ public final class BlockerReliefSynthesizer {
                                               Set<Position> immovableBoxes,
                                               boolean treatBoxesAsWalls,
                                               Color agentColor) {
-        Map<Position, Character> boxes = state.getBoxes();
+        return bfsReachable(start, state.getBoxes(), level, immovableBoxes, treatBoxesAsWalls);
+    }
+
+    private static Set<Position> bfsReachable(Position start, Map<Position, Character> boxes,
+                                              Level level, Set<Position> immovableBoxes,
+                                              boolean treatBoxesAsWalls) {
         int rows = level.getRows();
         int cols = level.getCols();
         Set<Position> visited = new HashSet<>();
@@ -421,11 +441,6 @@ public final class BlockerReliefSynthesizer {
                 if (treatBoxesAsWalls) {
                     Character bx = boxes.get(np);
                     if (bx != null) {
-                        // Same-color box: agent can push, so the cell is "reachable
-                        // for path planning" purposes only if we let it through.
-                        // For blocker detection (rActual) we keep it strict: same-color
-                        // box is also a wall, since the box itself occupies the cell
-                        // and the agent cannot stand on it.
                         continue;
                     }
                 }
@@ -607,7 +622,10 @@ public final class BlockerReliefSynthesizer {
     private static Position findPTempBFS(Position boxPos, State state, Level level,
                                          Set<Position> immovableBoxes,
                                          Set<Position> goalCells,
-                                         Set<Position> usedTemps) {
+                                         Set<Position> staticNoParkingCells,
+                                         Set<Position> dynamicRiskParkingCells,
+                                         Set<Position> usedTemps,
+                                         ReliefCertificate certificate) {
         Map<Position, Character> boxes = state.getBoxes();
         int rows = level.getRows();
         int cols = level.getCols();
@@ -621,6 +639,12 @@ public final class BlockerReliefSynthesizer {
         Position firstValid = null;
         Position bestDeadEnd = null;
         int bestNeighborCount = Integer.MAX_VALUE;
+        Position firstDynamicRisk = null;
+        Position bestDynamicRiskDeadEnd = null;
+        int bestDynamicRiskNeighborCount = Integer.MAX_VALUE;
+        Position firstStaticRisk = null;
+        Position bestStaticRiskDeadEnd = null;
+        int bestStaticRiskNeighborCount = Integer.MAX_VALUE;
 
         while (!queue.isEmpty() && expansions < PTEMP_BFS_CAP) {
             Position p = queue.poll();
@@ -632,12 +656,32 @@ public final class BlockerReliefSynthesizer {
                     && !boxes.containsKey(p)
                     && !immovableBoxes.contains(p)
                     && !isCorner(p, level, immovableBoxes)) {
-                if (firstValid == null) firstValid = p;
+                boolean releasesBlockerResource = certificate == null
+                        || candidateReleasesBlockerResource(boxPos, p, state);
+                boolean staticRisk = staticNoParkingCells.contains(p);
+                boolean dynamicRisk = dynamicRiskParkingCells.contains(p);
                 int free = countFreeNeighbors(p, level, immovableBoxes, boxes);
-                if (free < bestNeighborCount) {
-                    bestNeighborCount = free;
-                    bestDeadEnd = p;
-                    if (free <= 1) break; // can't get better than dead-end
+                if (!releasesBlockerResource) {
+                    continue;
+                } else if (staticRisk) {
+                    if (firstStaticRisk == null) firstStaticRisk = p;
+                    if (free < bestStaticRiskNeighborCount) {
+                        bestStaticRiskNeighborCount = free;
+                        bestStaticRiskDeadEnd = p;
+                    }
+                } else if (dynamicRisk) {
+                    if (firstDynamicRisk == null) firstDynamicRisk = p;
+                    if (free < bestDynamicRiskNeighborCount) {
+                        bestDynamicRiskNeighborCount = free;
+                        bestDynamicRiskDeadEnd = p;
+                    }
+                } else {
+                    if (firstValid == null) firstValid = p;
+                    if (free < bestNeighborCount) {
+                        bestNeighborCount = free;
+                        bestDeadEnd = p;
+                        if (free <= 1) break; // can't get better than safe dead-end
+                    }
                 }
             }
 
@@ -653,7 +697,18 @@ public final class BlockerReliefSynthesizer {
                 queue.add(np);
             }
         }
-        return bestDeadEnd != null ? bestDeadEnd : firstValid;
+        if (bestDeadEnd != null) return bestDeadEnd;
+        if (firstValid != null) return firstValid;
+        if (bestDynamicRiskDeadEnd != null) return bestDynamicRiskDeadEnd;
+        if (firstDynamicRisk != null) return firstDynamicRisk;
+        if (bestStaticRiskDeadEnd != null) return bestStaticRiskDeadEnd;
+        if (firstStaticRisk != null) return firstStaticRisk;
+        return null;
+    }
+
+    private static boolean candidateReleasesBlockerResource(Position blockerPos, Position candidate,
+                                                            State state) {
+        return !candidate.equals(blockerPos) && state.getBoxes().containsKey(blockerPos);
     }
 
     /** Count orthogonally-adjacent cells that are passable (not wall, not box, not immovable). */

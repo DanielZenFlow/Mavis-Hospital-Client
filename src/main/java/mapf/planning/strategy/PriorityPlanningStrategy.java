@@ -7,10 +7,12 @@ import mapf.planning.analysis.CrossColorBarrierAnalyzer;
 import mapf.planning.analysis.DependencyAnalyzer;
 import mapf.planning.analysis.GoalTransitAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer;
+import mapf.planning.coordination.ConflictDetector;
 import mapf.planning.coordination.DeadlockResolver;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.signal.FailureReport;
 import mapf.planning.spacetime.ReservationTable;
+import mapf.planning.synthesis.BlockerReliefSynthesizer;
 import java.util.*;
 
 /**
@@ -35,6 +37,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private final AgentCoordinator agentCoordinator;
     private final DeadlockBreaker deadlockBreaker;
     private final DeadlockResolver deadlockResolver = new DeadlockResolver();
+    private final ConflictDetector jointActionValidator = new ConflictDetector();
 
     /** Tracks displaced boxes to avoid infinite loops. */
     private Set<String> displacementHistory = new HashSet<>();
@@ -126,13 +129,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      */
     private Set<Position> escapeGoalPositions = Collections.emptySet();
 
-    /** P2: Iterated Width(1) planner (lazy init); used for escape subgoals only. */
+    /**
+     * P2 / P4b: Iterated Width(1) planner (lazy init).
+     * Used for two paths: (a) escape subgoals (P2, Round 0), and
+     * (b) find-route fallback for moderate-distance non-escape subgoals
+     * (P4b, Round 1.5 — see planSubgoal ~L3700).
+     * See also IW1_FINDROUTE_{MIN,MAX}_MANHATTAN below.
+     */
     private IW1Planner iw1Planner = null;
 
     /**
-     * P4 (subtask classifier): box-to-goal Manhattan distance gate for trying IW(1)
-     * on non-escape subgoals. Below MIN: A* with Manhattan is trivially fast — IW(1)
-     * is wasteful. Above MAX: IW(1) state explosion likely; trust BSP/A*+TrueDistance.
+     * P4b (subtask classifier): box-to-goal Manhattan distance gate for trying IW(1)
+     * on non-escape subgoals (IW(1) FIND-ROUTE FALLBACK per claudeopus47 §1.2.2 / §3.2).
+     * Below MIN: A* with Manhattan is trivially fast — IW(1) is wasteful.
+     * Above MAX: IW(1) state explosion likely; trust BSP/A*+TrueDistance.
+     * Used in planSubgoal ~L3700 (P4b branch).
      * Per qanda.txt §3.3 / §4.4 (IW(1) sweet spot for moderate find-route paths).
      */
     private static final int IW1_FINDROUTE_MIN_MANHATTAN = 10;
@@ -143,6 +154,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private int diagIw1Succeeded = 0;
     private int diagPlanSubgoalNull = 0;
     private int diagPathClearingRescued = 0;
+    private static final int REPEATED_LOG_PRINT_LIMIT = 2;
+    private final Map<String, Integer> repeatedLogCounts = new LinkedHashMap<>();
 
     // Box oscillation tracking: detects boxes that LEAVE a position and RETURN to it
     // across subgoal completions. Smoking-gun for NAMO↔PP thrashing.
@@ -183,6 +196,34 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private Set<Position> trapBlacklist = new HashSet<>();
 
     /**
+     * Dynamic L3 soft-deferral: a real goal that is theoretically prerequisite
+     * in the static dependency graph, but was just proven unavailable in the
+     * current state after blocker relief and path clearing both failed.
+     *
+     * Treating such a goal as a hard prerequisite can lock PP into retrying the
+     * same blocked root forever. Soft-deferral lets dependent goals make progress
+     * first, while the deferred goal stays in the queue and is retried once the
+     * world changes.
+     */
+    private Set<Position> deferredBlockedGoals = new HashSet<>();
+
+    /**
+     * Synthetic box targets (P_temp relief/escape cells) rejected in this PP run
+     * because they did not satisfy their concrete relief certificate. These are
+     * not real Hospital box goals; accepting them without releasing the blocker
+     * they were created for creates NAMO oscillation.
+     */
+    private Set<Position> syntheticReliefBlacklist = new HashSet<>();
+
+    /**
+     * Failed task-conditioned relief attempts in one PP run. A key is
+     * task goal + blocker start + temporary parking cell. This keeps the
+     * local-clearing loop from repeating the same impossible move.
+     */
+    private final Set<String> taskReliefNogoods = new HashSet<>();
+    private static final int MAX_TASK_RELIEF_MOVES = 4;
+
+    /**
      * REGRESS blacklist: counts how many times each completed goal has been
      * disturbed (by any subgoal). After MAX_REGRESS_PER_GOAL disturbances,
      * that completed goal is marked as "unprotectable" and removed from
@@ -205,6 +246,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** Tracks which subgoal tryExecuteSubgoals last touched, for failure reporting. */
     private Subgoal lastAttemptedSubgoalForReport = null;
+    private FailureReport.Cause lastFailureCauseForReport = FailureReport.Cause.UNKNOWN;
+    private final Set<Position> lastBlockedGoalsForReport = new LinkedHashSet<>();
+    private final Set<Position> lastBlockedPositionsForReport = new LinkedHashSet<>();
 
     /** Read-only access to the most recent failure signal. May be null. */
     public FailureReport getLastFailureReport() {
@@ -284,6 +328,93 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (SearchConfig.isVerbose()) System.err.println(msg);
     }
 
+    private void logNormalRepeated(String key, String msg) {
+        if (!SearchConfig.isNormal()) return;
+        int count = repeatedLogCounts.merge(key, 1, Integer::sum);
+        if (count <= REPEATED_LOG_PRINT_LIMIT) {
+            System.err.println(msg);
+        }
+    }
+
+    private void printRepeatedLogSummary(String outcome) {
+        if (!SearchConfig.isNormal() || repeatedLogCounts.isEmpty()) return;
+        List<Map.Entry<String, Integer>> repeated = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : repeatedLogCounts.entrySet()) {
+            if (entry.getValue() > REPEATED_LOG_PRINT_LIMIT) {
+                repeated.add(entry);
+            }
+        }
+        if (repeated.isEmpty()) return;
+        repeated.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+        int cap = Math.min(8, repeated.size());
+        System.err.println("[PP][LOG-SUMMARY][" + outcome + "] suppressed repeated diagnostics (showing top "
+                + cap + "/" + repeated.size() + ")");
+        for (int i = 0; i < cap; i++) {
+            Map.Entry<String, Integer> entry = repeated.get(i);
+            int suppressed = entry.getValue() - REPEATED_LOG_PRINT_LIMIT;
+            System.err.println("[PP][LOG-SUMMARY][" + outcome + "] " + entry.getKey()
+                    + " repeated=" + entry.getValue() + " suppressed=" + suppressed);
+        }
+    }
+
+    private String barrierLogKey(String reason, CrossColorBarrierAnalyzer.Barrier barrier) {
+        String first = barrier.clearingOrder.isEmpty() ? "?" : barrier.clearingOrder.get(0).toString();
+        return "barrier." + reason
+                + " blockedAgent=" + barrier.blockedAgentId
+                + " clearingType=" + barrier.blockingBoxType
+                + " size=" + barrier.clearingOrder.size()
+                + " first=" + first;
+    }
+
+    private void recordFailureSignal(FailureReport.Cause cause,
+                                     Collection<Position> blockedGoals,
+                                     Collection<Position> blockedPositions) {
+        if (cause != null && cause != FailureReport.Cause.UNKNOWN
+                && lastFailureCauseForReport == FailureReport.Cause.UNKNOWN) {
+            lastFailureCauseForReport = cause;
+        }
+        if (blockedGoals != null) {
+            for (Position p : blockedGoals) {
+                if (p != null) lastBlockedGoalsForReport.add(p);
+            }
+        }
+        if (blockedPositions != null) {
+            for (Position p : blockedPositions) {
+                if (p != null) lastBlockedPositionsForReport.add(p);
+            }
+        }
+    }
+
+    private FailureReport.Cause effectiveFailureCause() {
+        if (lastFailureCauseForReport != FailureReport.Cause.UNKNOWN) {
+            return lastFailureCauseForReport;
+        }
+        if (lastAttemptedSubgoalForReport == null) {
+            return FailureReport.Cause.UNKNOWN;
+        }
+        return lastAttemptedSubgoalForReport.isAgentGoal
+                ? FailureReport.Cause.AGENT_GOAL_BLOCKED
+                : FailureReport.Cause.BOX_GOAL_BLOCKED;
+    }
+
+    private FailureReport buildFailureReport(FailureReport.Kind kind, String note) {
+        List<Subgoal> snapshot = FailureReport.snapshot(cachedSubgoalOrder);
+        List<Position> blockedGoals = new ArrayList<>(lastBlockedGoalsForReport);
+        List<Position> blockedPositions = new ArrayList<>(lastBlockedPositionsForReport);
+        switch (kind) {
+            case STUCK_NO_PROGRESS:
+                return FailureReport.stuck(lastAttemptedSubgoalForReport, snapshot,
+                        effectiveFailureCause(), blockedGoals, blockedPositions, note);
+            case PARTIAL_PLAN:
+                return FailureReport.partial(lastAttemptedSubgoalForReport, snapshot,
+                        effectiveFailureCause(), blockedGoals, blockedPositions, note);
+            case NO_PLAN:
+            default:
+                return FailureReport.noPlan(lastAttemptedSubgoalForReport, snapshot,
+                        effectiveFailureCause(), blockedGoals, blockedPositions, note);
+        }
+    }
+
     private void printDiagSummary(String outcome) {
         if (SearchConfig.isVerbose()) {
         System.err.println("[PP][DIAG][" + outcome + "] IW1: invoked=" + diagIw1Invoked
@@ -313,6 +444,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         } catch (Exception ignored) {
             // Diagnostic must never crash the planner.
         }
+        printRepeatedLogSummary(outcome);
         printBoxOscillationReport(outcome);
     }
 
@@ -551,19 +683,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         lastComputedPlanSize = 0;
         dynamicBarrierRounds = 0;
         trapBlacklist.clear();
+        deferredBlockedGoals.clear();
+        syntheticReliefBlacklist.clear();
+        taskReliefNogoods.clear();
         regressDisturbCount.clear();
         lastProgressTime = System.currentTimeMillis();
         lastFailureReport = null;
         lastAttemptedSubgoalForReport = null;
+        lastFailureCauseForReport = FailureReport.Cause.UNKNOWN;
+        lastBlockedGoalsForReport.clear();
+        lastBlockedPositionsForReport.clear();
         diagIw1Invoked = 0;
         diagIw1Succeeded = 0;
         diagPlanSubgoalNull = 0;
         diagPathClearingRescued = 0;
+        repeatedLogCounts.clear();
         boxPositionHistory.clear();
         subgoalLabelHistory.clear();
         suspendedTransitGoals.clear();
         transitProfiles = Collections.emptyMap();
         conflictResolver.resetCounts();
+        seedCompletedGoalsFromState(initialState, level);
 
         // Layer-3 Steps 2-4: classify goals by transit pressure (computed once per search).
         {
@@ -582,6 +722,35 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
 
         return planWithSubgoals(initialState, level, startTime);
+    }
+
+    private void seedCompletedGoalsFromState(State state, Level level) {
+        int seededBoxes = 0;
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            for (Position goalPos : entry.getValue()) {
+                Character actual = state.getBoxes().get(goalPos);
+                if (actual != null && actual == goalType && completedBoxGoals.add(goalPos)) {
+                    seededBoxes++;
+                }
+            }
+        }
+
+        int seededAgents = 0;
+        for (Map.Entry<Integer, Position> entry : level.getAgentGoalPositionMap().entrySet()) {
+            int agentId = entry.getKey();
+            Position goalPos = entry.getValue();
+            if (agentId >= 0 && agentId < state.getNumAgents()
+                    && goalPos.equals(state.getAgentPosition(agentId))
+                    && completedAgentGoals.add(goalPos)) {
+                seededAgents++;
+            }
+        }
+
+        if (seededBoxes > 0 || seededAgents > 0) {
+            logNormal("[PP] Seeded completed goals from start state: boxes="
+                    + seededBoxes + ", agents=" + seededAgents);
+        }
     }
 
     /** Cached subgoal order - MAPF PP requires fixed priority (computed once, reused). */
@@ -670,9 +839,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 } catch (Exception e) {
                     // Diagnostic must never crash the planner.
                 }
-                lastFailureReport = FailureReport.stuck(
-                        lastAttemptedSubgoalForReport,
-                        FailureReport.snapshot(cachedSubgoalOrder),
+                lastFailureReport = buildFailureReport(FailureReport.Kind.STUCK_NO_PROGRESS,
                         "early-exit noProgressMs=" + noProgressMs + " stuckCount=" + stuckCount);
                 break;
             }
@@ -765,9 +932,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             fullPlan = validateAndOptimizePlan(fullPlan, initialState, level, numAgents);
             // Only set if a more specific report wasn't already attached at break-time.
             if (lastFailureReport == null) {
-                lastFailureReport = FailureReport.partial(
-                        lastAttemptedSubgoalForReport,
-                        FailureReport.snapshot(cachedSubgoalOrder),
+                lastFailureReport = buildFailureReport(FailureReport.Kind.PARTIAL_PLAN,
                         "plan size=" + fullPlan.size());
             }
             printDiagSummary("PARTIAL");
@@ -775,9 +940,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         logMinimal(getName() + ": [FAIL] Could not reach goal state, no partial plan available");
         if (lastFailureReport == null) {
-            lastFailureReport = FailureReport.noPlan(
-                    lastAttemptedSubgoalForReport,
-                    FailureReport.snapshot(cachedSubgoalOrder),
+            lastFailureReport = buildFailureReport(FailureReport.Kind.NO_PLAN,
                     "no partial plan");
         }
         printDiagSummary("FAIL");
@@ -814,7 +977,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         if (barriers.isEmpty()) return currentState;
 
-        logNormal("[PP] Cross-color barriers detected: " + barriers.size());
+        logNormalRepeated("barrier.detected count=" + barriers.size(),
+                "[PP] Cross-color barriers detected: " + barriers.size());
 
         // Sort barriers by clearing order size: solve small barriers first. 
         // This opens up parking space (e.g., clearing Z opens left-right connection)
@@ -871,7 +1035,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
-            logNormal("[PP] Clearing barrier for agent " + barrier.blockedAgentId
+            logNormalRepeated(barrierLogKey("clearing-start.agent" + clearingAgent, barrier),
+                    "[PP] Clearing barrier for agent " + barrier.blockedAgentId
                     + ": " + barrier.clearingOrder.size() + " " + barrier.blockingBoxType
                     + "-boxes to clear (clearing agent " + clearingAgent + ")");
 
@@ -999,6 +1164,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     Math.max(barrier.clearingOrder.size() * 3, 20), agentReachable, currentState, level,
                     baseAvoidPositions, firstBox);
             if (allParking.size() < barrier.clearingOrder.size()) {
+                recordFailureSignal(FailureReport.Cause.PARKING_UNAVAILABLE,
+                        barrier.clearingOrder, barrier.clearingOrder);
                 logNormal("[PP] [CLEAR-BARRIER] Insufficient parking (" + allParking.size()
                         + "/" + barrier.clearingOrder.size() + ") — skipping barrier");
                 skippedBarrierClearingOrders.add(barrier.clearingOrder);
@@ -1021,6 +1188,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     blockedAgentPos, gapExitCell);
             int maxSafeClears = preAssignedSlots.size();
             if (maxSafeClears == 0) {
+                recordFailureSignal(FailureReport.Cause.PARKING_UNAVAILABLE,
+                        barrier.clearingOrder, barrier.clearingOrder);
                 logNormal("[PP] [CLEAR-BARRIER] Pre-assignment found no safe parking — skipping barrier");
                 skippedBarrierClearingOrders.add(barrier.clearingOrder);
                 continue;
@@ -1107,6 +1276,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         }
                     }
                     if (parkPos == null) {
+                        recordFailureSignal(FailureReport.Cause.PARKING_UNAVAILABLE,
+                                Collections.singletonList(boxPos), barrier.clearingOrder);
                         logNormal("[PP] [CLEAR-BARRIER] No fallback parking for " + boxPos + " — stopping");
                         break;
                     }
@@ -1120,16 +1291,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Use higher BSP budget — pull-chain paths through narrow gaps need more exploration
                 // Progressive budget: deeper boxes need exponentially longer displacement paths
                 // because they must navigate through already-cleared corridor + complex maze
-                int clearingBudget = SearchConfig.MIN_BSP_BUDGET * (8 + cleared * 4);
+                boolean singleBoxBarrier = barrier.clearingOrder.size() == 1;
+                int clearingBudget = SearchConfig.MIN_BSP_BUDGET
+                        * (singleBoxBarrier ? 20 : (8 + cleared * 4));
                 
                 // Build per-box unfreeze set: current box + already-cleared positions.
                 // This prevents BSP from pushing remaining barrier boxes as collateral damage.
                 Set<Position> unfreezePositions = new HashSet<>(clearedPositions);
                 unfreezePositions.add(boxPos);
+                Set<Position> protectedPositions = new HashSet<>(baseAvoidPositions);
+                protectedPositions.addAll(usedParkings);
                 
                 List<Action> displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
                         clearingAgent, boxPos, parkPos, barrier.blockingBoxType,
-                        currentState, level, unfreezePositions, clearingBudget);
+                        currentState, level, unfreezePositions, clearingBudget,
+                        protectedPositions);
 
                 if (displacePath == null || displacePath.isEmpty()) {
                     // Retry with full unfreeze — limited unfreeze may be too restrictive
@@ -1137,7 +1313,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     Set<Position> fullUnfreeze = new HashSet<>(barrier.clearingOrder);
                     displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
                             clearingAgent, boxPos, parkPos, barrier.blockingBoxType,
-                            currentState, level, fullUnfreeze, clearingBudget);
+                            currentState, level, fullUnfreeze, clearingBudget,
+                            protectedPositions);
                 }
 
                 // RETRY WITH ALTERNATIVE PARKING TARGETS
@@ -1167,6 +1344,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     // Sort by distance to the BOX (not the gap reference) — closer = simpler BSP path
                     List<Position> retryCandidates = CrossColorBarrierAnalyzer.findParkingPositions(
                             30, updReach, currentState, level, retryAvoid, boxPos);
+
+                    int rayCandidatesBefore = retryCandidates.size();
+                    addBoxRayParkingCandidates(retryCandidates, boxPos, retryAvoid,
+                            currentState, level, 12);
+                    if (retryCandidates.size() > rayCandidatesBefore) {
+                        logNormalRepeated(barrierLogKey("ray-parking-candidates.box" + boxPos, barrier),
+                                "[PP] [CLEAR-BARRIER] Added "
+                                        + (retryCandidates.size() - rayCandidatesBefore)
+                                        + " box-ray parking candidate(s) for " + boxPos);
+                    }
                     
                     // BARRIER EXTENSION CANDIDATES: cells beyond the last barrier box
                     // along the corridor direction are not walkable (the box blocks the
@@ -1237,7 +1424,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     
                     Set<Position> tried = new HashSet<>();
                     tried.add(parkPos);
-                    int maxRetries = 8;
+                    int maxRetries = singleBoxBarrier ? 16 : 8;
                     int retryCount = 0;
                     
                     for (Position altTarget : retryCandidates) {
@@ -1273,9 +1460,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 + ": " + boxPos + " -> " + altTarget);
                         
                         Set<Position> retryUnfreeze = new HashSet<>(barrier.clearingOrder);
+                        Set<Position> retryProtected = new HashSet<>(retryAvoid);
                         displacePath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
                                 clearingAgent, boxPos, altTarget, barrier.blockingBoxType,
-                                currentState, level, retryUnfreeze, clearingBudget);
+                                currentState, level, retryUnfreeze, clearingBudget,
+                                retryProtected);
                         
                         if (displacePath != null && !displacePath.isEmpty()) {
                             parkPos = altTarget;
@@ -1287,11 +1476,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
 
                 if (displacePath == null || displacePath.isEmpty()) {
-                    logNormal("[PP] [CLEAR-BARRIER] BSP failed for " + boxPos
+                    recordFailureSignal(FailureReport.Cause.BARRIER_BSP_EXHAUSTED,
+                            Collections.singletonList(boxPos), barrier.clearingOrder);
+                    logNormalRepeated(barrierLogKey("bsp-all-targets-exhausted.box" + boxPos, barrier),
+                            "[PP] [CLEAR-BARRIER] BSP failed for " + boxPos
                             + " (all targets exhausted)");
                     // First box failure → deeper boxes are certainly harder. Abort this barrier.
                     if (cleared == 0) {
-                        logNormal("[PP] [CLEAR-BARRIER] First box failed — aborting barrier");
+                        logNormalRepeated(barrierLogKey("first-box-failed.box" + boxPos, barrier),
+                                "[PP] [CLEAR-BARRIER] First box failed — aborting barrier");
                         skippedBarrierClearingOrders.add(barrier.clearingOrder);
                         earlyExit = true;
                         break;
@@ -1324,7 +1517,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         globalTimeStep--;
                     }
                     currentState = recomputeState(initialState, fullPlan, level, numAgents);
-                    continue; // Don't increment cleared, don't track parking
+                    earlyExit = true;
+                    break; // Don't increment cleared, don't track parking
                 }
                 
                 // Verify box reached parking target (not stuck at intermediate position)
@@ -1339,8 +1533,40 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         globalTimeStep--;
                     }
                     currentState = recomputeState(initialState, fullPlan, level, numAgents);
-                    // Try next parking candidate
-                    continue;
+                    earlyExit = true;
+                    break;
+                }
+
+                // Verify previous clears were not undone as collateral damage.
+                // Parking is a commitment: later BSP calls must not move an already
+                // parked box or refill a cleared barrier cell with the same box type.
+                boolean previousClearDisturbed = false;
+                for (Position usedParking : usedParkings) {
+                    Character parkedBox = currentState.getBoxes().get(usedParking);
+                    if (parkedBox == null || parkedBox != barrier.blockingBoxType) {
+                        previousClearDisturbed = true;
+                        break;
+                    }
+                }
+                if (!previousClearDisturbed) {
+                    for (Position clearedPos : clearedPositions) {
+                        Character atCleared = currentState.getBoxes().get(clearedPos);
+                        if (atCleared != null && atCleared == barrier.blockingBoxType) {
+                            previousClearDisturbed = true;
+                            break;
+                        }
+                    }
+                }
+                if (previousClearDisturbed) {
+                    logNormal("[PP] [CLEAR-BARRIER] BSP disturbed a previous clear while moving "
+                            + boxPos + " -> " + parkPos + " - rolling back");
+                    while (fullPlan.size() > planSizeBefore) {
+                        fullPlan.remove(fullPlan.size() - 1);
+                        globalTimeStep--;
+                    }
+                    currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                    earlyExit = true;
+                    break;
                 }
 
                 // Track the displaced goal position
@@ -1428,6 +1654,40 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return visited;
+    }
+
+    /**
+     * Adds parking candidates that are reachable by moving the box, not
+     * necessarily by the clearing agent walking there before the box is moved.
+     * This matters for pull-push Sokoban "door latch" blockers: the box itself
+     * can be pushed or pulled into the corridor beyond the blocked cell, while
+     * that corridor is absent from the agent's walk-reachable set until the box
+     * leaves.
+     */
+    private void addBoxRayParkingCandidates(List<Position> candidates,
+                                            Position boxPos,
+                                            Set<Position> avoidPositions,
+                                            State state,
+                                            Level level,
+                                            int maxStepsPerDirection) {
+        Set<Position> seen = new HashSet<>(candidates);
+        List<Position> rayCandidates = new ArrayList<>();
+        for (Direction dir : Direction.values()) {
+            Position pos = boxPos;
+            for (int step = 1; step <= maxStepsPerDirection; step++) {
+                pos = pos.move(dir);
+                if (level.isWall(pos)) break;
+                if (avoidPositions != null && avoidPositions.contains(pos)) continue;
+                if (state.hasAgentAt(pos)) continue;
+                if (state.hasBoxAt(pos)) break;
+                if (level.getBoxGoal(pos) != '\0') continue;
+                if (level.getAgentGoal(pos.row, pos.col) != -1) continue;
+                if (seen.add(pos)) {
+                    rayCandidates.add(pos);
+                }
+            }
+        }
+        candidates.addAll(0, rayCandidates);
     }
 
     /**
@@ -2028,6 +2288,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Normal path: some goals have all dependencies met
         if (!strictRemaining.isEmpty()) {
+            moveDeferredGoalsToTail(strictRemaining);
             return strictRemaining;
         }
         
@@ -2054,6 +2315,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return 0;
         int count = 0;
         for (Position dep : deps) {
+            if (deferredBlockedGoals.contains(dep)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) count++;
@@ -2073,6 +2335,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return true;
 
         for (Position dep : deps) {
+            if (deferredBlockedGoals.contains(dep)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) return false;
@@ -2084,6 +2347,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return true;
+    }
+
+    private void moveDeferredGoalsToTail(List<Subgoal> subgoals) {
+        if (deferredBlockedGoals.isEmpty() || subgoals.size() < 2) return;
+        List<Subgoal> active = new ArrayList<>(subgoals.size());
+        List<Subgoal> deferred = new ArrayList<>();
+        for (Subgoal sg : subgoals) {
+            if (deferredBlockedGoals.contains(sg.goalPos)) deferred.add(sg);
+            else active.add(sg);
+        }
+        if (!deferred.isEmpty() && !active.isEmpty()) {
+            subgoals.clear();
+            subgoals.addAll(active);
+            subgoals.addAll(deferred);
+        }
     }
     
     /** Sort subgoals based on the current OrderingMode. */
@@ -2283,6 +2561,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (goalDependsOn.containsKey(subgoal.goalPos)) {
                 boolean depMet = true;
                 for (Position dep : goalDependsOn.get(subgoal.goalPos)) {
+                    if (deferredBlockedGoals.contains(dep)) continue;
                     boolean isBoxG = level.getBoxGoal(dep.row, dep.col) != '\0';
                     if (isBoxG && !completedBoxGoals.contains(dep)) {
                         depMet = false;
@@ -2319,6 +2598,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
+            if (isSyntheticBoxTarget(subgoal, level) && syntheticReliefBlacklist.contains(subgoal.goalPos)) {
+                logVerbose("[PP] [SYNTHETIC-RELIEF-SKIP] " + subgoal.boxType + " -> " + subgoal.goalPos
+                        + " rejected earlier in this attempt");
+                continue;
+            }
+
+            if (subgoal.isSyntheticRelief() && !reliefCertificateStillBlocked(subgoal, currentState, level)) {
+                String cert = reliefCertificateLabel(subgoal);
+                logNormalRepeated("synthetic.skip.certificate-resolved " + cert,
+                        "[PP][SYNTHETIC-RELIEF-SKIP] subgoal=" + subgoalLabel(subgoal)
+                        + " reason=certificate-already-resolved cert=" + reliefCertificateLabel(subgoal));
+                continue;
+            }
+
             // REGRESS blacklist: skip subgoals that repeatedly cause regression rollbacks.
             // After MAX_REGRESS_RETRIES failures for the same subgoal, the path through completed goals is
             // structurally unavoidable for this ordering — stop wasting time.
@@ -2334,6 +2627,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 
                 // Snapshot plan size for potential rollback (agent-trap detection)
                 int planSizeBefore = fullPlan.size();
+                SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                 
                 // Plan parallel subgoals for agents in independent components
                 planIndependentAgents(subgoal, subgoals, currentState, level);
@@ -2370,7 +2664,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (!regressedGoals.isEmpty()) {
                         // Check if we can accept this regression (break-then-rebuild)
                         boolean subgoalReached = !subgoal.isAgentGoal && verifyGoalReached(subgoal, tempState, level);
-                        if (regressedGoals.size() <= 1 && subgoalReached) {
+                        int satisfiedBefore = countSatisfiedBoxGoals(currentState, level);
+                        int satisfiedAfter = countSatisfiedBoxGoals(tempState, level);
+                        boolean netGoalGain = satisfiedAfter > satisfiedBefore;
+                        if (regressedGoals.size() <= 1 && subgoalReached && netGoalGain) {
                             // REGRESS-ACCEPT: 1 goal regressed but current subgoal succeeded.
                             // Accept the trade-off — remove regressed goal from completed set
                             // so it gets re-planned in a future iteration.
@@ -2396,7 +2693,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             // Fall through to normal goal verification and completion
                         } else {
                             // Original rollback: 2+ regressions or subgoal not reached
-                            logNormal(getName() + ": [REGRESS] Path for " 
+                            logVerbose(getName() + ": [REGRESS] Path for " 
                                     + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
                                     + " -> " + subgoal.goalPos + " disturbed " + regressedGoals.size() 
                                     + " completed goal(s): " + regressedGoals + " — rollback");
@@ -2457,10 +2754,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         storedPlanSubgoals.clear();
                         continue; // try next subgoal in priority order
                     }
+                    if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                        rollbackPlanTo(fullPlan, planSizeBefore);
+                        planMerger.clearAllPlans();
+                        storedPlanSubgoals.clear();
+                        continue;
+                    }
+                    if (!acceptReachedSubgoal("NORMAL", subgoal, beforeEval, tempState, level,
+                            planSizeBefore, fullPlan.size(), subgoals)) {
+                        rollbackPlanTo(fullPlan, planSizeBefore);
+                        planMerger.clearAllPlans();
+                        storedPlanSubgoals.clear();
+                        continue;
+                    }
+                    logAcceptedSubgoalEval("NORMAL", subgoal, beforeEval, tempState, level,
+                            planSizeBefore, fullPlan.size());
                     
                     // Mark box goal as completed
                     if (!subgoal.isAgentGoal) {
                         completedBoxGoals.add(subgoal.goalPos);
+                        deferredBlockedGoals.remove(subgoal.goalPos);
                         // NOTE: displacedGoals NOT cleared here. Barrier-displaced goals
                         // stay deferred until the phase switch (all non-displaced goals
                         // satisfied) to prevent PP from undoing barrier clearing.
@@ -2523,6 +2836,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     }
                     return true;
                 }
+                logNormal(getName() + ": [EXEC-MISMATCH] "
+                        + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                        + " -> " + subgoal.goalPos
+                        + " path executed but goal not reached - rollback");
+                while (fullPlan.size() > planSizeBefore) {
+                    fullPlan.remove(fullPlan.size() - 1);
+                    globalTimeStep--;
+                }
+                planMerger.clearAllPlans();
+                storedPlanSubgoals.clear();
+                continue;
             } else {
                 diagPlanSubgoalNull++;
                 // PATH CLEARING: When BSP fails for a box subgoal, other boxes may
@@ -2530,7 +2854,29 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Example: In MADS, box C at (10,3) blocks box A's path to (10,1).
                 // Agent 1 (red) can't push C (pink), so BSP fails. We need agent 2
                 // (pink) to move C out of the way first.
-                if (!subgoal.isAgentGoal) {
+                if (!isSyntheticBoxTarget(subgoal, level)) {
+                    State relievedState = tryTaskConditionedBlockerRelief(subgoal, currentState, level,
+                            fullPlan, numAgents, subgoals);
+                    if (relievedState != null) {
+                        path = planSubgoal(subgoal, relievedState, level, subgoals);
+                        if (path != null && !path.isEmpty()) {
+                            currentState = relievedState;
+                        }
+                    }
+                }
+
+                if (!isSyntheticBoxTarget(subgoal, level) && (path == null || path.isEmpty())) {
+                    State relievedState = tryScopedSyntheticBlockerRelief(subgoal, currentState, level,
+                            fullPlan, numAgents, subgoals);
+                    if (relievedState != null) {
+                        path = planSubgoal(subgoal, relievedState, level, subgoals);
+                        if (path != null && !path.isEmpty()) {
+                            currentState = relievedState;
+                        }
+                    }
+                }
+
+                if (!subgoal.isAgentGoal && (path == null || path.isEmpty())) {
                     State clearedState = tryPathClearing(subgoal, currentState, level, 
                             fullPlan, numAgents, subgoals);
                     if (clearedState != null) {
@@ -2548,6 +2894,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Execute path if clearing succeeded
                 if (path != null && !path.isEmpty()) {
                     int planSizeBefore = fullPlan.size();
+                    SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                     List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
                     reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep, subgoal.isAgentGoal);
                     
@@ -2567,7 +2914,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         List<Position> regressedGoals = detectRegressedGoals(tempState, level);
                         regressedGoals.removeAll(displacedGoals);
                         if (!regressedGoals.isEmpty()) {
-                            logNormal(getName() + ": [REGRESS] Cleared path disturbed " 
+                            logVerbose(getName() + ": [REGRESS] Cleared path disturbed " 
                                     + regressedGoals.size() + " goal(s) — rollback");
                             while (fullPlan.size() > planSizeBefore) {
                                 fullPlan.remove(fullPlan.size() - 1);
@@ -2579,8 +2926,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     
                     boolean reached = verifyGoalReached(subgoal, tempState, level);
                     if (reached) {
+                        if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                            rollbackPlanTo(fullPlan, planSizeBefore);
+                            planMerger.clearAllPlans();
+                            storedPlanSubgoals.clear();
+                            continue;
+                        }
+                        if (!acceptReachedSubgoal("CLEARED", subgoal, beforeEval, tempState, level,
+                                planSizeBefore, fullPlan.size(), subgoals)) {
+                            rollbackPlanTo(fullPlan, planSizeBefore);
+                            planMerger.clearAllPlans();
+                            storedPlanSubgoals.clear();
+                            continue;
+                        }
+                        logAcceptedSubgoalEval("CLEARED", subgoal, beforeEval, tempState, level,
+                                planSizeBefore, fullPlan.size());
                         if (!subgoal.isAgentGoal) {
                             completedBoxGoals.add(subgoal.goalPos);
+                            deferredBlockedGoals.remove(subgoal.goalPos);
                             // NOTE: displacedGoals NOT cleared here — see phase switch.
                             int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
                             goalCompletionCount.put(subgoal.goalPos, count);
@@ -2606,7 +2969,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 + " -> " + subgoal.goalPos + " (" + path.size() + " steps) [CLEARED]");
                         return true;
                     }
+                    logNormal(getName() + ": [EXEC-MISMATCH] Cleared path for "
+                            + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                            + " -> " + subgoal.goalPos
+                            + " executed but goal not reached - rollback");
+                    while (fullPlan.size() > planSizeBefore) {
+                        fullPlan.remove(fullPlan.size() - 1);
+                        globalTimeStep--;
+                    }
+                    planMerger.clearAllPlans();
+                    storedPlanSubgoals.clear();
+                    continue;
                 }
+
+                deferBlockedGoal(subgoal, currentState, level, subgoals);
             }
         }
         // ============ CYCLE-AWARE DEPENDENCY RELAXATION ============
@@ -2627,10 +3003,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (completions >= MAX_GOAL_COMPLETIONS) continue;
                 }
                 if (!subgoal.isAgentGoal && trapBlacklist.contains(subgoal.goalPos)) continue;
+                if (isSyntheticBoxTarget(subgoal, level) && syntheticReliefBlacklist.contains(subgoal.goalPos)) continue;
 
                 List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);
                 if (path != null && !path.isEmpty()) {
                     int planSizeBefore = fullPlan.size();
+                    SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                     planIndependentAgents(subgoal, subgoals, currentState, level);
                     List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
                     reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep, subgoal.isAgentGoal);
@@ -2652,7 +3030,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         regressedGoals.removeAll(displacedGoals);
                         if (!regressedGoals.isEmpty()) {
                             boolean subgoalReached = !subgoal.isAgentGoal && verifyGoalReached(subgoal, tempState, level);
-                            if (regressedGoals.size() <= 1 && subgoalReached) {
+                            int satisfiedBefore = countSatisfiedBoxGoals(currentState, level);
+                            int satisfiedAfter = countSatisfiedBoxGoals(tempState, level);
+                            boolean netGoalGain = satisfiedAfter > satisfiedBefore;
+                            if (regressedGoals.size() <= 1 && subgoalReached && netGoalGain) {
                                 Position regressedPos = regressedGoals.get(0);
                                 logNormal(getName() + ": [CYCLE-BREAK][REGRESS-ACCEPT] " 
                                         + subgoal.boxType + " -> " + subgoal.goalPos
@@ -2671,7 +3052,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 cachedSubgoalOrder = null;
                                 subgoalManager.invalidateHungarianCache();
                             } else {
-                                logVerbose("[PP] [CYCLE-BREAK] Regression rollback for " + subgoal.goalPos);
+                                logVerbose("[PP] [CYCLE-BREAK] Regression rollback for " + subgoal.goalPos
+                                        + (subgoalReached && !netGoalGain
+                                                ? " (no net satisfied-goal gain)" : ""));
                                 for (Position rg : regressedGoals) {
                                     int count = regressDisturbCount.merge(rg, 1, Integer::sum);
                                     if (count >= MAX_REGRESS_PER_GOAL) {
@@ -2707,6 +3090,21 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             storedPlanSubgoals.clear();
                             continue;
                         }
+                        if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                            rollbackPlanTo(fullPlan, planSizeBefore);
+                            planMerger.clearAllPlans();
+                            storedPlanSubgoals.clear();
+                            continue;
+                        }
+                        if (!acceptReachedSubgoal("CYCLE-BREAK", subgoal, beforeEval, tempState, level,
+                                planSizeBefore, fullPlan.size(), subgoals)) {
+                            rollbackPlanTo(fullPlan, planSizeBefore);
+                            planMerger.clearAllPlans();
+                            storedPlanSubgoals.clear();
+                            continue;
+                        }
+                        logAcceptedSubgoalEval("CYCLE-BREAK", subgoal, beforeEval, tempState, level,
+                                planSizeBefore, fullPlan.size());
                         if (!subgoal.isAgentGoal) {
                             completedBoxGoals.add(subgoal.goalPos);
                             int count = goalCompletionCount.getOrDefault(subgoal.goalPos, 0) + 1;
@@ -2727,6 +3125,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 + " -> " + subgoal.goalPos + " (" + path.size() + " steps) [CYCLE-BREAK]");
                         return true;
                     }
+                    logNormal(getName() + ": [CYCLE-BREAK][EXEC-MISMATCH] "
+                            + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                            + " -> " + subgoal.goalPos
+                            + " executed but goal not reached - rollback");
+                    while (fullPlan.size() > planSizeBefore) {
+                        fullPlan.remove(fullPlan.size() - 1);
+                        globalTimeStep--;
+                    }
+                    planMerger.clearAllPlans();
+                    storedPlanSubgoals.clear();
+                    continue;
                 }
             }
             logVerbose("[PP] [CYCLE-BREAK] Second pass also failed — no executable subgoal found");
@@ -2736,7 +3145,689 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 + ", total=" + subgoals.size() + ")");
         return false;
     }
+
+    private void deferBlockedGoal(Subgoal subgoal, State state, Level level,
+                                  List<Subgoal> allSubgoals) {
+        if (subgoal == null || subgoal.goalPos == null) return;
+        if (subgoal.isSyntheticRelief() || isSyntheticBoxTarget(subgoal, level)) return;
+        if (deferredBlockedGoals.add(subgoal.goalPos)) {
+            List<Position> blockers = findAccessBlockersForTask(subgoal, state, level, allSubgoals);
+            recordFailureSignal(subgoal.isAgentGoal
+                            ? FailureReport.Cause.AGENT_GOAL_BLOCKED
+                            : FailureReport.Cause.BOX_GOAL_BLOCKED,
+                    Collections.singletonList(subgoal.goalPos), blockers);
+            logNormal("[PP][DEFER] " + subgoalLabel(subgoal)
+                    + " remains blocked after relief/clearing; softening as prerequisite"
+                    + (blockers.isEmpty() ? "" : " blockers=" + blockers));
+            cachedSubgoalOrder = null;
+        }
+    }
     
+    private State tryTaskConditionedBlockerRelief(Subgoal blockedSubgoal, State state, Level level,
+            List<Action[]> fullPlan, int numAgents, List<Subgoal> allSubgoals) {
+        if (isSyntheticBoxTarget(blockedSubgoal, level)) {
+            return null;
+        }
+
+        int initialPlanSize = fullPlan.size();
+        int initialTime = globalTimeStep;
+        State current = state;
+        int moved = 0;
+        Set<Position> usedTemps = new HashSet<>();
+        Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
+
+        for (int round = 0; round < MAX_TASK_RELIEF_MOVES; round++) {
+            List<Position> blockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
+            if (blockers.isEmpty()) {
+                break;
+            }
+
+            recordFailureSignal(FailureReport.Cause.BOX_GOAL_BLOCKED,
+                    Collections.singletonList(blockedSubgoal.goalPos), blockers);
+            logNormal("[PP][TASK-RELIEF] " + subgoalLabel(blockedSubgoal)
+                    + " blocked by " + blockers + " - trying local relief"
+                    + " (round=" + (round + 1) + ")");
+
+            boolean movedThisRound = false;
+            int blockerCountBefore = blockers.size();
+
+            for (Position blockerPos : blockers) {
+                if (moved >= MAX_TASK_RELIEF_MOVES) break;
+                Character blockerType = current.getBoxes().get(blockerPos);
+                if (blockerType == null) continue;
+
+                int helper = findHelperAgentForBox(blockerType, current, level, blockerPos);
+                if (helper < 0) continue;
+
+                int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
+                        Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
+                                computeDynamicBspBudget(blockerPos, blockedSubgoal.goalPos) * 2));
+                Set<Position> unfreeze = new HashSet<>();
+                unfreeze.add(blockerPos);
+                Set<Position> releaseForbidden = new HashSet<>(taskCritical);
+                releaseForbidden.addAll(allGoalCells(level));
+                releaseForbidden.addAll(usedTemps);
+                releaseForbidden.add(blockerPos);
+
+                int attempted = 0;
+                int bspFailed = 0;
+                int validationFailed = 0;
+                int skippedNogood = 0;
+                boolean movedThisBlocker = false;
+
+                int planSizeBeforeRelease = fullPlan.size();
+                int timeBeforeRelease = globalTimeStep;
+                List<Action> releasePath = boxSearchPlanner.planBoxReleaseFromForbidden(
+                        helper, blockerPos, blockerType, current, level,
+                        releaseForbidden, unfreeze, reliefBudget, taskCritical);
+                attempted++;
+                if (releasePath != null && !releasePath.isEmpty()) {
+                    State beforeRelease = current;
+                    State trial = appendReliefPath(releasePath, helper, current, level, fullPlan, numAgents);
+                    Position releasedPos = findRelocatedBoxPosition(beforeRelease, trial, blockerType, blockerPos);
+                    int blockerCountAfter = findAccessBlockersForTask(
+                            blockedSubgoal, trial, level, allSubgoals).size();
+                    boolean movedBlocker = releasedPos != null && !releasedPos.equals(blockerPos)
+                            && !trial.getBoxes().containsKey(blockerPos);
+                    boolean madeTaskProgress = blockerCountAfter < blockerCountBefore
+                            || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
+
+                    if (movedBlocker && madeTaskProgress) {
+                        current = trial;
+                        usedTemps.add(releasedPos);
+                        moved++;
+                        movedThisBlocker = true;
+                        movedThisRound = true;
+                        logNormal("[PP][TASK-RELIEF] released blocker "
+                                + blockerType + " " + blockerPos + " -> " + releasedPos
+                                + " for " + subgoalLabel(blockedSubgoal)
+                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter);
+                    } else {
+                        rollbackPlanTo(fullPlan, planSizeBeforeRelease);
+                        globalTimeStep = timeBeforeRelease;
+                        planMerger.clearAllPlans();
+                        storedPlanSubgoals.clear();
+                        validationFailed++;
+                    }
+                } else {
+                    bspFailed++;
+                }
+
+                if (movedThisBlocker) {
+                    if (movedThisRound) break;
+                    continue;
+                }
+
+                List<Position> parkingCandidates = findTaskReliefParkingCandidates(
+                        blockerPos, current, level, taskCritical, usedTemps);
+                for (Position pTemp : parkingCandidates) {
+                    String nogoodKey = taskReliefNogoodKey(blockedSubgoal, blockerPos, pTemp);
+                    if (taskReliefNogoods.contains(nogoodKey)) {
+                        skippedNogood++;
+                        continue;
+                    }
+
+                    int planSizeBefore = fullPlan.size();
+                    int timeBefore = globalTimeStep;
+                    List<Action> reliefPath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
+                            helper, blockerPos, pTemp, blockerType, current, level,
+                            unfreeze, reliefBudget, taskCritical);
+                    attempted++;
+                    if (reliefPath == null || reliefPath.isEmpty()) {
+                        taskReliefNogoods.add(nogoodKey);
+                        bspFailed++;
+                        continue;
+                    }
+
+                    State trial = appendReliefPath(reliefPath, helper, current, level, fullPlan, numAgents);
+
+                    Character atTemp = trial.getBoxes().get(pTemp);
+                    int blockerCountAfter = findAccessBlockersForTask(
+                            blockedSubgoal, trial, level, allSubgoals).size();
+                    boolean movedBlocker = atTemp != null && atTemp == blockerType
+                            && !trial.getBoxes().containsKey(blockerPos);
+                    boolean madeTaskProgress = blockerCountAfter < blockerCountBefore
+                            || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
+
+                    if (movedBlocker && madeTaskProgress) {
+                        current = trial;
+                        usedTemps.add(pTemp);
+                        moved++;
+                        movedThisBlocker = true;
+                        movedThisRound = true;
+                        logNormal("[PP][TASK-RELIEF] moved blocker "
+                                + blockerType + " " + blockerPos + " -> " + pTemp
+                                + " for " + subgoalLabel(blockedSubgoal)
+                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter);
+                        break;
+                    }
+
+                    rollbackPlanTo(fullPlan, planSizeBefore);
+                    globalTimeStep = timeBefore;
+                    planMerger.clearAllPlans();
+                    storedPlanSubgoals.clear();
+                    taskReliefNogoods.add(nogoodKey);
+                    validationFailed++;
+                }
+
+                if (!movedThisBlocker) {
+                    logNormal("[PP][TASK-RELIEF] failed blocker "
+                            + blockerType + " at " + blockerPos
+                            + " for " + subgoalLabel(blockedSubgoal)
+                            + " candidates=" + parkingCandidates.size()
+                            + " attempted=" + attempted
+                            + " bspFailed=" + bspFailed
+                            + " validationFailed=" + validationFailed
+                            + " skippedNogood=" + skippedNogood);
+                }
+
+                if (movedThisRound) break;
+            }
+
+            if (!movedThisRound) {
+                break;
+            }
+            taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
+        }
+
+        if (moved == 0) return null;
+        List<Position> remainingBlockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
+        if (!remainingBlockers.isEmpty()) {
+            rollbackPlanTo(fullPlan, initialPlanSize);
+            globalTimeStep = initialTime;
+            planMerger.clearAllPlans();
+            storedPlanSubgoals.clear();
+            logNormal("[PP][TASK-RELIEF] incomplete relief for " + subgoalLabel(blockedSubgoal)
+                    + " remaining=" + remainingBlockers + " -- rollback partial relief");
+            return null;
+        }
+        subgoalManager.invalidateHungarianCache();
+        cachedSubgoalOrder = null;
+        return current;
+    }
+
+    private State tryScopedSyntheticBlockerRelief(Subgoal blockedSubgoal, State state, Level level,
+            List<Action[]> fullPlan, int numAgents, List<Subgoal> allSubgoals) {
+        if (isSyntheticBoxTarget(blockedSubgoal, level)) {
+            return null;
+        }
+
+        int initialPlanSize = fullPlan.size();
+        int initialTime = globalTimeStep;
+        State current = state;
+        int moved = 0;
+
+        BlockerReliefSynthesizer.ReliefResult reliefResult =
+                BlockerReliefSynthesizer.synthesizeWithMeta(current, level, immovableBoxes);
+        if (reliefResult.reliefs.isEmpty()) {
+            return null;
+        }
+
+        Set<Subgoal> selected = new LinkedHashSet<>();
+        for (Subgoal relief : reliefResult.reliefs) {
+            if (reliefTargetsSubgoal(relief, blockedSubgoal, current, level, allSubgoals)) {
+                selected.add(relief);
+            }
+        }
+        boolean added;
+        do {
+            added = false;
+            for (Subgoal relief : reliefResult.reliefs) {
+                if (selected.contains(relief)) continue;
+                for (Subgoal parentRelief : selected) {
+                    if (reliefSupportsRelief(relief, parentRelief)) {
+                        selected.add(relief);
+                        added = true;
+                        break;
+                    }
+                }
+            }
+        } while (added);
+
+        List<Subgoal> candidates = new ArrayList<>(reliefResult.reliefs);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        int maxScopedMoves = Math.max(MAX_TASK_RELIEF_MOVES, Math.min(12, candidates.size()));
+
+        logNormal("[PP][SCOPED-RELIEF] " + subgoalLabel(blockedSubgoal)
+                + " trying " + candidates.size() + " NAMO relief candidate(s)"
+                + " (directChain=" + selected.size() + ", moveCap=" + maxScopedMoves + ")");
+
+        for (Subgoal relief : candidates) {
+            if (moved >= maxScopedMoves) break;
+            if (syntheticReliefBlacklist.contains(relief.goalPos)) continue;
+            if (relief.isSyntheticRelief() && !reliefCertificateStillBlocked(relief, current, level)) {
+                continue;
+            }
+
+            List<Position> blockersBefore = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
+            boolean hadAccessBefore = hasTaskAccess(blockedSubgoal, current, level, allSubgoals);
+            int planSizeBefore = fullPlan.size();
+            int timeBefore = globalTimeStep;
+            SubgoalEval beforeEval = captureSubgoalEval(relief, current, level);
+
+            Position blockerPos = relief.reliefCertificate.blockerStart;
+            Character blockerType = current.getBoxes().get(blockerPos);
+            if (blockerType == null || blockerType != relief.boxType) {
+                continue;
+            }
+            Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
+            Set<Position> releaseForbidden = new HashSet<>(taskCritical);
+            releaseForbidden.addAll(allGoalCells(level));
+            releaseForbidden.add(blockerPos);
+            Set<Position> unfreeze = new HashSet<>();
+            unfreeze.add(blockerPos);
+            int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
+                    Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
+                            computeDynamicBspBudget(blockerPos, blockedSubgoal.goalPos) * 2));
+            List<Action> reliefPath = planSubgoal(relief, current, level, allSubgoals);
+            boolean usedFixedTargetFallback = reliefPath != null && !reliefPath.isEmpty();
+            if (reliefPath == null || reliefPath.isEmpty()) {
+                reliefPath = boxSearchPlanner.planBoxReleaseFromForbidden(
+                        relief.agentId, blockerPos, relief.boxType, current, level,
+                        releaseForbidden, unfreeze, reliefBudget, taskCritical);
+                usedFixedTargetFallback = false;
+            }
+            if (reliefPath == null || reliefPath.isEmpty()) {
+                logNormal("[PP][SCOPED-RELIEF] failed to plan " + subgoalLabel(relief)
+                        + " for " + subgoalLabel(blockedSubgoal)
+                        + " cert=" + reliefCertificateLabel(relief));
+                continue;
+            }
+
+            State beforeRelease = current;
+            State trial = appendReliefPath(reliefPath, relief.agentId, current, level, fullPlan, numAgents);
+            if (!acceptReachedSubgoal("SCOPED-RELIEF", relief, beforeEval, trial, level,
+                    planSizeBefore, fullPlan.size(), allSubgoals)) {
+                rollbackPlanTo(fullPlan, planSizeBefore);
+                globalTimeStep = timeBefore;
+                planMerger.clearAllPlans();
+                storedPlanSubgoals.clear();
+                continue;
+            }
+
+            Position releasedPos = findRelocatedBoxPosition(beforeRelease, trial, relief.boxType, blockerPos);
+            List<Position> blockersAfter = findAccessBlockersForTask(blockedSubgoal, trial, level, allSubgoals);
+            boolean hasAccessAfter = hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
+            boolean madeTaskProgress = blockersAfter.size() < blockersBefore.size()
+                    || (!hadAccessBefore && hasAccessAfter);
+
+            current = trial;
+            moved++;
+            logNormal("[PP][SCOPED-RELIEF] accepted " + subgoalLabel(relief)
+                    + " for " + subgoalLabel(blockedSubgoal)
+                    + " released=" + blockerPos + "->" + releasedPos
+                    + " blockers=" + blockersBefore.size() + "->" + blockersAfter.size()
+                    + " parentProgress=" + madeTaskProgress
+                    + " mode=" + (usedFixedTargetFallback ? "fixed-target" : "release")
+                    + " cert=" + reliefCertificateLabel(relief));
+
+            List<Action> parentPath = planSubgoal(blockedSubgoal, current, level, allSubgoals);
+            if (parentPath != null && !parentPath.isEmpty()) {
+                subgoalManager.invalidateHungarianCache();
+                cachedSubgoalOrder = null;
+                return current;
+            }
+        }
+
+        if (moved > 0) {
+            rollbackPlanTo(fullPlan, initialPlanSize);
+            globalTimeStep = initialTime;
+            planMerger.clearAllPlans();
+            storedPlanSubgoals.clear();
+            logNormal("[PP][SCOPED-RELIEF] incomplete relief for " + subgoalLabel(blockedSubgoal)
+                    + " -- rollback partial relief");
+        }
+        return null;
+    }
+
+    private boolean reliefTargetsSubgoal(Subgoal relief, Subgoal blockedSubgoal, State state,
+                                         Level level, List<Subgoal> allSubgoals) {
+        if (!relief.isSyntheticRelief()) return false;
+        ReliefCertificate cert = relief.reliefCertificate;
+
+        if (cert.blockedAgentId == blockedSubgoal.agentId) {
+            return true;
+        }
+        if (blockedSubgoal.goalPos != null && blockedSubgoal.goalPos.equals(cert.secondary)) {
+            return true;
+        }
+        if (!blockedSubgoal.isAgentGoal && blockedSubgoal.goalPos != null
+                && blockedSubgoal.goalPos.equals(cert.primary)) {
+            return true;
+        }
+        if (!blockedSubgoal.isAgentGoal && cert.primary != null) {
+            for (Position boxPos : sameTypeBoxesForSubgoal(blockedSubgoal, state, level, allSubgoals)) {
+                if (boxPos.equals(cert.primary)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean reliefSupportsRelief(Subgoal candidate, Subgoal parentRelief) {
+        if (!candidate.isSyntheticRelief() || !parentRelief.isSyntheticRelief()) {
+            return false;
+        }
+        ReliefCertificate candidateCert = candidate.reliefCertificate;
+        ReliefCertificate parentCert = parentRelief.reliefCertificate;
+        if (candidateCert.blockedAgentId != parentRelief.agentId) {
+            return false;
+        }
+        return parentCert.blockerStart != null
+                && (parentCert.blockerStart.equals(candidateCert.primary)
+                || parentCert.blockerStart.equals(candidateCert.secondary));
+    }
+
+    private State appendReliefPath(List<Action> reliefPath, int helper, State current,
+                                   Level level, List<Action[]> fullPlan, int numAgents) {
+        State trial = current;
+        for (Action action : reliefPath) {
+            Action[] jointAction = planMerger.createJointActionWithMerging(
+                    helper, action, trial, level, numAgents, false, completedBoxGoals);
+            jointAction = conflictResolver.resolveConflicts(jointAction, trial, level, helper);
+            fullPlan.add(jointAction);
+            trial = applyJointAction(jointAction, trial, level, numAgents);
+            globalTimeStep++;
+            planMerger.updatePlanIndexes(jointAction, numAgents, helper);
+        }
+        return trial;
+    }
+
+    private Position findRelocatedBoxPosition(State before, State after, char boxType, Position oldPos) {
+        Character stillThere = after.getBoxes().get(oldPos);
+        if (stillThere != null && stillThere == boxType) return oldPos;
+
+        Set<Position> beforePositions = new HashSet<>();
+        for (Map.Entry<Position, Character> entry : before.getBoxes().entrySet()) {
+            if (entry.getValue() == boxType) beforePositions.add(entry.getKey());
+        }
+        for (Map.Entry<Position, Character> entry : after.getBoxes().entrySet()) {
+            if (entry.getValue() != boxType) continue;
+            if (!beforePositions.contains(entry.getKey())) return entry.getKey();
+        }
+        return null;
+    }
+
+    private Set<Position> allGoalCells(Level level) {
+        Set<Position> cells = new HashSet<>();
+        for (List<Position> goals : level.getBoxGoalsByType().values()) cells.addAll(goals);
+        cells.addAll(level.getAgentGoalPositionMap().values());
+        return cells;
+    }
+
+    private List<Position> findAccessBlockersForTask(Subgoal subgoal, State state, Level level,
+                                                     List<Subgoal> allSubgoals) {
+        Color agentColor = level.getAgentColor(subgoal.agentId);
+        Set<Position> reachable = strictAgentReachable(state.getAgentPosition(subgoal.agentId), state, level);
+        if (subgoal.isAgentGoal) {
+            if (reachable.contains(subgoal.goalPos)) {
+                return Collections.emptyList();
+            }
+            return findAgentGoalBlockersForTask(subgoal, state, level, agentColor);
+        }
+
+        List<Position> candidateBoxes = sameTypeBoxesForSubgoal(subgoal, state, level, allSubgoals);
+        Set<Position> blockers = new LinkedHashSet<>();
+
+        for (Position boxPos : candidateBoxes) {
+            if (hasReachableNeighbor(boxPos, reachable, level)) continue;
+
+            for (Direction dir : Direction.values()) {
+                Position adj = boxPos.move(dir);
+                if (level.isWall(adj)) continue;
+                if (reachable.contains(adj)) continue;
+                Character adjBox = state.getBoxes().get(adj);
+                if (adjBox != null) {
+                    Color adjColor = level.getBoxColor(adjBox);
+                    if (adjColor != null && !adjColor.equals(agentColor)
+                            && !immovableBoxes.contains(adj)) {
+                        blockers.add(adj);
+                    }
+                } else {
+                    blockers.addAll(findAgentPathBlockersToAccessCell(
+                            state.getAgentPosition(subgoal.agentId), adj, state, level, agentColor));
+                }
+            }
+        }
+        return new ArrayList<>(blockers);
+    }
+
+    private List<Position> findAgentGoalBlockersForTask(Subgoal subgoal, State state, Level level,
+                                                        Color agentColor) {
+        LinkedHashSet<Position> blockers = new LinkedHashSet<>();
+        List<Position> pathBlockers = findAgentPathBlockersToAccessCell(
+                state.getAgentPosition(subgoal.agentId), subgoal.goalPos, state, level, agentColor);
+        Collections.reverse(pathBlockers);
+        blockers.addAll(pathBlockers);
+
+        Character goalBox = state.getBoxes().get(subgoal.goalPos);
+        if (goalBox != null) {
+            Color goalBoxColor = level.getBoxColor(goalBox);
+            if (goalBoxColor != null && !goalBoxColor.equals(agentColor)
+                    && !immovableBoxes.contains(subgoal.goalPos)) {
+                blockers.add(subgoal.goalPos);
+            }
+        }
+        return new ArrayList<>(blockers);
+    }
+
+    private boolean hasTaskAccess(Subgoal subgoal, State state, Level level,
+                                  List<Subgoal> allSubgoals) {
+        Set<Position> reachable = strictAgentReachable(state.getAgentPosition(subgoal.agentId), state, level);
+        if (subgoal.isAgentGoal) {
+            return reachable.contains(subgoal.goalPos);
+        }
+        for (Position boxPos : sameTypeBoxesForSubgoal(subgoal, state, level, allSubgoals)) {
+            if (hasReachableNeighbor(boxPos, reachable, level)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String taskReliefNogoodKey(Subgoal task, Position blockerPos, Position pTemp) {
+        String taskKey = task.isAgentGoal
+                ? "agent" + task.agentId + "@" + task.goalPos
+                : task.agentId + ":" + task.boxType + "@" + task.goalPos;
+        return taskKey
+                + "|blocker=" + blockerPos + "|park=" + pTemp;
+    }
+
+    /**
+     * Finds boxes on a shortest static route from the task agent to an operation
+     * cell. Normal reachability treats boxes as walls; this pass treats movable
+     * boxes as passable only to identify which ones explain the failed access.
+     */
+    private List<Position> findAgentPathBlockersToAccessCell(Position start, Position target,
+            State state, Level level, Color taskAgentColor) {
+        if (start == null || target == null || level.isWall(target)) return Collections.emptyList();
+
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        Map<Position, Position> parent = new HashMap<>();
+        queue.add(start);
+        visited.add(start);
+
+        boolean found = false;
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            if (current.equals(target)) {
+                found = true;
+                break;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next) || immovableBoxes.contains(next)) continue;
+                visited.add(next);
+                parent.put(next, current);
+                queue.add(next);
+            }
+        }
+
+        if (!found) return Collections.emptyList();
+
+        LinkedHashSet<Position> blockers = new LinkedHashSet<>();
+        Position current = target;
+        while (current != null && !current.equals(start)) {
+            Character box = state.getBoxes().get(current);
+            if (box != null) {
+                Color boxColor = level.getBoxColor(box);
+                if (boxColor != null && !boxColor.equals(taskAgentColor)) {
+                    blockers.add(current);
+                }
+            }
+            current = parent.get(current);
+        }
+        return new ArrayList<>(blockers);
+    }
+
+    private Set<Position> taskAccessCells(Subgoal subgoal, State state, Level level,
+                                          List<Subgoal> allSubgoals) {
+        Set<Position> cells = new HashSet<>();
+        cells.add(subgoal.goalPos);
+        if (subgoal.isAgentGoal) {
+            for (Direction dir : Direction.values()) {
+                Position adj = subgoal.goalPos.move(dir);
+                if (!level.isWall(adj)) cells.add(adj);
+            }
+            return cells;
+        }
+        for (Position boxPos : sameTypeBoxesForSubgoal(subgoal, state, level, allSubgoals)) {
+            cells.add(boxPos);
+            for (Direction dir : Direction.values()) {
+                Position adj = boxPos.move(dir);
+                if (!level.isWall(adj)) cells.add(adj);
+            }
+        }
+        return cells;
+    }
+
+    private List<Position> sameTypeBoxesForSubgoal(Subgoal subgoal, State state, Level level,
+                                                   List<Subgoal> allSubgoals) {
+        Position preferred = subgoalManager.findBestBoxForGoal(
+                subgoal, state, level, allSubgoals, completedBoxGoals);
+        List<Position> boxes = new ArrayList<>();
+        if (preferred != null) boxes.add(preferred);
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() == subgoal.boxType
+                    && !entry.getKey().equals(preferred)
+                    && level.getBoxGoal(entry.getKey()) != subgoal.boxType) {
+                boxes.add(entry.getKey());
+            }
+        }
+        return boxes;
+    }
+
+    private Set<Position> strictAgentReachable(Position start, State state, Level level) {
+        Set<Position> visited = new HashSet<>();
+        if (start == null || level.isWall(start) || state.hasBoxAt(start)) return visited;
+        Queue<Position> queue = new LinkedList<>();
+        visited.add(start);
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next) || state.hasBoxAt(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return visited;
+    }
+
+    private boolean hasReachableNeighbor(Position pos, Set<Position> reachable, Level level) {
+        for (Direction dir : Direction.values()) {
+            Position adj = pos.move(dir);
+            if (!level.isWall(adj) && reachable.contains(adj)) return true;
+        }
+        return false;
+    }
+
+    private int findHelperAgentForBox(char boxType, State state, Level level, Position boxPos) {
+        Color color = level.getBoxColor(boxType);
+        if (color == null) return -1;
+        int bestAgent = -1;
+        int bestDist = Integer.MAX_VALUE;
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            if (!color.equals(level.getAgentColor(agentId))) continue;
+            Position agentPos = state.getAgentPosition(agentId);
+            if (agentPos == null) continue;
+            int d = agentPos.manhattanDistance(boxPos);
+            if (d < bestDist) {
+                bestDist = d;
+                bestAgent = agentId;
+            }
+        }
+        return bestAgent;
+    }
+
+    private List<Position> findTaskReliefParkingCandidates(Position blockerPos, State state, Level level,
+                                                           Set<Position> taskCritical,
+                                                           Set<Position> usedTemps) {
+        Set<Position> goalCells = new HashSet<>();
+        for (List<Position> goals : level.getBoxGoalsByType().values()) goalCells.addAll(goals);
+        goalCells.addAll(level.getAgentGoalPositionMap().values());
+
+        List<Position> safe = new ArrayList<>();
+        List<Position> fallback = new ArrayList<>();
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(blockerPos);
+        visited.add(blockerPos);
+
+        int expansions = 0;
+        while (!queue.isEmpty() && expansions++ < 160) {
+            Position p = queue.poll();
+            if (!p.equals(blockerPos)
+                    && !level.isWall(p)
+                    && !state.hasBoxAt(p)
+                    && !immovableBoxes.contains(p)
+                    && !goalCells.contains(p)
+                    && !taskCritical.contains(p)
+                    && !usedTemps.contains(p)) {
+                if (countFreeNeighborsForTaskRelief(p, state, level) <= 1) {
+                    safe.add(p);
+                } else {
+                    fallback.add(p);
+                }
+            }
+
+            for (Direction dir : Direction.values()) {
+                Position next = p.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next) || immovableBoxes.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+
+        Comparator<Position> byDistance = Comparator
+                .comparingInt((Position p) -> p.manhattanDistance(blockerPos))
+                .thenComparingInt(p -> p.row)
+                .thenComparingInt(p -> p.col);
+        safe.sort(byDistance);
+        fallback.sort(byDistance);
+        safe.addAll(fallback);
+        return safe;
+    }
+
+    private int countFreeNeighborsForTaskRelief(Position p, State state, Level level) {
+        int count = 0;
+        for (Direction dir : Direction.values()) {
+            Position adj = p.move(dir);
+            if (!level.isWall(adj) && !state.hasBoxAt(adj) && !immovableBoxes.contains(adj)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     /**
      * Path Clearing: when BSP fails because OTHER boxes physically block the target
      * box's path to its goal, this method identifies those blockers and uses the
@@ -3630,8 +4721,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // distance), but PP executes SERIALLY. A globally-optimal box can be locally
             // terrible for BSP's limited search budget (far away, complex path). The retry
             // gives greedy Layer 2 a chance to pick a closer, easier box.
-            boolean usedHungarian = subgoalManager.hasHungarianCache();
-            Position boxPos = subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
+            boolean fixedReliefBox = subgoal.isSyntheticRelief()
+                    && subgoal.reliefCertificate.blockerStart != null;
+            boolean usedHungarian = !fixedReliefBox && subgoalManager.hasHungarianCache();
+            Position boxPos = fixedReliefBox
+                    ? subgoal.reliefCertificate.blockerStart
+                    : subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
+            if (fixedReliefBox && state.getBoxAt(boxPos) != subgoal.boxType) {
+                String cert = reliefCertificateLabel(subgoal);
+                logNormalRepeated("synthetic.skip.blocker-moved " + cert,
+                        "[PP][SYNTHETIC-RELIEF-SKIP] subgoal=" + subgoalLabel(subgoal)
+                                + " reason=blocker-not-at-certificate-start cert=" + cert);
+                return null;
+            }
             
             for (int attempt = 0; attempt < 2; attempt++) {
                 if (boxPos == null) {
@@ -3697,12 +4799,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 logVerbose("[PP] Round 1 (frozen) failed for " + subgoal.boxType + " -> " + subgoal.goalPos);
 
-                // P4b: Round 1.5 — IW(1) fallback for moderate-distance find-route subgoals
-                // when A*/BSP failed under frozen. Per qanda.txt §3.3 / §4.4: IW(1) is the
-                // sweet spot for single-box find-route where A*+Manhattan badly underestimates
-                // (long detours around walls). Used as a FALLBACK (not Round 0 speculation)
-                // to preserve the fast A* path on simple subgoals. Skip very short paths
-                // (A* trivially solves them) and very long paths (IW(1) state explosion).
+                // P4b: Round 1.5 — IW(1) FIND-ROUTE FALLBACK (per claudeopus47 §1.2.2 / §3.2)
+                // for moderate-distance find-route subgoals when A*/BSP failed under frozen.
+                // Per qanda.txt §3.3 / §4.4: IW(1) is the sweet spot for single-box find-route
+                // where A*+Manhattan badly underestimates (long detours around walls).
+                // Used as a FALLBACK (not Round 0 speculation) to preserve the fast A* path
+                // on simple subgoals. Skip very short paths (A* trivially solves them)
+                // and very long paths (IW(1) state explosion).
                 if (!isEscapeSg
                         && boxToGoalManhattan >= IW1_FINDROUTE_MIN_MANHATTAN
                         && boxToGoalManhattan <= IW1_FINDROUTE_MAX_MANHATTAN) {
@@ -3968,6 +5071,349 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return state.getBoxAt(subgoal.goalPos) == subgoal.boxType;
         }
     }
+
+    private SubgoalEval captureSubgoalEval(Subgoal subgoal, State state, Level level) {
+        Set<Position> reachable = bfsReachableForEval(state.getAgentPosition(subgoal.agentId), state, level);
+        return new SubgoalEval(
+                stateSignature(state),
+                reachable.size(),
+                totalReachableCells(state, level),
+                adjacentReachable(subgoal.goalPos, reachable, level),
+                subgoal.isAgentGoal ? Collections.emptyList() : boxPositionsOfType(state, subgoal.boxType));
+    }
+
+    private boolean acceptReachedSubgoal(String phase, Subgoal subgoal, SubgoalEval before,
+                                         State afterState, Level level, int planStart, int planEnd,
+                                         List<Subgoal> allSubgoals) {
+        if (!isSyntheticBoxTarget(subgoal, level)) return true;
+
+        SubgoalEval after = captureSubgoalEval(subgoal, afterState, level);
+        boolean sameState = before.stateSignature.equals(after.stateSignature);
+        if (subgoal.isSyntheticRelief()) {
+            boolean resolved = reliefCertificateResolved(subgoal, afterState, level);
+            if (!sameState && resolved) {
+                Subgoal blockedFuture = syntheticParkingBlocksRemainingTask(subgoal, afterState, level, allSubgoals);
+                if (blockedFuture != null) {
+                    syntheticReliefBlacklist.add(subgoal.goalPos);
+                    logNormal("[PP][SYNTHETIC-RELIEF-REJECT] phase=" + phase
+                            + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
+                            + " actions=" + Math.max(0, planEnd - planStart)
+                            + " subgoal=" + subgoalLabel(subgoal)
+                            + " reason=blocks-future-task"
+                            + " blockedFuture=" + subgoalLabel(blockedFuture)
+                            + " cert=" + reliefCertificateLabel(subgoal)
+                            + " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+                    return false;
+                }
+                return true;
+            }
+            syntheticReliefBlacklist.add(subgoal.goalPos);
+            logNormal("[PP][SYNTHETIC-RELIEF-REJECT] phase=" + phase
+                    + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
+                    + " actions=" + Math.max(0, planEnd - planStart)
+                    + " subgoal=" + subgoalLabel(subgoal)
+                    + " reason=" + (sameState ? "same-state" : "certificate-not-resolved")
+                    + " cert=" + reliefCertificateLabel(subgoal)
+                    + " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+            return false;
+        }
+
+        int agentReachDelta = after.agentReachable - before.agentReachable;
+        int totalReachDelta = after.totalReachable - before.totalReachable;
+        boolean openedTargetAdjacency = after.goalAdjacentReachable && !before.goalAdjacentReachable;
+        boolean reachGain = agentReachDelta > 0 || totalReachDelta > 0;
+
+        if (!sameState && (reachGain || openedTargetAdjacency)) {
+            Subgoal blockedFuture = syntheticParkingBlocksRemainingTask(subgoal, afterState, level, allSubgoals);
+            if (blockedFuture != null) {
+                syntheticReliefBlacklist.add(subgoal.goalPos);
+                logNormal("[PP][SYNTHETIC-RELIEF-REJECT] phase=" + phase
+                        + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
+                        + " actions=" + Math.max(0, planEnd - planStart)
+                        + " subgoal=" + subgoalLabel(subgoal)
+                        + " reason=blocks-future-task"
+                        + " blockedFuture=" + subgoalLabel(blockedFuture)
+                        + " agentReach=" + before.agentReachable + "->" + after.agentReachable
+                        + " totalReach=" + before.totalReachable + "->" + after.totalReachable
+                        + " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+                return false;
+            }
+            return true;
+        }
+
+        syntheticReliefBlacklist.add(subgoal.goalPos);
+        logNormal("[PP][SYNTHETIC-RELIEF-REJECT] phase=" + phase
+                + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
+                + " actions=" + Math.max(0, planEnd - planStart)
+                + " subgoal=" + subgoalLabel(subgoal)
+                + " reason=" + (sameState ? "same-state" : "no-reach-gain")
+                + " agentReach=" + before.agentReachable + "->" + after.agentReachable
+                + " totalReach=" + before.totalReachable + "->" + after.totalReachable
+                + " goalAdj=" + before.goalAdjacentReachable + "->" + after.goalAdjacentReachable
+                + " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+        return false;
+    }
+
+    private Subgoal syntheticParkingBlocksRemainingTask(Subgoal synthetic, State state, Level level,
+                                                        List<Subgoal> allSubgoals) {
+        Position parked = synthetic.goalPos;
+        Character parkedBox = state.getBoxAt(parked);
+        if (parkedBox == null || parkedBox != synthetic.boxType) return null;
+
+        List<Subgoal> goalsToCheck = cachedSubgoalOrder != null ? cachedSubgoalOrder : allSubgoals;
+        for (Subgoal remaining : goalsToCheck) {
+            if (remaining == synthetic) continue;
+            if (isSyntheticBoxTarget(remaining, level)) continue;
+            if (remaining.isAgentGoal) {
+                if (remaining.goalPos.equals(state.getAgentPosition(remaining.agentId))) continue;
+            } else {
+                if (completedBoxGoals.contains(remaining.goalPos)) continue;
+                Character atGoal = state.getBoxAt(remaining.goalPos);
+                if (atGoal != null && atGoal == remaining.boxType) continue;
+            }
+
+            List<Position> blockers = findAccessBlockersForTask(remaining, state, level, allSubgoals);
+            if (blockers.contains(parked)) {
+                return remaining;
+            }
+        }
+        return null;
+    }
+
+    private boolean wouldSealRemainingGoals(Subgoal completedSubgoal, State afterState,
+                                            Level level, List<Subgoal> allSubgoals) {
+        if (completedSubgoal.isAgentGoal || isSyntheticBoxTarget(completedSubgoal, level)) {
+            return false;
+        }
+
+        Set<Position> frozen = new HashSet<>(completedBoxGoals);
+        frozen.add(completedSubgoal.goalPos);
+        List<Subgoal> goalsToCheck = cachedSubgoalOrder != null ? cachedSubgoalOrder : allSubgoals;
+
+        for (Subgoal remaining : goalsToCheck) {
+            if (remaining == completedSubgoal || remaining.isAgentGoal) continue;
+            if (isSyntheticBoxTarget(remaining, level)) continue;
+            if (remaining.goalPos.equals(completedSubgoal.goalPos)) continue;
+            if (frozen.contains(remaining.goalPos)) continue;
+
+            Character boxAtGoal = afterState.getBoxes().get(remaining.goalPos);
+            if (boxAtGoal != null && boxAtGoal == remaining.boxType) continue;
+
+            if (!canServiceGoalNeighborhood(remaining, afterState, level, frozen)) {
+                logVerbose("[PP][SEAL-REJECT] " + completedSubgoal.boxType + " -> "
+                        + completedSubgoal.goalPos + " would seal "
+                        + remaining.boxType + " -> " + remaining.goalPos
+                        + " with frozen=" + formatPositions(frozen));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean canServiceGoalNeighborhood(Subgoal goal, State state, Level level,
+                                               Set<Position> frozen) {
+        Color goalColor = level.getBoxColor(goal.boxType);
+        if (goalColor == null) return true;
+
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            if (!goalColor.equals(level.getAgentColor(agentId))) continue;
+            Set<Position> reachable = bfsReachableWithFrozenGoals(
+                    state.getAgentPosition(agentId), level, frozen);
+            if (reachable.contains(goal.goalPos)) return true;
+            for (Direction dir : Direction.values()) {
+                Position adj = goal.goalPos.move(dir);
+                if (!level.isWall(adj) && !frozen.contains(adj) && reachable.contains(adj)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private Set<Position> bfsReachableWithFrozenGoals(Position start, Level level, Set<Position> frozen) {
+        Set<Position> visited = new HashSet<>();
+        if (start == null || level.isWall(start) || frozen.contains(start)) return visited;
+        Queue<Position> queue = new LinkedList<>();
+        visited.add(start);
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next) || frozen.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return visited;
+    }
+
+    private String formatPositions(Set<Position> positions) {
+        List<String> out = new ArrayList<>();
+        for (Position p : positions) out.add(p.row + "," + p.col);
+        Collections.sort(out);
+        return out.toString();
+    }
+
+    private boolean isSyntheticBoxTarget(Subgoal subgoal, Level level) {
+        return !subgoal.isAgentGoal && level.getBoxGoal(subgoal.goalPos) == '\0';
+    }
+
+    private boolean reliefCertificateStillBlocked(Subgoal subgoal, State state, Level level) {
+        if (!subgoal.isSyntheticRelief()) return false;
+        ReliefCertificate cert = subgoal.reliefCertificate;
+        return state.hasBoxAt(cert.blockerStart);
+    }
+
+    private boolean reliefCertificateResolved(Subgoal subgoal, State state, Level level) {
+        if (!subgoal.isSyntheticRelief()) return false;
+        ReliefCertificate cert = subgoal.reliefCertificate;
+        return !state.hasBoxAt(cert.blockerStart);
+    }
+
+    private String reliefCertificateLabel(Subgoal subgoal) {
+        if (!subgoal.isSyntheticRelief()) return "-";
+        ReliefCertificate cert = subgoal.reliefCertificate;
+        return cert.kind
+                + " blocker=" + cert.blockerStart
+                + " blockedAgent=" + cert.blockedAgentId
+                + " primary=" + cert.primary
+                + " secondary=" + cert.secondary;
+    }
+
+    private void rollbackPlanTo(List<Action[]> fullPlan, int planSizeBefore) {
+        while (fullPlan.size() > planSizeBefore) {
+            fullPlan.remove(fullPlan.size() - 1);
+            globalTimeStep--;
+        }
+    }
+
+    private void logAcceptedSubgoalEval(String phase, Subgoal subgoal, SubgoalEval before,
+                                        State afterState, Level level, int planStart, int planEnd) {
+        if (!SearchConfig.isNormal()) return;
+        SubgoalEval after = captureSubgoalEval(subgoal, afterState, level);
+        boolean sameState = before.stateSignature.equals(after.stateSignature);
+        boolean syntheticBoxTarget = isSyntheticBoxTarget(subgoal, level);
+        int agentReachDelta = after.agentReachable - before.agentReachable;
+        int totalReachDelta = after.totalReachable - before.totalReachable;
+        String verdict;
+        if (sameState) {
+            verdict = "CYCLE";
+        } else if (subgoal.isSyntheticRelief() && reliefCertificateResolved(subgoal, afterState, level)) {
+            verdict = "CERTIFICATE_RESOLVED";
+        } else if (syntheticBoxTarget && totalReachDelta <= 0 && agentReachDelta <= 0) {
+            verdict = "SYNTHETIC_NO_REACH_GAIN";
+        } else if (after.goalAdjacentReachable && !before.goalAdjacentReachable) {
+            verdict = "TARGET_ADJ_OPENED";
+        } else {
+            verdict = "ACCEPTED";
+        }
+
+        String msg = "[PP][SUBGOAL-EVAL] phase=" + phase
+                + " steps=" + planStart + ".." + Math.max(planStart, planEnd - 1)
+                + " actions=" + Math.max(0, planEnd - planStart)
+                + " subgoal=" + subgoalLabel(subgoal)
+                + " synthetic=" + syntheticBoxTarget
+                + " verdict=" + verdict
+                + " sameState=" + sameState
+                + " agentReach=" + before.agentReachable + "->" + after.agentReachable
+                + " totalReach=" + before.totalReachable + "->" + after.totalReachable
+                + " goalAdj=" + before.goalAdjacentReachable + "->" + after.goalAdjacentReachable
+                + (subgoal.isSyntheticRelief() ? " cert=" + reliefCertificateLabel(subgoal) : "")
+                + (subgoal.isAgentGoal ? "" : " " + subgoal.boxType + "=" + before.boxPositions + "->" + after.boxPositions);
+        if ("ACCEPTED".equals(verdict)) {
+            logVerbose(msg);
+        } else {
+            logNormal(msg);
+        }
+    }
+
+    private String subgoalLabel(Subgoal subgoal) {
+        return subgoal.isAgentGoal
+                ? "agent" + subgoal.agentId + "->@" + subgoal.goalPos
+                : "agent" + subgoal.agentId + "->" + subgoal.boxType + "@" + subgoal.goalPos;
+    }
+
+    private Set<Position> bfsReachableForEval(Position start, State state, Level level) {
+        Set<Position> visited = new HashSet<>();
+        if (start == null) return visited;
+        Queue<Position> queue = new LinkedList<>();
+        visited.add(start);
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next)) continue;
+                if (state.hasBoxAt(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return visited;
+    }
+
+    private int totalReachableCells(State state, Level level) {
+        int total = 0;
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            total += bfsReachableForEval(state.getAgentPosition(agentId), state, level).size();
+        }
+        return total;
+    }
+
+    private boolean adjacentReachable(Position target, Set<Position> reachable, Level level) {
+        if (target == null) return false;
+        if (reachable.contains(target)) return true;
+        for (Direction dir : Direction.values()) {
+            Position adj = target.move(dir);
+            if (!level.isWall(adj) && reachable.contains(adj)) return true;
+        }
+        return false;
+    }
+
+    private List<String> boxPositionsOfType(State state, char boxType) {
+        List<String> positions = new ArrayList<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != boxType) continue;
+            Position p = entry.getKey();
+            positions.add(p.row + "," + p.col);
+        }
+        Collections.sort(positions);
+        return positions;
+    }
+
+    private String stateSignature(State state) {
+        List<String> parts = new ArrayList<>();
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            Position p = state.getAgentPosition(agentId);
+            if (p != null) parts.add("a" + agentId + "@" + p.row + "," + p.col);
+        }
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            Position p = entry.getKey();
+            parts.add(entry.getValue() + "@" + p.row + "," + p.col);
+        }
+        Collections.sort(parts);
+        return String.join("|", parts);
+    }
+
+    private static class SubgoalEval {
+        final String stateSignature;
+        final int agentReachable;
+        final int totalReachable;
+        final boolean goalAdjacentReachable;
+        final List<String> boxPositions;
+
+        SubgoalEval(String stateSignature, int agentReachable, int totalReachable,
+                    boolean goalAdjacentReachable, List<String> boxPositions) {
+            this.stateSignature = stateSignature;
+            this.agentReachable = agentReachable;
+            this.totalReachable = totalReachable;
+            this.goalAdjacentReachable = goalAdjacentReachable;
+            this.boxPositions = boxPositions;
+        }
+    }
     
     /**
      * True if goal pos should be treated as path-critical (filled last, suspended when displaced):
@@ -4044,6 +5490,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return regressed;
+    }
+
+    private int countSatisfiedBoxGoals(State state, Level level) {
+        int count = 0;
+        for (Map.Entry<Character, List<Position>> entry : level.getBoxGoalsByType().entrySet()) {
+            char goalType = entry.getKey();
+            for (Position goalPos : entry.getValue()) {
+                Character actual = state.getBoxes().get(goalPos);
+                if (actual != null && actual == goalType) {
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 
     /** Try displacement-based recovery when stuck with cyclic dependencies. */
@@ -4217,7 +5677,35 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** Apply joint action to state (simultaneous per CLAUDE.md). */
     private State applyJointAction(Action[] jointAction, State state, Level level, int numAgents) {
-        return state.applyJointAction(jointAction, level);
+        Action[] effective = jointAction.clone();
+        boolean changed = false;
+
+        for (int agentId = 0; agentId < effective.length; agentId++) {
+            Action action = effective[agentId];
+            if (action != null && action.type != Action.ActionType.NOOP
+                    && !state.isApplicable(action, agentId, level)) {
+                effective[agentId] = Action.noOp();
+                changed = true;
+            }
+        }
+
+        List<ConflictDetector.Conflict> conflicts =
+                jointActionValidator.detectConflicts(state, effective, level);
+        for (ConflictDetector.Conflict conflict : conflicts) {
+            if (effective[conflict.agent1].type != Action.ActionType.NOOP) {
+                effective[conflict.agent1] = Action.noOp();
+                changed = true;
+            }
+            if (effective[conflict.agent2].type != Action.ActionType.NOOP) {
+                effective[conflict.agent2] = Action.noOp();
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            System.arraycopy(effective, 0, jointAction, 0, effective.length);
+        }
+        return state.applyJointAction(effective, level);
     }
 
     /** Subgoal: move a box or agent to a goal position. */
@@ -4226,16 +5714,60 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         public final char boxType;
         public final Position goalPos;
         public final boolean isAgentGoal;
+        public final ReliefCertificate reliefCertificate;
 
         public Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal) {
+            this(agentId, boxType, goalPos, isAgentGoal, null);
+        }
+
+        public Subgoal(int agentId, char boxType, Position goalPos, boolean isAgentGoal,
+                       ReliefCertificate reliefCertificate) {
             this.agentId = agentId;
             this.boxType = boxType;
             this.goalPos = goalPos;
             this.isAgentGoal = isAgentGoal;
+            this.reliefCertificate = reliefCertificate;
         }
 
         public Subgoal(int agentId, char boxType, Position goalPos) {
             this(agentId, boxType, goalPos, false);
+        }
+
+        public boolean isSyntheticRelief() {
+            return reliefCertificate != null;
+        }
+    }
+
+    public static final class ReliefCertificate {
+        public enum Kind {
+            AGENT_ACCESS,
+            BOX_CORRIDOR
+        }
+
+        public final Kind kind;
+        public final Position blockerStart;
+        public final int blockedAgentId;
+        public final Position primary;
+        public final Position secondary;
+
+        private ReliefCertificate(Kind kind, Position blockerStart, int blockedAgentId,
+                                  Position primary, Position secondary) {
+            this.kind = kind;
+            this.blockerStart = blockerStart;
+            this.blockedAgentId = blockedAgentId;
+            this.primary = primary;
+            this.secondary = secondary;
+        }
+
+        public static ReliefCertificate agentAccess(Position blockerStart, int blockedAgentId,
+                                                    Position targetBox, Position alternateTarget) {
+            return new ReliefCertificate(Kind.AGENT_ACCESS, blockerStart, blockedAgentId,
+                    targetBox, alternateTarget);
+        }
+
+        public static ReliefCertificate boxCorridor(Position blockerStart,
+                                                    Position box, Position goal) {
+            return new ReliefCertificate(Kind.BOX_CORRIDOR, blockerStart, -1, box, goal);
         }
     }
 }
