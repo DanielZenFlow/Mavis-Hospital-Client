@@ -3310,21 +3310,39 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return null;
         }
 
-        List<Subgoal> candidates = new ArrayList<>();
+        Set<Subgoal> selected = new LinkedHashSet<>();
         for (Subgoal relief : reliefResult.reliefs) {
             if (reliefTargetsSubgoal(relief, blockedSubgoal, current, level, allSubgoals)) {
-                candidates.add(relief);
+                selected.add(relief);
             }
         }
+        boolean added;
+        do {
+            added = false;
+            for (Subgoal relief : reliefResult.reliefs) {
+                if (selected.contains(relief)) continue;
+                for (Subgoal parentRelief : selected) {
+                    if (reliefSupportsRelief(relief, parentRelief)) {
+                        selected.add(relief);
+                        added = true;
+                        break;
+                    }
+                }
+            }
+        } while (added);
+
+        List<Subgoal> candidates = new ArrayList<>(reliefResult.reliefs);
         if (candidates.isEmpty()) {
             return null;
         }
+        int maxScopedMoves = Math.max(MAX_TASK_RELIEF_MOVES, Math.min(12, candidates.size()));
 
         logNormal("[PP][SCOPED-RELIEF] " + subgoalLabel(blockedSubgoal)
-                + " trying " + candidates.size() + " NAMO relief candidate(s)");
+                + " trying " + candidates.size() + " NAMO relief candidate(s)"
+                + " (directChain=" + selected.size() + ", moveCap=" + maxScopedMoves + ")");
 
         for (Subgoal relief : candidates) {
-            if (moved >= MAX_TASK_RELIEF_MOVES) break;
+            if (moved >= maxScopedMoves) break;
             if (syntheticReliefBlacklist.contains(relief.goalPos)) continue;
             if (relief.isSyntheticRelief() && !reliefCertificateStillBlocked(relief, current, level)) {
                 continue;
@@ -3336,7 +3354,28 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             int timeBefore = globalTimeStep;
             SubgoalEval beforeEval = captureSubgoalEval(relief, current, level);
 
+            Position blockerPos = relief.reliefCertificate.blockerStart;
+            Character blockerType = current.getBoxes().get(blockerPos);
+            if (blockerType == null || blockerType != relief.boxType) {
+                continue;
+            }
+            Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
+            Set<Position> releaseForbidden = new HashSet<>(taskCritical);
+            releaseForbidden.addAll(allGoalCells(level));
+            releaseForbidden.add(blockerPos);
+            Set<Position> unfreeze = new HashSet<>();
+            unfreeze.add(blockerPos);
+            int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
+                    Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
+                            computeDynamicBspBudget(blockerPos, blockedSubgoal.goalPos) * 2));
             List<Action> reliefPath = planSubgoal(relief, current, level, allSubgoals);
+            boolean usedFixedTargetFallback = reliefPath != null && !reliefPath.isEmpty();
+            if (reliefPath == null || reliefPath.isEmpty()) {
+                reliefPath = boxSearchPlanner.planBoxReleaseFromForbidden(
+                        relief.agentId, blockerPos, relief.boxType, current, level,
+                        releaseForbidden, unfreeze, reliefBudget, taskCritical);
+                usedFixedTargetFallback = false;
+            }
             if (reliefPath == null || reliefPath.isEmpty()) {
                 logNormal("[PP][SCOPED-RELIEF] failed to plan " + subgoalLabel(relief)
                         + " for " + subgoalLabel(blockedSubgoal)
@@ -3344,6 +3383,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
+            State beforeRelease = current;
             State trial = appendReliefPath(reliefPath, relief.agentId, current, level, fullPlan, numAgents);
             if (!acceptReachedSubgoal("SCOPED-RELIEF", relief, beforeEval, trial, level,
                     planSizeBefore, fullPlan.size(), allSubgoals)) {
@@ -3354,27 +3394,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 continue;
             }
 
+            Position releasedPos = findRelocatedBoxPosition(beforeRelease, trial, relief.boxType, blockerPos);
             List<Position> blockersAfter = findAccessBlockersForTask(blockedSubgoal, trial, level, allSubgoals);
             boolean hasAccessAfter = hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
             boolean madeTaskProgress = blockersAfter.size() < blockersBefore.size()
                     || (!hadAccessBefore && hasAccessAfter);
-            if (!madeTaskProgress) {
-                rollbackPlanTo(fullPlan, planSizeBefore);
-                globalTimeStep = timeBefore;
-                planMerger.clearAllPlans();
-                storedPlanSubgoals.clear();
-                logNormal("[PP][SCOPED-RELIEF] rejected " + subgoalLabel(relief)
-                        + " for " + subgoalLabel(blockedSubgoal)
-                        + " reason=no-parent-progress blockers="
-                        + blockersBefore.size() + "->" + blockersAfter.size());
-                continue;
-            }
 
             current = trial;
             moved++;
             logNormal("[PP][SCOPED-RELIEF] accepted " + subgoalLabel(relief)
                     + " for " + subgoalLabel(blockedSubgoal)
+                    + " released=" + blockerPos + "->" + releasedPos
                     + " blockers=" + blockersBefore.size() + "->" + blockersAfter.size()
+                    + " parentProgress=" + madeTaskProgress
+                    + " mode=" + (usedFixedTargetFallback ? "fixed-target" : "release")
                     + " cert=" + reliefCertificateLabel(relief));
 
             List<Action> parentPath = planSubgoal(blockedSubgoal, current, level, allSubgoals);
@@ -3419,6 +3452,20 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return false;
+    }
+
+    private boolean reliefSupportsRelief(Subgoal candidate, Subgoal parentRelief) {
+        if (!candidate.isSyntheticRelief() || !parentRelief.isSyntheticRelief()) {
+            return false;
+        }
+        ReliefCertificate candidateCert = candidate.reliefCertificate;
+        ReliefCertificate parentCert = parentRelief.reliefCertificate;
+        if (candidateCert.blockedAgentId != parentRelief.agentId) {
+            return false;
+        }
+        return parentCert.blockerStart != null
+                && (parentCert.blockerStart.equals(candidateCert.primary)
+                || parentCert.blockerStart.equals(candidateCert.secondary));
     }
 
     private State appendReliefPath(List<Action> reliefPath, int helper, State current,
