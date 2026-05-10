@@ -36,6 +36,9 @@ public class PortfolioController implements SearchStrategy {
     
     // Track attempts for debugging
     private final List<AttemptRecord> attempts = new ArrayList<>();
+    private static final String PHASE_RESIDUAL_ORDER_REPAIR = "L3-ResidualOrderRepair";
+    private static final String PHASE_PARTIAL_PLAN_CONTINUATION = "L3-PartialPlanContinuation";
+    private static final String PHASE_CBSR_BASE_CONTINUATION = "L3-CBSRBaseContinuation";
     
     public PortfolioController(SearchConfig config) {
         this.config = config;
@@ -526,10 +529,10 @@ public class PortfolioController implements SearchStrategy {
         }
 
         // ===== CBSR: Conflict-Based Subgoal Reordering =====
-        // After warm-start attempts (TOPOLOGICAL, DISTANCE_GREEDY), use learned ordering
+        // After the initial ordering probes (TOPOLOGICAL, DISTANCE_GREEDY), use learned ordering
         // constraints (nogoods) to repair the goal ordering and re-run PP iteratively.
         // When nogood-directed ordering stabilizes, falls back to random-seeded diversification.
-        List<OrderingNogood> cbsrNogoods = new ArrayList<>(); // promoted: used in pre-F7 attempt
+        List<OrderingNogood> cbsrNogoods = new ArrayList<>(); // promoted: used in residual-order repair
         List<Position> finalCbsrOrder = (features != null && features.executionOrder != null)
                 ? new ArrayList<>(features.executionOrder) : new ArrayList<>();
         // Per claudeopus47.txt §3.2.2 / qanda.txt §5.2 (failure signals drive ordering repair).
@@ -546,12 +549,16 @@ public class PortfolioController implements SearchStrategy {
                 // Derive initial nogoods from ALL PP failures collected in the for-loop above.
                 // (cbsrNogoods declared at outer scope for post-CBSR use)
                 for (mapf.planning.signal.FailureReport fr : allPPFailures) {
-                    cbsrNogoods.addAll(learnNogoodsFromReport(fr));
+                    cbsrNogoods.addAll(learnNogoodsFromReport(fr,
+                            features != null ? features.goalDependsOn : null,
+                            features != null ? features.executionOrder : null));
                 }
+                int rawInitialNogoods = cbsrNogoods.size();
                 cbsrNogoods = deduplicateNogoods(cbsrNogoods);
 
                 System.err.println("[CBSR] Starting loop: baseOrder=" + features.executionOrder.size()
                         + " goals, initialNogoods=" + cbsrNogoods.size()
+                        + " (raw=" + rawInitialNogoods + ")"
                         + ", budget=" + cbsrBudget + "ms");
 
                 final int MAX_CBSR_ITER = 8;
@@ -613,7 +620,7 @@ public class PortfolioController implements SearchStrategy {
 
                     cbsrPP.setTimeout(perIterBudget);
 
-                    // Carry forward accumulated hints from warm-start attempts
+                    // Carry forward accumulated hints from initial ordering probes
                     if (!deprioritizedGoals.isEmpty()) cbsrPP.setDeprioritizedGoals(deprioritizedGoals);
                     if (!prioritizedGoals.isEmpty()) cbsrPP.setPrioritizedGoals(prioritizedGoals);
                     if (escapeSubgoals != null && !escapeSubgoals.isEmpty()) cbsrPP.setEscapeSubgoals(escapeSubgoals);
@@ -697,10 +704,17 @@ public class PortfolioController implements SearchStrategy {
 
                     // Learn new nogoods from this iteration's failure (directed phase only)
                     if (!orderingStable && cbsrReport != null) {
-                        List<OrderingNogood> newNogoods = learnNogoodsFromReport(cbsrReport);
+                        int beforeNogoods = cbsrNogoods.size();
+                        List<OrderingNogood> newNogoods = learnNogoodsFromReport(cbsrReport,
+                                features != null ? features.goalDependsOn : null,
+                                features != null ? features.executionOrder : null);
                         if (!newNogoods.isEmpty()) {
                             cbsrNogoods.addAll(newNogoods);
                             cbsrNogoods = deduplicateNogoods(cbsrNogoods);
+                            if (cbsrNogoods.size() == beforeNogoods) {
+                                System.err.println("[CBSR] Iteration #" + cbsrIter
+                                        + " learned only duplicate/merged nogoods");
+                            }
                         }
                     }
 
@@ -709,18 +723,18 @@ public class PortfolioController implements SearchStrategy {
                             + " (" + iterDuration + "ms), nogoods=" + cbsrNogoods.size());
                 } // end CBSR iteration loop
 
-                finalCbsrOrder = new ArrayList<>(cbsrOrder); // save for pre-F7 use
+                finalCbsrOrder = new ArrayList<>(cbsrOrder); // save for residual-order repair
                 System.err.println("[CBSR] Loop done, nogoods=" + cbsrNogoods.size()
                         + ", result=TIMEOUT/UNSAT");
             } // end if cbsrApplicable
         } // end CBSR block
         // ===== END CBSR =====
 
-        // Save the CBSR result BEFORE F7-PRE may modify bestPartialPlan.
-        // F7B will use this as its warm-start base (original CBSR state, not F7-PRE's potentially harder state).
+        // Save the CBSR result BEFORE residual-first repair may modify bestPartialPlan.
+        // CBSR-base continuation will use this original state as an independent baseline.
         final List<Action[]> originalCbsrBestPlan = bestPartialPlan;
 
-        // ===== F7-PRE: Unsatisfied-First Fresh Attempt =====
+        // ===== Residual-first ordering repair =====
         // After CBSR, compute which box goals are still unsatisfied in the CBSR partial plan's
         // final state. Build an ordering that puts those goals FIRST (preserving relative order
         // from the CBSR-repaired ordering), then appends already-satisfied goals.
@@ -728,9 +742,9 @@ public class PortfolioController implements SearchStrategy {
         // The CBSR nogood (I after L) is naturally preserved because L goals appear in the
         // unsatisfied set and thus come before I in the new ordering.
         if (bestPartialPlan != null && features != null && !finalCbsrOrder.isEmpty()) {
-            long preF7Elapsed = System.currentTimeMillis() - startTime;
-            long preF7Remaining = timeoutMs - preF7Elapsed;
-            if (preF7Remaining > 15_000) {
+            long residualRepairElapsed = System.currentTimeMillis() - startTime;
+            long residualRepairRemaining = timeoutMs - residualRepairElapsed;
+            if (residualRepairRemaining > 15_000) {
                 State cbsrFinalState = replayPlan(bestPartialPlan, initialState, level);
                 if (cbsrFinalState != null && !cbsrFinalState.isGoalState(level)) {
                     // Partition finalCbsrOrder into unsatisfied vs satisfied
@@ -744,81 +758,107 @@ public class PortfolioController implements SearchStrategy {
                         }
                     }
                     if (!unsatFirst.isEmpty()) {
-                        List<Position> preF7Order = new ArrayList<>(unsatFirst);
-                        preF7Order.addAll(satLast);
-                        System.err.println("[Portfolio] F7-PRE: unsatisfied-first ordering ("
+                        List<Position> residualRepairOrder = new ArrayList<>(unsatFirst);
+                        residualRepairOrder.addAll(satLast);
+                        System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                + ": unsatisfied-first ordering ("
                                 + unsatFirst.size() + " unsat, " + satLast.size() + " sat)");
 
                         // Try TOPOLOGICAL with this ordering from initialState (fresh start)
-                        for (int preF7Seed : new int[]{0, 9001}) { // 0 = no-random (topological), 9001 = random seed
+                        for (int residualRepairSeed : new int[]{0, 9001}) { // 0 = no-random (topological), 9001 = random seed
                             long pBudget = Math.min(timeoutMs - (System.currentTimeMillis() - startTime) - 1000, 30_000L);
                             if (pBudget < 5000) break;
 
-                            StrategyConfig preF7Cfg = new StrategyConfig(
+                            StrategyConfig residualRepairCfg = new StrategyConfig(
                                     StrategyType.STRICT_ORDER, 1.0,
-                                    preF7Seed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
-                                    preF7Seed, 0.5);
-                            SearchStrategy preF7Strategy = createStrategy(preF7Cfg, level);
-                            if (preF7Strategy == null) continue;
-                            preF7Strategy.setTimeout((int) pBudget);
-                            if (preF7Strategy instanceof PriorityPlanningStrategy) {
-                                PriorityPlanningStrategy ppp = (PriorityPlanningStrategy) preF7Strategy;
-                                ppp.setGoalExecutionOrder(preF7Order);
-                                ppp.setOrderingMode(preF7Seed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM);
-                                if (preF7Seed != 0) ppp.setRandomSeed(preF7Seed);
+                                    residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
+                                    residualRepairSeed, 0.5);
+                            SearchStrategy residualRepairStrategy = createStrategy(residualRepairCfg, level);
+                            if (residualRepairStrategy == null) continue;
+                            residualRepairStrategy.setTimeout((int) pBudget);
+                            if (residualRepairStrategy instanceof PriorityPlanningStrategy) {
+                                PriorityPlanningStrategy ppp = (PriorityPlanningStrategy) residualRepairStrategy;
+                                ppp.setGoalExecutionOrder(residualRepairOrder);
+                                ppp.setOrderingMode(residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM);
+                                if (residualRepairSeed != 0) ppp.setRandomSeed(residualRepairSeed);
                                 if (!suspendedBoxGoals.isEmpty()) ppp.setSuspendedBoxGoals(suspendedBoxGoals);
                                 if (escapeSubgoals != null && !escapeSubgoals.isEmpty()) ppp.setEscapeSubgoals(escapeSubgoals);
                             }
-                            List<Action[]> preF7Result = null;
+                            List<Action[]> residualRepairResult = null;
+                            long residualRepairAttemptStart = System.currentTimeMillis();
                             try {
-                                preF7Result = preF7Strategy.search(initialState, level);
+                                residualRepairResult = residualRepairStrategy.search(initialState, level);
                             } catch (Exception e) {
-                                System.err.println("[Portfolio] F7-PRE exception: " + e.getMessage());
+                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                        + " exception: " + e.getMessage());
                             }
-                            if (preF7Result != null && !preF7Result.isEmpty()) {
-                                State preF7Final = replayPlan(preF7Result, initialState, level);
-                                if (preF7Final != null && preF7Final.isGoalState(level)) {
-                                    System.err.println("[Portfolio] F7-PRE SOLVED level (" + preF7Result.size() + " actions)");
+                            long residualRepairAttemptMs = System.currentTimeMillis() - residualRepairAttemptStart;
+                            mapf.planning.signal.FailureReport residualRepairReport =
+                                    residualRepairStrategy instanceof PriorityPlanningStrategy
+                                            ? ((PriorityPlanningStrategy) residualRepairStrategy).getLastFailureReport()
+                                            : null;
+                            boolean residualRepairFull = false;
+                            if (residualRepairResult != null && !residualRepairResult.isEmpty()) {
+                                State residualRepairFinal = replayPlan(residualRepairResult, initialState, level);
+                                residualRepairFull = residualRepairFinal != null && residualRepairFinal.isGoalState(level);
+                                if (residualRepairFull) {
+                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                            + " SOLVED level (" + residualRepairResult.size() + " actions)");
+                                    attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER,
+                                            residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
+                                            residualRepairSeed,
+                                            PHASE_RESIDUAL_ORDER_REPAIR + "#" + (residualRepairSeed == 0 ? "topo" : residualRepairSeed),
+                                            residualRepairAttemptMs, true, residualRepairResult.size(), 0,
+                                            null, "SUCCESS", 0, suspendedBoxGoals.size()));
                                     printAttemptSummary();
-                                    return preF7Result;
+                                    return residualRepairResult;
                                 }
-                                int preF7Goals = countSatisfiedGoals(preF7Final, level);
+                                int residualRepairGoals = countSatisfiedGoals(residualRepairFinal, level);
                                 int bestCurrent = countSatisfiedGoals(replayPlan(bestPartialPlan, initialState, level), level);
-                                System.err.println("[Portfolio] F7-PRE goals=" + preF7Goals
+                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                        + " goals=" + residualRepairGoals
                                         + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
                                                 + level.getAgentGoalPositionMap().size())
-                                        + " steps=" + preF7Result.size() + " (current best=" + bestCurrent + ")");
-                                if (preF7Goals > bestCurrent
-                                        || (preF7Goals == bestCurrent && preF7Result.size() < bestPartialPlan.size())) {
-                                    bestPartialPlan = preF7Result;
-                                    System.err.println("[Portfolio] F7-PRE improved best to " + preF7Goals + " goals");
+                                        + " steps=" + residualRepairResult.size() + " (current best=" + bestCurrent + ")");
+                                if (residualRepairGoals > bestCurrent
+                                        || (residualRepairGoals == bestCurrent && residualRepairResult.size() < bestPartialPlan.size())) {
+                                    bestPartialPlan = residualRepairResult;
+                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                            + " improved best to " + residualRepairGoals + " goals");
                                 }
                             } else {
-                                System.err.println("[Portfolio] F7-PRE no result (seed=" + preF7Seed + ")");
+                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                        + " no result (seed=" + residualRepairSeed + ")");
                             }
+                            attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER,
+                                    residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
+                                    residualRepairSeed,
+                                    PHASE_RESIDUAL_ORDER_REPAIR + "#" + (residualRepairSeed == 0 ? "topo" : residualRepairSeed),
+                                    residualRepairAttemptMs, residualRepairFull,
+                                    residualRepairResult != null ? residualRepairResult.size() : 0,
+                                    unsatCountOf(residualRepairReport),
+                                    failedSubgoalOf(residualRepairReport),
+                                    failureKindOf(residualRepairReport, residualRepairFull),
+                                    0, suspendedBoxGoals.size()));
                         }
                     }
                 }
             }
         }
-        // ===== END F7-PRE =====
+        // ===== END residual-first ordering repair =====
 
-        // F7: Warm-start extension loop. After all fresh attempts produced only partial
+        // Partial-plan continuation loop. After all fresh attempts produced only partial
         // plans, repeatedly continue from the current best partial's end state using
         // different random seeds. Chains improvements (each improved partial becomes the
         // new base for the next attempt). Uses the full remaining budget.
         // Improvement is judged by GOAL COUNT first, then plan length (competition scoring order).
-        // Save the pre-F7-PRE CBSR result as cbsrBestPlan for F7B, so F7B uses the original
-        // CBSR planning state (not F7-PRE's potentially harder state).
-        // NOTE: cbsrBestPlan was set BEFORE F7-PRE above. bestPartialPlan may have been
-        // updated by F7-PRE. Re-save original CBSR result here.
-        // (If F7-PRE didn't improve, cbsrBestPlan equals the CBSR result anyway.)
-        final List<Action[]> cbsrBestPlan = bestPartialPlan; // F7B base: could be CBSR or F7-PRE result
+        // Continue from the current best partial state and let later phases compare
+        // alternatives against the original CBSR baseline if residual repair changed it.
         {
-            final int[] F7_SEEDS = {9001, 42, 137, 9999, 12345, 7777, 55555};
-            int f7SeedIdx = 0;
-            int f7ConsecutiveNoImprovement = 0;
-            int f7Iter = 0;
+            final int[] continuationSeeds = {9001, 42, 137, 9999, 12345, 7777, 55555};
+            int continuationSeedIdx = 0;
+            int continuationConsecutiveNoImprovement = 0;
+            int continuationIter = 0;
 
             // Track best-by-goals separately (competition primary metric)
             List<Action[]> bestByGoalsPlan = bestPartialPlan;
@@ -828,7 +868,7 @@ public class PortfolioController implements SearchStrategy {
                 bestGoalCount = countSatisfiedGoals(bestFinal, level);
             }
 
-            while (f7SeedIdx < F7_SEEDS.length) {
+            while (continuationSeedIdx < continuationSeeds.length) {
                 long elapsedTotal = System.currentTimeMillis() - startTime;
                 long remainingForWarm = timeoutMs - elapsedTotal;
                 if (bestPartialPlan == null || bestPartialPlan.size() <= 100 || remainingForWarm < 5000) break;
@@ -836,12 +876,12 @@ public class PortfolioController implements SearchStrategy {
                 State replayed = replayPlan(bestPartialPlan, initialState, level);
                 if (replayed == null || replayed.isGoalState(level)) break;
 
-                int seed = F7_SEEDS[f7SeedIdx++];
-                f7Iter++;
+                int seed = continuationSeeds[continuationSeedIdx++];
+                continuationIter++;
                 // Per-iteration budget: cap at 30s; rely on PP's natural early-exit to bound time
                 long perWarmBudget = Math.min(remainingForWarm - 1000, 30_000L);
 
-                System.err.println("[Portfolio] F7." + f7Iter + " warm-start from "
+                System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter + " from "
                         + bestPartialPlan.size() + "-step plan, seed=" + seed
                         + " budget=" + perWarmBudget + "ms (remaining=" + remainingForWarm + "ms)");
 
@@ -854,16 +894,23 @@ public class PortfolioController implements SearchStrategy {
                 warmStrategy.setTimeout((int) perWarmBudget);
                 if (warmStrategy instanceof PriorityPlanningStrategy) {
                     PriorityPlanningStrategy wpp = (PriorityPlanningStrategy) warmStrategy;
-                    if (!suspendedBoxGoals.isEmpty()) wpp.setSuspendedBoxGoals(suspendedBoxGoals);
-                    if (escapeSubgoals != null && !escapeSubgoals.isEmpty()) wpp.setEscapeSubgoals(escapeSubgoals);
+                    applyContinuationReliefs(wpp, replayed, level, features,
+                            suspendedBoxGoals, escapeSubgoals);
                 }
 
                 List<Action[]> tail = null;
+                long warmStartMs = System.currentTimeMillis();
                 try {
                     tail = warmStrategy.search(replayed, level);
                 } catch (Exception e) {
-                    System.err.println("[Portfolio] F7." + f7Iter + " exception: " + e.getMessage());
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                            + " exception: " + e.getMessage());
                 }
+                long warmMs = System.currentTimeMillis() - warmStartMs;
+                mapf.planning.signal.FailureReport warmReport =
+                        warmStrategy instanceof PriorityPlanningStrategy
+                                ? ((PriorityPlanningStrategy) warmStrategy).getLastFailureReport()
+                                : null;
 
                 if (tail != null && !tail.isEmpty()) {
                     List<Action[]> combined = new ArrayList<>(bestPartialPlan.size() + tail.size());
@@ -871,8 +918,13 @@ public class PortfolioController implements SearchStrategy {
                     combined.addAll(tail);
                     State combinedFinal = replayPlan(combined, initialState, level);
                     if (combinedFinal != null && combinedFinal.isGoalState(level)) {
-                        System.err.println("[Portfolio] F7." + f7Iter + " SOLVED level ("
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " SOLVED level ("
                                 + combined.size() + " actions)");
+                        attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                                seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
+                                warmMs, true, tail.size(), 0, null, "SUCCESS",
+                                0, suspendedBoxGoals.size()));
                         printAttemptSummary();
                         return combined;
                     }
@@ -882,7 +934,8 @@ public class PortfolioController implements SearchStrategy {
                     boolean lengthImproved = combinedGoalCount == bestGoalCount
                             && combined.size() < bestPartialPlan.size();
 
-                    System.err.println("[Portfolio] F7." + f7Iter + " goals=" + combinedGoalCount
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                            + " goals=" + combinedGoalCount
                             + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
                                      + level.getAgentGoalPositionMap().size())
                             + " steps=" + combined.size());
@@ -897,27 +950,41 @@ public class PortfolioController implements SearchStrategy {
                                     ((PriorityPlanningStrategy) warmStrategy).getLastFailureReport();
                             if (wr != null) bestPartialReport = wr;
                         }
-                        System.err.println("[Portfolio] F7." + f7Iter + " improved: goals "
-                                + prevGoalCount + "→" + combinedGoalCount
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " improved: goals "
+                                + prevGoalCount + " -> " + combinedGoalCount
                                 + ", steps=" + combined.size());
-                        f7ConsecutiveNoImprovement = 0;
+                        continuationConsecutiveNoImprovement = 0;
                     } else {
-                        f7ConsecutiveNoImprovement++;
-                        System.err.println("[Portfolio] F7." + f7Iter + " no improvement (consec="
-                                + f7ConsecutiveNoImprovement + ")");
+                        continuationConsecutiveNoImprovement++;
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " no improvement (consec="
+                                + continuationConsecutiveNoImprovement + ")");
                     }
+                    attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                            seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
+                            warmMs, false, tail.size(),
+                            unsatCountOf(warmReport), failedSubgoalOf(warmReport),
+                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size()));
                 } else {
-                    f7ConsecutiveNoImprovement++;
-                    System.err.println("[Portfolio] F7." + f7Iter + " no result (consec="
-                            + f7ConsecutiveNoImprovement + ")");
+                    continuationConsecutiveNoImprovement++;
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                            + " no result (consec="
+                            + continuationConsecutiveNoImprovement + ")");
+                    attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                            seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
+                            warmMs, false, 0,
+                            unsatCountOf(warmReport), failedSubgoalOf(warmReport),
+                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size()));
                 }
 
                 // Stop if 3+ consecutive non-improvements (budget conservation)
-                if (f7ConsecutiveNoImprovement >= 3) {
-                    System.err.println("[Portfolio] F7 stopping: 3 consecutive non-improvements");
+                if (continuationConsecutiveNoImprovement >= 3) {
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
+                            + " stopping: 3 consecutive non-improvements");
                     break;
                 }
-            } // end F7 loop
+            } // end partial-plan continuation loop
 
             // Ensure we return the best-by-goals plan (in case a later iteration degraded goals)
             if (bestByGoalsPlan != null && bestByGoalsPlan != bestPartialPlan) {
@@ -925,78 +992,105 @@ public class PortfolioController implements SearchStrategy {
                 int byGoals = countSatisfiedGoals(replayPlan(bestByGoalsPlan, initialState, level), level);
                 if (byGoals > curGoals) {
                     bestPartialPlan = bestByGoalsPlan;
-                    System.err.println("[Portfolio] F7 final: restored best-by-goals plan ("
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
+                            + " final: restored best-by-goals plan ("
                             + byGoals + " vs " + curGoals + ")");
                 }
             }
         }
 
-        // F7B: Independent warm-start from CBSR base using seeds not tried from that base.
-        // F7 chained from CBSR base: seed 9001 gave improvement. F7.2+ chained from improved state.
-        // F7B tries seeds [42, 137, 9999, 12345, 7777, 55555] from the original CBSR base
+        // Independent CBSR-base continuation using seeds not tried from that base.
+        // Partial continuation chains from the current best state; this phase tries
+        // seeds [42, 137, 9999, 12345, 7777, 55555] from the original CBSR base
         // independently, to discover alternative 25+ goal plans that avoid painting K/L/G/E
         // boxes into bad positions.
-        // Uses originalCbsrBestPlan (pre-F7-PRE) to avoid F7-PRE's potentially harder state.
+        // Uses originalCbsrBestPlan to avoid residual-first repair's potentially harder state.
         if (originalCbsrBestPlan != null && originalCbsrBestPlan != bestPartialPlan) {
             int cbsrBaseGoals = countSatisfiedGoals(replayPlan(originalCbsrBestPlan, initialState, level), level);
-            int f7bCurrentBest = countSatisfiedGoals(replayPlan(bestPartialPlan, initialState, level), level);
-            final int[] F7B_SEEDS = {42, 137, 9999, 12345, 7777, 55555};
-            int f7bIter = 0;
-            System.err.println("[Portfolio] F7B: trying " + F7B_SEEDS.length + " seeds from CBSR base ("
-                    + originalCbsrBestPlan.size() + " steps, " + cbsrBaseGoals + " goals), current best=" + f7bCurrentBest);
-            for (int f7bSeed : F7B_SEEDS) {
-                long elapsed7b = System.currentTimeMillis() - startTime;
-                long remaining7b = timeoutMs - elapsed7b;
-                if (remaining7b < 5000) break;
+            int cbsrBaseCurrentBest = countSatisfiedGoals(replayPlan(bestPartialPlan, initialState, level), level);
+            final int[] cbsrBaseSeeds = {42, 137, 9999, 12345, 7777, 55555};
+            int cbsrBaseIter = 0;
+            System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + ": trying "
+                    + cbsrBaseSeeds.length + " seeds from CBSR base ("
+                    + originalCbsrBestPlan.size() + " steps, " + cbsrBaseGoals + " goals), current best=" + cbsrBaseCurrentBest);
+            for (int cbsrBaseSeed : cbsrBaseSeeds) {
+                long cbsrBaseElapsed = System.currentTimeMillis() - startTime;
+                long cbsrBaseRemaining = timeoutMs - cbsrBaseElapsed;
+                if (cbsrBaseRemaining < 5000) break;
                 State cbsrFinal = replayPlan(originalCbsrBestPlan, initialState, level);
                 if (cbsrFinal == null || cbsrFinal.isGoalState(level)) break;
 
-                f7bIter++;
-                long perF7bBudget = Math.min(remaining7b - 1000, 30_000L);
-                System.err.println("[Portfolio] F7B." + f7bIter + " warm-start from CBSR base, seed=" + f7bSeed
-                        + " budget=" + perF7bBudget + "ms");
+                cbsrBaseIter++;
+                long cbsrBaseBudget = Math.min(cbsrBaseRemaining - 1000, 30_000L);
+                System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                        + " from CBSR base, seed=" + cbsrBaseSeed
+                        + " budget=" + cbsrBaseBudget + "ms");
 
-                StrategyConfig f7bCfg = new StrategyConfig(
+                StrategyConfig cbsrBaseCfg = new StrategyConfig(
                         StrategyType.STRICT_ORDER, 1.0,
-                        OrderingMode.RANDOM, f7bSeed, 0.5);
-                SearchStrategy f7bStrategy = createStrategy(f7bCfg, level);
-                if (f7bStrategy == null) break;
-                f7bStrategy.setTimeout((int) perF7bBudget);
-                if (f7bStrategy instanceof PriorityPlanningStrategy) {
-                    PriorityPlanningStrategy wpp = (PriorityPlanningStrategy) f7bStrategy;
-                    if (!suspendedBoxGoals.isEmpty()) wpp.setSuspendedBoxGoals(suspendedBoxGoals);
-                    if (escapeSubgoals != null && !escapeSubgoals.isEmpty()) wpp.setEscapeSubgoals(escapeSubgoals);
+                        OrderingMode.RANDOM, cbsrBaseSeed, 0.5);
+                SearchStrategy cbsrBaseStrategy = createStrategy(cbsrBaseCfg, level);
+                if (cbsrBaseStrategy == null) break;
+                cbsrBaseStrategy.setTimeout((int) cbsrBaseBudget);
+                if (cbsrBaseStrategy instanceof PriorityPlanningStrategy) {
+                    PriorityPlanningStrategy wpp = (PriorityPlanningStrategy) cbsrBaseStrategy;
+                    applyContinuationReliefs(wpp, cbsrFinal, level, features,
+                            suspendedBoxGoals, escapeSubgoals);
                 }
 
-                List<Action[]> f7bTail = null;
+                List<Action[]> cbsrBaseTail = null;
+                long cbsrBaseStartMs = System.currentTimeMillis();
                 try {
-                    f7bTail = f7bStrategy.search(cbsrFinal, level);
+                    cbsrBaseTail = cbsrBaseStrategy.search(cbsrFinal, level);
                 } catch (Exception e) {
-                    System.err.println("[Portfolio] F7B." + f7bIter + " exception: " + e.getMessage());
+                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                            + " exception: " + e.getMessage());
                 }
+                long cbsrBaseMs = System.currentTimeMillis() - cbsrBaseStartMs;
+                mapf.planning.signal.FailureReport cbsrBaseReport =
+                        cbsrBaseStrategy instanceof PriorityPlanningStrategy
+                                ? ((PriorityPlanningStrategy) cbsrBaseStrategy).getLastFailureReport()
+                                : null;
 
-                if (f7bTail != null && !f7bTail.isEmpty()) {
-                    List<Action[]> f7bCombined = new ArrayList<>(originalCbsrBestPlan.size() + f7bTail.size());
-                    f7bCombined.addAll(originalCbsrBestPlan);
-                    f7bCombined.addAll(f7bTail);
-                    State f7bFinal = replayPlan(f7bCombined, initialState, level);
-                    if (f7bFinal != null && f7bFinal.isGoalState(level)) {
-                        System.err.println("[Portfolio] F7B." + f7bIter + " SOLVED level ("
-                                + f7bCombined.size() + " actions)");
+                if (cbsrBaseTail != null && !cbsrBaseTail.isEmpty()) {
+                    List<Action[]> cbsrBaseCombined = new ArrayList<>(originalCbsrBestPlan.size() + cbsrBaseTail.size());
+                    cbsrBaseCombined.addAll(originalCbsrBestPlan);
+                    cbsrBaseCombined.addAll(cbsrBaseTail);
+                    State cbsrBaseFinal = replayPlan(cbsrBaseCombined, initialState, level);
+                    if (cbsrBaseFinal != null && cbsrBaseFinal.isGoalState(level)) {
+                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                + " SOLVED level ("
+                                + cbsrBaseCombined.size() + " actions)");
+                        attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                                cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
+                                cbsrBaseMs, true, cbsrBaseTail.size(), 0, null, "SUCCESS",
+                                0, suspendedBoxGoals.size()));
                         printAttemptSummary();
-                        return f7bCombined;
+                        return cbsrBaseCombined;
                     }
-                    int f7bGoals = countSatisfiedGoals(f7bFinal, level);
-                    System.err.println("[Portfolio] F7B." + f7bIter + " goals=" + f7bGoals
-                            + " steps=" + f7bCombined.size());
-                    if (f7bGoals > f7bCurrentBest
-                            || (f7bGoals == f7bCurrentBest && f7bCombined.size() < bestPartialPlan.size())) {
-                        bestPartialPlan = f7bCombined;
-                        f7bCurrentBest = f7bGoals;
-                        System.err.println("[Portfolio] F7B." + f7bIter + " improved best to " + f7bGoals + " goals");
+                    int cbsrBaseGoalsAfterTail = countSatisfiedGoals(cbsrBaseFinal, level);
+                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                            + " goals=" + cbsrBaseGoalsAfterTail
+                            + " steps=" + cbsrBaseCombined.size());
+                    if (cbsrBaseGoalsAfterTail > cbsrBaseCurrentBest
+                            || (cbsrBaseGoalsAfterTail == cbsrBaseCurrentBest && cbsrBaseCombined.size() < bestPartialPlan.size())) {
+                        bestPartialPlan = cbsrBaseCombined;
+                        cbsrBaseCurrentBest = cbsrBaseGoalsAfterTail;
+                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                + " improved best to " + cbsrBaseGoalsAfterTail + " goals");
                     }
+                    attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                            cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
+                            cbsrBaseMs, false, cbsrBaseTail.size(),
+                            unsatCountOf(cbsrBaseReport), failedSubgoalOf(cbsrBaseReport),
+                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size()));
                 } else {
-                    System.err.println("[Portfolio] F7B." + f7bIter + " no result");
+                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter + " no result");
+                    attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
+                            cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
+                            cbsrBaseMs, false, 0,
+                            unsatCountOf(cbsrBaseReport), failedSubgoalOf(cbsrBaseReport),
+                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size()));
                 }
             }
         }
@@ -1256,11 +1350,7 @@ public class PortfolioController implements SearchStrategy {
             int steps = bestPartialPlan != null ? bestPartialPlan.size() : 0;
             List<mapf.planning.diag.FailureSnapshot.AttemptInfo> infos = new ArrayList<>(attempts.size());
             for (AttemptRecord r : attempts) {
-                String label;
-                if (r.orderingMode == null) label = r.strategy.name();
-                else if (r.orderingMode == OrderingMode.RANDOM)
-                    label = r.strategy.name() + "(RANDOM#" + r.randomSeed + ")";
-                else label = r.strategy.name() + "(" + r.orderingMode.name() + ")";
+                String label = r.displayLabel != null ? r.displayLabel : formatAttemptMode(r, false);
                 infos.add(new mapf.planning.diag.FailureSnapshot.AttemptInfo(
                         label, r.durationMs, r.success, r.planSteps,
                         r.unsatCount, r.failedSubgoal, r.failureKind));
@@ -1279,6 +1369,44 @@ public class PortfolioController implements SearchStrategy {
             }
         } catch (Throwable t) {
             System.err.println("[SNAPSHOT] failed: " + t);
+        }
+    }
+
+    private void applyContinuationReliefs(PriorityPlanningStrategy pp,
+                                          State continuationState,
+                                          Level level,
+                                          LevelFeatures features,
+                                          Set<Position> fallbackSuspendedGoals,
+                                          List<PriorityPlanningStrategy.Subgoal> fallbackEscapes) {
+        boolean appliedFreshRelief = false;
+        if (features != null && continuationState != null) {
+            Set<Position> immovable = features.taskFilter != null
+                    ? features.taskFilter.immovableBoxes : Collections.emptySet();
+            mapf.planning.synthesis.BlockerReliefSynthesizer.ReliefResult relRes =
+                    mapf.planning.synthesis.BlockerReliefSynthesizer.synthesizeWithMeta(
+                            continuationState, level, immovable);
+            if (relRes != null && relRes.reliefs != null && !relRes.reliefs.isEmpty()) {
+                pp.setEscapeSubgoals(relRes.reliefs);
+                pp.setSuspendedBoxGoals(relRes.suspendedBoxGoals != null
+                        ? relRes.suspendedBoxGoals : Collections.emptySet());
+                appliedFreshRelief = true;
+                if (SearchConfig.isMinimal()) {
+                    System.err.println("[Portfolio] P5 (NAMO-continuation): synthesized "
+                            + relRes.reliefs.size() + " blocker-relief subgoal(s)"
+                            + " (F2: " + (relRes.suspendedBoxGoals != null
+                                    ? relRes.suspendedBoxGoals.size() : 0)
+                            + " suspended)");
+                }
+            }
+        }
+
+        if (!appliedFreshRelief) {
+            if (fallbackSuspendedGoals != null && !fallbackSuspendedGoals.isEmpty()) {
+                pp.setSuspendedBoxGoals(fallbackSuspendedGoals);
+            }
+            if (fallbackEscapes != null && !fallbackEscapes.isEmpty()) {
+                pp.setEscapeSubgoals(fallbackEscapes);
+            }
         }
     }
 
@@ -1301,14 +1429,7 @@ public class PortfolioController implements SearchStrategy {
         long totalMs = 0;
         for (int i = 0; i < attempts.size(); i++) {
             AttemptRecord r = attempts.get(i);
-            String mode;
-            if (r.orderingMode == null) {
-                mode = r.strategy.name();
-            } else if (r.orderingMode == OrderingMode.RANDOM) {
-                mode = r.strategy.name() + "(" + r.orderingMode.name() + "#" + r.randomSeed + ")";
-            } else {
-                mode = r.strategy.name() + "(" + r.orderingMode.name() + ")";
-            }
+            String mode = r.displayLabel != null ? r.displayLabel : formatAttemptMode(r, true);
             if (mode.length() > 26) mode = mode.substring(0, 26);
             String result;
             if (r.success) {
@@ -1342,10 +1463,7 @@ public class PortfolioController implements SearchStrategy {
                 }
                 if (r.planSteps > bestSteps) {
                     bestSteps = r.planSteps;
-                    bestStrategy = r.orderingMode != null
-                            ? r.strategy.name() + "(" + r.orderingMode.name()
-                                + (r.orderingMode == OrderingMode.RANDOM ? "#" + r.randomSeed : "") + ")"
-                            : r.strategy.name();
+                    bestStrategy = r.displayLabel != null ? r.displayLabel : formatAttemptMode(r, true);
                     bestBlocker = r.failedSubgoal;
                 }
             }
@@ -1354,10 +1472,12 @@ public class PortfolioController implements SearchStrategy {
                     .map(e -> e.getKey() + " (x" + e.getValue() + ")")
                     .orElse("none");
             System.err.println("[Portfolio][DIAG] All " + attempts.size()
-                    + " attempts FAILED — action-layer fix needed");
+                    + " attempts failed; inspect L3 ordering/blocker relief first");
             System.err.println("[Portfolio][DIAG] Best partial: " + bestSteps + " steps via "
                     + bestStrategy + (bestBlocker != null ? " blocked at " + bestBlocker : ""));
             System.err.println("[Portfolio][DIAG] Dominant blocker: " + dominantBlocker);
+            System.err.println("[Portfolio][DIAG] Note: current evidence points to ordering/blocker relief "
+                    + "unless conflict/no-op warnings also appear");
 
             // Bug-1 follow-up (2026-05): print full ancestor / dependent chains for each
             // distinct failed subgoal. Reads features.goalDependsOn (X depends on deps[X]
@@ -1369,6 +1489,35 @@ public class PortfolioController implements SearchStrategy {
                 printBlockerDepChains(blockerCounts.keySet(), features.goalDependsOn, lastLevel);
             }
         }
+    }
+
+    private String formatAttemptMode(AttemptRecord r, boolean includeSeed) {
+        if (r.orderingMode == null) {
+            return r.strategy.name();
+        }
+        if (r.orderingMode == OrderingMode.RANDOM) {
+            return r.strategy.name() + "(" + r.orderingMode.name()
+                    + (includeSeed ? "#" + r.randomSeed : "") + ")";
+        }
+        return r.strategy.name() + "(" + r.orderingMode.name() + ")";
+    }
+
+    private String failureKindOf(mapf.planning.signal.FailureReport report, boolean success) {
+        if (success) return "SUCCESS";
+        return report != null && report.kind != null ? report.kind.name() : "NONE";
+    }
+
+    private int unsatCountOf(mapf.planning.signal.FailureReport report) {
+        return report != null && report.unsatisfiedAtFailure != null
+                ? report.unsatisfiedAtFailure.size() : -1;
+    }
+
+    private String failedSubgoalOf(mapf.planning.signal.FailureReport report) {
+        if (report == null || report.lastAttemptedSubgoal == null) return null;
+        PriorityPlanningStrategy.Subgoal sg = report.lastAttemptedSubgoal;
+        return "agent" + sg.agentId
+                + (sg.isAgentGoal ? "->@" : "->" + sg.boxType + "@")
+                + (sg.goalPos != null ? sg.goalPos : "?");
     }
 
     /**
@@ -2199,7 +2348,9 @@ public class PortfolioController implements SearchStrategy {
      * goals first would clear the corridor. The TRAP signal confirms this: parking L
      * would trap agent 8 from reaching its remaining same-color tasks.
      */
-    private List<OrderingNogood> learnNogoodsFromReport(mapf.planning.signal.FailureReport report) {
+    private List<OrderingNogood> learnNogoodsFromReport(mapf.planning.signal.FailureReport report,
+            Map<Position, Set<Position>> goalDependsOn,
+            List<Position> executionOrder) {
         if (report == null || report.lastAttemptedSubgoal == null) return Collections.emptyList();
         // Only learn from genuine "stuck" or "partial" failures, not budget exhaustion.
         if (report.kind != mapf.planning.signal.FailureReport.Kind.STUCK_NO_PROGRESS
@@ -2207,21 +2358,78 @@ public class PortfolioController implements SearchStrategy {
             return Collections.emptyList();
         }
         PriorityPlanningStrategy.Subgoal failed = report.lastAttemptedSubgoal;
-        if (failed.isAgentGoal || failed.goalPos == null) return Collections.emptyList();
+        if (failed.goalPos == null) return Collections.emptyList();
+        if (failed.isSyntheticRelief()) {
+            System.err.println("[CBSR] Skip nogood from synthetic relief failure: "
+                    + failed.boxType + "@" + failed.goalPos);
+            return Collections.emptyList();
+        }
+        Set<Position> executionOrderSet = executionOrder == null
+                ? Collections.emptySet() : new HashSet<>(executionOrder);
+        if (executionOrder != null && !executionOrderSet.contains(failed.goalPos)) {
+            return Collections.emptyList();
+        }
 
         int agentId = failed.agentId;
         Set<Position> required = new LinkedHashSet<>();
+        Set<Position> unsatisfied = new LinkedHashSet<>();
         for (PriorityPlanningStrategy.Subgoal sg : report.unsatisfiedAtFailure) {
-            if (sg.agentId == agentId && !sg.isAgentGoal
-                    && sg.goalPos != null && !sg.goalPos.equals(failed.goalPos)) {
+            if (sg.goalPos != null) {
+                unsatisfied.add(sg.goalPos);
+            }
+            if (failed.isAgentGoal
+                    && !sg.isSyntheticRelief()
+                    && !sg.isAgentGoal
+                    && sg.goalPos != null
+                    && (executionOrder == null || executionOrderSet.contains(sg.goalPos))) {
                 required.add(sg.goalPos);
+            }
+            if (!failed.isAgentGoal
+                    && !sg.isSyntheticRelief()
+                    && sg.agentId == agentId && !sg.isAgentGoal
+                    && sg.goalPos != null && !sg.goalPos.equals(failed.goalPos)
+                    && (executionOrder == null || executionOrderSet.contains(sg.goalPos))) {
+                required.add(sg.goalPos);
+            }
+        }
+
+        // Agent goals can be blocked by box goals that static dependency analysis
+        // already knows must be handled first. This is the ISO pattern where
+        // agent5->@(1,29) repeats but old CBSR learned nothing because it skipped
+        // agent goals entirely.
+        if (goalDependsOn != null) {
+            Set<Position> deps = goalDependsOn.get(failed.goalPos);
+            if (deps != null) {
+                for (Position dep : deps) {
+                    if (!dep.equals(failed.goalPos)
+                            && (unsatisfied.isEmpty() || unsatisfied.contains(dep))) {
+                        required.add(dep);
+                    }
+                }
+            }
+        }
+
+        // Blocker-relief/BSP diagnostics identify concrete cells. When a cell is
+        // also a goal in the current ordering, promote it before the failed goal.
+        if (executionOrder != null) {
+            for (Position blocker : report.blockedGoals) {
+                if (blocker != null && !blocker.equals(failed.goalPos) && executionOrderSet.contains(blocker)) {
+                    required.add(blocker);
+                }
+            }
+            for (Position blocker : report.blockedPositions) {
+                if (blocker != null && !blocker.equals(failed.goalPos) && executionOrderSet.contains(blocker)) {
+                    required.add(blocker);
+                }
             }
         }
 
         if (required.isEmpty()) return Collections.emptyList();
 
         OrderingNogood nogood = new OrderingNogood(required, failed.goalPos);
-        System.err.println("[CBSR] Learned nogood: " + nogood + " reason=" + report.kind);
+        System.err.println("[CBSR] Learned nogood: " + nogood
+                + " reason=" + report.kind
+                + " cause=" + report.cause);
         return Collections.singletonList(nogood);
     }
 
@@ -2301,6 +2509,7 @@ public class PortfolioController implements SearchStrategy {
         final StrategyType strategy;
         final OrderingMode orderingMode;   // null for non-PP (e.g. SINGLE_AGENT)
         final int randomSeed;              // 0 if not RANDOM
+        final String displayLabel;          // optional human-readable phase label
         final long durationMs;
         final boolean success;
         final int planSteps;               // plan length returned by strategy (0 if null)
@@ -2314,9 +2523,18 @@ public class PortfolioController implements SearchStrategy {
                       long durationMs, boolean success, int planSteps, int unsatCount,
                       String failedSubgoal, String failureKind,
                       int reliefCount, int suspendedCount) {
+            this(strategy, orderingMode, randomSeed, null, durationMs, success, planSteps,
+                    unsatCount, failedSubgoal, failureKind, reliefCount, suspendedCount);
+        }
+
+        AttemptRecord(StrategyType strategy, OrderingMode orderingMode, int randomSeed,
+                      String displayLabel, long durationMs, boolean success,
+                      int planSteps, int unsatCount, String failedSubgoal, String failureKind,
+                      int reliefCount, int suspendedCount) {
             this.strategy = strategy;
             this.orderingMode = orderingMode;
             this.randomSeed = randomSeed;
+            this.displayLabel = displayLabel;
             this.durationMs = durationMs;
             this.success = success;
             this.planSteps = planSteps;
