@@ -236,6 +236,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** Timestamp of last successful subgoal execution, for early termination. */
     private long lastProgressTime = 0;
+    private static final double NORMAL_EARLY_EXIT_FRACTION = 0.35;
+    private static final double OPEN_TRANSACTION_EARLY_EXIT_FRACTION = 0.85;
 
     /**
      * P0a (cheapest path, see qanda.txt §5.2 / claudeopus47.txt §3.2.2):
@@ -778,19 +780,26 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         // by boxes of a different color, and pre-clear a path before the main loop.
         currentState = detectAndExecuteClearingPhase(
                 currentState, initialState, level, fullPlan, numAgents, startTime);
+        int lastStablePlanSize = hasOpenGoalTransaction(currentState, level) ? 0 : fullPlan.size();
 
         while (!currentState.isGoalState(level)) {
             // PRODUCT.md constraints: 3 minutes, 20,000 actions
             if (System.currentTimeMillis() - startTime > timeoutMs) {
                 logVerbose(getName() + ": Timeout");
+                currentState = rollbackToStablePartialIfNeeded(initialState, currentState,
+                        level, fullPlan, numAgents, lastStablePlanSize, "timeout");
                 break;
             }
             if (fullPlan.size() >= SearchConfig.MAX_ACTIONS) {
                 logVerbose(getName() + ": Action limit");
+                currentState = rollbackToStablePartialIfNeeded(initialState, currentState,
+                        level, fullPlan, numAgents, lastStablePlanSize, "action-limit");
                 break;
             }
             if (stuckCount > SearchConfig.MAX_STUCK_ITERATIONS) {
                 logVerbose(getName() + ": Stuck");
+                currentState = rollbackToStablePartialIfNeeded(initialState, currentState,
+                        level, fullPlan, numAgents, lastStablePlanSize, "stuck");
                 break;
             }
 
@@ -804,7 +813,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // produce any, and yielding the rest of the budget to the next
             // strategy is strictly better than spinning silently to timeout.
             long noProgressMs = System.currentTimeMillis() - lastProgressTime;
-            if (noProgressMs > timeoutMs * 0.35) {
+            boolean openGoalTransaction = hasOpenGoalTransaction(currentState, level);
+            double earlyExitFraction = openGoalTransaction
+                    ? OPEN_TRANSACTION_EARLY_EXIT_FRACTION
+                    : NORMAL_EARLY_EXIT_FRACTION;
+            if (noProgressMs > timeoutMs * earlyExitFraction) {
                 if (!fullPlan.isEmpty()) {
                     logVerbose(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
                 } else {
@@ -843,8 +856,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 } catch (Exception e) {
                     // Diagnostic must never crash the planner.
                 }
+                currentState = rollbackToStablePartialIfNeeded(initialState, currentState,
+                        level, fullPlan, numAgents, lastStablePlanSize, "early-exit");
                 lastFailureReport = buildFailureReport(FailureReport.Kind.STUCK_NO_PROGRESS,
-                        "early-exit noProgressMs=" + noProgressMs + " stuckCount=" + stuckCount);
+                        "early-exit noProgressMs=" + noProgressMs
+                                + " stuckCount=" + stuckCount
+                                + (openGoalTransaction ? " openGoalTransaction=true" : ""));
                 break;
             }
 
@@ -876,6 +893,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (!lastProgressWasPhantom) {
                     stuckCount = 0;
                     lastProgressTime = System.currentTimeMillis();
+                    if (!hasOpenGoalTransaction(currentState, level)) {
+                        lastStablePlanSize = fullPlan.size();
+                    }
                     // MAPF FIX: Clear displacement history on genuine progress
                     displacementHistory.clear();
                     displacementAttempts = 0;
@@ -901,6 +921,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     boolean recovered = tryRecovery(unsatisfied, fullPlan, currentState, level, numAgents, initialState);
                     if (recovered) {
                         currentState = recomputeState(initialState, fullPlan, level, numAgents);
+                        if (!hasOpenGoalTransaction(currentState, level)) {
+                            lastStablePlanSize = fullPlan.size();
+                        }
                         stuckCount = 0;
                     } else {
                         // Dynamic barrier re-detection: state changes may have created
@@ -912,6 +935,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             dynamicBarrierRounds++;
                             if (afterBarrier != currentState) {
                                 currentState = afterBarrier;
+                                if (!hasOpenGoalTransaction(currentState, level)) {
+                                    lastStablePlanSize = fullPlan.size();
+                                }
                                 stuckCount = 0;
                                 logVerbose("[PP] Dynamic barrier re-detection cleared new barriers (round "
                                         + dynamicBarrierRounds + "/" + MAX_DYNAMIC_BARRIER_ROUNDS + ")");
@@ -921,6 +947,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
         }
+
+        currentState = rollbackToStablePartialIfNeeded(initialState, currentState,
+                level, fullPlan, numAgents, lastStablePlanSize, "partial-exit");
 
         if (currentState.isGoalState(level)) {
             logMinimal(getName() + ": [OK] Goal state reached!");
@@ -5809,6 +5838,61 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 + " blockedAgent=" + cert.blockedAgentId
                 + " primary=" + cert.primary
                 + " secondary=" + cert.secondary;
+    }
+
+    private boolean hasOpenGoalTransaction(State state, Level level) {
+        return !openGoalDebtPositions(state, level).isEmpty();
+    }
+
+    private Set<Position> openGoalDebtPositions(State state, Level level) {
+        LinkedHashSet<Position> debt = new LinkedHashSet<>();
+        addOpenGoalDebt(debt, lastClearingDisplacedGoals, state, level);
+        addOpenGoalDebt(debt, displacedGoals, state, level);
+        addOpenGoalDebt(debt, suspendedTransitGoals, state, level);
+        addOpenGoalDebt(debt, completedBoxGoals, state, level);
+        return debt;
+    }
+
+    private void addOpenGoalDebt(Set<Position> debt, Collection<Position> positions,
+                                 State state, Level level) {
+        if (positions == null || state == null) return;
+        for (Position goalPos : positions) {
+            if (goalPos != null && !isSatisfiedBoxGoal(goalPos, state, level)) {
+                debt.add(goalPos);
+            }
+        }
+    }
+
+    private boolean isSatisfiedBoxGoal(Position goalPos, State state, Level level) {
+        if (goalPos == null || state == null) return false;
+        char goalType = level.getBoxGoal(goalPos.row, goalPos.col);
+        if (goalType == '\0') return true;
+        Character actual = state.getBoxAt(goalPos);
+        return actual != null && actual == goalType;
+    }
+
+    private State rollbackToStablePartialIfNeeded(State initialState, State currentState,
+                                                  Level level, List<Action[]> fullPlan,
+                                                  int numAgents, int stablePlanSize,
+                                                  String reason) {
+        Set<Position> debt = openGoalDebtPositions(currentState, level);
+        if (debt.isEmpty() || stablePlanSize >= fullPlan.size()) {
+            return currentState;
+        }
+
+        int from = fullPlan.size();
+        rollbackPlanTo(fullPlan, stablePlanSize);
+        State stableState = recomputeState(initialState, fullPlan, level, numAgents);
+        displacedGoals.clear();
+        lastClearingDisplacedGoals.clear();
+        lastBorrowedGoalBoxPositions.clear();
+        revalidateCompletedGoals(stableState, level);
+        planMerger.clearAllPlans();
+        storedPlanSubgoals.clear();
+        logNormal("[PP][STABLE-PARTIAL] reason=" + reason
+                + " rollback=" + from + "->" + stablePlanSize
+                + " openDebt=" + formatPositions(debt));
+        return stableState;
     }
 
     private void rollbackPlanTo(List<Action[]> fullPlan, int planSizeBefore) {
