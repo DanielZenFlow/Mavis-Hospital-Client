@@ -881,9 +881,11 @@ public class PortfolioController implements SearchStrategy {
                 // Per-iteration budget: cap at 30s; rely on PP's natural early-exit to bound time
                 long perWarmBudget = Math.min(remainingForWarm - 1000, 30_000L);
 
-                System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter + " from "
-                        + bestPartialPlan.size() + "-step plan, seed=" + seed
-                        + " budget=" + perWarmBudget + "ms (remaining=" + remainingForWarm + "ms)");
+                if (SearchConfig.isVerbose()) {
+                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter + " from "
+                            + bestPartialPlan.size() + "-step plan, seed=" + seed
+                            + " budget=" + perWarmBudget + "ms (remaining=" + remainingForWarm + "ms)");
+                }
 
                 StrategyConfig warmCfg = new StrategyConfig(
                         StrategyType.STRICT_ORDER, 1.0,
@@ -934,11 +936,13 @@ public class PortfolioController implements SearchStrategy {
                     boolean lengthImproved = combinedGoalCount == bestGoalCount
                             && combined.size() < bestPartialPlan.size();
 
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                            + " goals=" + combinedGoalCount
-                            + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
-                                     + level.getAgentGoalPositionMap().size())
-                            + " steps=" + combined.size());
+                    if (SearchConfig.isVerbose()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " goals=" + combinedGoalCount
+                                + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
+                                         + level.getAgentGoalPositionMap().size())
+                                + " steps=" + combined.size());
+                    }
 
                     if (goalImproved || lengthImproved) {
                         int prevGoalCount = bestGoalCount;
@@ -957,9 +961,11 @@ public class PortfolioController implements SearchStrategy {
                         continuationConsecutiveNoImprovement = 0;
                     } else {
                         continuationConsecutiveNoImprovement++;
-                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                + " no improvement (consec="
-                                + continuationConsecutiveNoImprovement + ")");
+                        if (SearchConfig.isVerbose()) {
+                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                    + " no improvement (consec="
+                                    + continuationConsecutiveNoImprovement + ")");
+                        }
                     }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                             seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
@@ -968,9 +974,11 @@ public class PortfolioController implements SearchStrategy {
                             failureKindOf(warmReport, false), 0, suspendedBoxGoals.size()));
                 } else {
                     continuationConsecutiveNoImprovement++;
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                            + " no result (consec="
-                            + continuationConsecutiveNoImprovement + ")");
+                    if (SearchConfig.isVerbose()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " no result (consec="
+                                + continuationConsecutiveNoImprovement + ")");
+                    }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                             seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
                             warmMs, false, 0,
@@ -1390,7 +1398,7 @@ public class PortfolioController implements SearchStrategy {
                 pp.setSuspendedBoxGoals(relRes.suspendedBoxGoals != null
                         ? relRes.suspendedBoxGoals : Collections.emptySet());
                 appliedFreshRelief = true;
-                if (SearchConfig.isMinimal()) {
+                if (SearchConfig.isVerbose()) {
                     System.err.println("[Portfolio] P5 (NAMO-continuation): synthesized "
                             + relRes.reliefs.size() + " blocker-relief subgoal(s)"
                             + " (F2: " + (relRes.suspendedBoxGoals != null

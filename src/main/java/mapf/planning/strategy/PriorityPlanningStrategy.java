@@ -802,9 +802,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             long noProgressMs = System.currentTimeMillis() - lastProgressTime;
             if (noProgressMs > timeoutMs * 0.35) {
                 if (!fullPlan.isEmpty()) {
-                    logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
+                    logVerbose(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — returning partial plan");
                 } else {
-                    logNormal(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — yielding to next strategy (empty plan)");
+                    logVerbose(getName() + ": [EARLY-EXIT] No progress for " + noProgressMs + "ms — yielding to next strategy (empty plan)");
                 }
                 // Diagnostic dump: surface what state we got stuck in.
                 // 2026-05 (post Bug-1): when STUCK fires we want to know
@@ -835,7 +835,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             .append("->").append(lastAttemptedSubgoalForReport.boxType)
                             .append("@").append(lastAttemptedSubgoalForReport.goalPos);
                     }
-                    logNormal(dump.toString());
+                    logVerbose(dump.toString());
                 } catch (Exception e) {
                     // Diagnostic must never crash the planner.
                 }
@@ -3156,7 +3156,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             ? FailureReport.Cause.AGENT_GOAL_BLOCKED
                             : FailureReport.Cause.BOX_GOAL_BLOCKED,
                     Collections.singletonList(subgoal.goalPos), blockers);
-            logNormal("[PP][DEFER] " + subgoalLabel(subgoal)
+            logVerbose("[PP][DEFER] " + subgoalLabel(subgoal)
                     + " remains blocked after relief/clearing; softening as prerequisite"
                     + (blockers.isEmpty() ? "" : " blockers=" + blockers));
             cachedSubgoalOrder = null;
@@ -3184,7 +3184,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             recordFailureSignal(FailureReport.Cause.BOX_GOAL_BLOCKED,
                     Collections.singletonList(blockedSubgoal.goalPos), blockers);
-            logNormal("[PP][TASK-RELIEF] " + subgoalLabel(blockedSubgoal)
+            logVerbose("[PP][TASK-RELIEF] " + subgoalLabel(blockedSubgoal)
                     + " blocked by " + blockers + " - trying local relief"
                     + " (round=" + (round + 1) + ")");
 
@@ -3311,7 +3311,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
 
                 if (!movedThisBlocker) {
-                    logNormal("[PP][TASK-RELIEF] failed blocker "
+                    logVerbose("[PP][TASK-RELIEF] failed blocker "
                             + blockerType + " at " + blockerPos
                             + " for " + subgoalLabel(blockedSubgoal)
                             + " candidates=" + parkingCandidates.size()
@@ -3390,7 +3390,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         int maxScopedMoves = Math.max(MAX_TASK_RELIEF_MOVES, Math.min(12, candidates.size()));
 
-        logNormal("[PP][SCOPED-RELIEF] " + subgoalLabel(blockedSubgoal)
+        logVerbose("[PP][SCOPED-RELIEF] " + subgoalLabel(blockedSubgoal)
                 + " trying " + candidates.size() + " NAMO relief candidate(s)"
                 + " (directChain=" + selected.size() + ", moveCap=" + maxScopedMoves + ")");
 
@@ -3430,7 +3430,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 usedFixedTargetFallback = false;
             }
             if (reliefPath == null || reliefPath.isEmpty()) {
-                logNormal("[PP][SCOPED-RELIEF] failed to plan " + subgoalLabel(relief)
+                logVerbose("[PP][SCOPED-RELIEF] failed to plan " + subgoalLabel(relief)
                         + " for " + subgoalLabel(blockedSubgoal)
                         + " cert=" + reliefCertificateLabel(relief));
                 continue;
@@ -3455,13 +3455,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             current = trial;
             moved++;
-            logNormal("[PP][SCOPED-RELIEF] accepted " + subgoalLabel(relief)
+            String acceptedMsg = "[PP][SCOPED-RELIEF] accepted " + subgoalLabel(relief)
                     + " for " + subgoalLabel(blockedSubgoal)
                     + " released=" + blockerPos + "->" + releasedPos
                     + " blockers=" + blockersBefore.size() + "->" + blockersAfter.size()
                     + " parentProgress=" + madeTaskProgress
                     + " mode=" + (usedFixedTargetFallback ? "fixed-target" : "release")
-                    + " cert=" + reliefCertificateLabel(relief));
+                    + " cert=" + reliefCertificateLabel(relief);
+            if (madeTaskProgress) {
+                logNormal(acceptedMsg);
+            } else {
+                logVerbose(acceptedMsg);
+            }
 
             List<Action> parentPath = planSubgoal(blockedSubgoal, current, level, allSubgoals);
             if (parentPath != null && !parentPath.isEmpty()) {
@@ -3476,7 +3481,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             globalTimeStep = initialTime;
             planMerger.clearAllPlans();
             storedPlanSubgoals.clear();
-            logNormal("[PP][SCOPED-RELIEF] incomplete relief for " + subgoalLabel(blockedSubgoal)
+            logVerbose("[PP][SCOPED-RELIEF] incomplete relief for " + subgoalLabel(blockedSubgoal)
                     + " -- rollback partial relief");
         }
         return null;
