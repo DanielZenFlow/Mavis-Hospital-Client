@@ -13,6 +13,7 @@ public class SubgoalManager {
     
     private final Heuristic heuristic;
     private final ImmovableBoxDetector immovableDetector;
+    private static final int OPERATION_SIDE_FALLBACK_PENALTY = 10;
     
     /** Cached Hungarian optimal assignments: boxType → (goalPos → boxPos). */
     private Map<Character, HungarianBoxAssigner.AssignmentResult> hungarianCache = null;
@@ -262,9 +263,11 @@ public class SubgoalManager {
         Position closestBox = findBestBoxForGoal(subgoal, state, level, completedBoxGoals);
         if (closestBox == null) return Integer.MAX_VALUE;
         
+        Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
         int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(closestBox, subgoal.goalPos, state, level);
         Position agentPos = state.getAgentPosition(subgoal.agentId);
-        int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, closestBox, state, level);
+        int agentToBox = estimateAgentToBoxWorkDistance(
+                subgoal.agentId, subgoal.boxType, agentPos, closestBox, state, level, immovableBoxes);
         
         if (agentToBox == Integer.MAX_VALUE || boxToGoal == Integer.MAX_VALUE) {
             return Integer.MAX_VALUE;
@@ -322,7 +325,8 @@ public class SubgoalManager {
             if (!isBoxMovable(boxPos, state, level)) continue;
             
             // Check if agent can reach box
-            int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
+            int agentToBox = estimateAgentToBoxWorkDistance(
+                    subgoal.agentId, subgoal.boxType, agentPos, boxPos, state, level, immovableBoxes);
             if (agentToBox == Integer.MAX_VALUE) continue;
             
             int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(boxPos, subgoal.goalPos, state, level);
@@ -379,7 +383,8 @@ public class SubgoalManager {
         if (!isBoxMovable(assignedBox, state, level)) return null;        // Box stuck
         
         // Check reachability
-        int agentToBox = immovableDetector.getDistanceWithImmovableBoxes(agentPos, assignedBox, state, level);
+        int agentToBox = estimateAgentToBoxWorkDistance(
+                subgoal.agentId, subgoal.boxType, agentPos, assignedBox, state, level, immovableBoxes);
         if (agentToBox == Integer.MAX_VALUE) return null;
         int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(assignedBox, subgoal.goalPos, state, level);
         if (boxToGoal == Integer.MAX_VALUE) return null;
@@ -391,6 +396,86 @@ public class SubgoalManager {
         Position pos;
         int dist;
         BoxCandidate(Position p, int d) { pos = p; dist = d; }
+    }
+
+    /**
+     * Estimates the cost for an agent to start working on a box.
+     *
+     * A raw agent->box distance is too optimistic in pull-push Sokoban: the agent
+     * cannot stand on the box; it must reach an adjacent operation side with room
+     * for at least one push/pull-style transition. Prefer that operation-side
+     * distance, but keep a penalized direct fallback so tightly packed boxes can
+     * still be considered by the real BSP search.
+     */
+    private int estimateAgentToBoxWorkDistance(int agentId, char boxType, Position agentPos,
+                                               Position boxPos, State state, Level level,
+                                               Set<Position> immovableBoxes) {
+        if (agentPos == null || boxPos == null || !level.canAgentMoveBox(agentId, boxType)) {
+            return Integer.MAX_VALUE;
+        }
+
+        int operationSide = estimateAgentToOperationSide(agentPos, boxPos, state, level, immovableBoxes);
+        if (operationSide < Integer.MAX_VALUE) {
+            return operationSide;
+        }
+
+        int direct = immovableDetector.getDistanceWithImmovableBoxes(agentPos, boxPos, state, level);
+        if (direct == Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return direct + OPERATION_SIDE_FALLBACK_PENALTY;
+    }
+
+    private int estimateAgentToOperationSide(Position agentPos, Position boxPos, State state,
+                                             Level level, Set<Position> immovableBoxes) {
+        int best = Integer.MAX_VALUE;
+        for (Direction dir : Direction.values()) {
+            Position stand = boxPos.move(dir);
+            if (!isOperationStandCell(stand, agentPos, state, level, immovableBoxes)) {
+                continue;
+            }
+            if (!hasOperationExit(boxPos, stand, state, level, immovableBoxes)) {
+                continue;
+            }
+            int d = immovableDetector.getDistanceWithImmovableBoxes(agentPos, stand, state, level);
+            if (d < best) {
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    private boolean isOperationStandCell(Position pos, Position agentPos, State state,
+                                         Level level, Set<Position> immovableBoxes) {
+        if (!level.isFree(pos) || immovableBoxes.contains(pos) || state.hasBoxAt(pos)) {
+            return false;
+        }
+        return !state.hasAgentAt(pos) || pos.equals(agentPos);
+    }
+
+    private boolean hasOperationExit(Position boxPos, Position stand, State state,
+                                     Level level, Set<Position> immovableBoxes) {
+        for (Direction dir : Direction.values()) {
+            Position next = boxPos.move(dir);
+            if (next.equals(stand)) {
+                continue;
+            }
+            if (level.isFree(next) && !immovableBoxes.contains(next)
+                    && !state.hasBoxAt(next) && !state.hasAgentAt(next)) {
+                return true;
+            }
+        }
+        for (Direction dir : Direction.values()) {
+            Position nextAgent = stand.move(dir);
+            if (nextAgent.equals(boxPos)) {
+                continue;
+            }
+            if (level.isFree(nextAgent) && !immovableBoxes.contains(nextAgent)
+                    && !state.hasBoxAt(nextAgent) && !state.hasAgentAt(nextAgent)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
