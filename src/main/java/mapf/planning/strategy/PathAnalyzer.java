@@ -116,6 +116,21 @@ public class PathAnalyzer {
             return Collections.singletonList(start);
         }
 
+        return findPathIgnoringDynamicObstacles(start, goal, level, Collections.emptySet());
+    }
+
+    /**
+     * Finds a static path while treating selected cells as unavailable.
+     * Dynamic obstacles are still ignored; this is used for structural path
+     * analysis where completed goals should behave like fixed resources.
+     */
+    public List<Position> findPathIgnoringDynamicObstacles(Position start, Position goal, Level level,
+            Set<Position> blockedPositions) {
+        if (start.equals(goal)) {
+            return Collections.singletonList(start);
+        }
+
+        Set<Position> blocked = blockedPositions != null ? blockedPositions : Collections.emptySet();
         Map<Position, Position> cameFrom = new HashMap<>();
         Map<Position, Integer> gScore = new HashMap<>();
         PriorityQueue<Position> openSet = new PriorityQueue<>(
@@ -135,6 +150,8 @@ public class PathAnalyzer {
                 Position next = current.move(dir);
 
                 if (level.isWall(next))
+                    continue;
+                if (!next.equals(goal) && !next.equals(start) && blocked.contains(next))
                     continue;
 
                 int tentativeG = gScore.get(current) + 1;
