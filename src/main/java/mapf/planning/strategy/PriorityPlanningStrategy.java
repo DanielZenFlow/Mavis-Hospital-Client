@@ -72,6 +72,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * Max MAX_CLEARING_DISPLACEMENTS allowed per clearing operation.
      */
     private List<Position> lastClearingDisplacedGoals = new ArrayList<>();
+    private Map<Position, Position> lastBorrowedGoalBoxPositions = new HashMap<>();
     private static final int MAX_CLEARING_DISPLACEMENTS = 4;
     
     /** Pre-computed goal execution order from LevelAnalyzer (optional). */
@@ -700,6 +701,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         repeatedLogCounts.clear();
         boxPositionHistory.clear();
         subgoalLabelHistory.clear();
+        lastBorrowedGoalBoxPositions.clear();
         suspendedTransitGoals.clear();
         transitProfiles = Collections.emptyMap();
         conflictResolver.resetCounts();
@@ -2936,6 +2938,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             ? supportStateBefore : currentState;
                     Set<Position> transactionDisplacedBefore = supportDisplacedBefore != null
                             ? supportDisplacedBefore : new HashSet<>(displacedGoals);
+                    Set<Position> transactionCompletedBefore = new HashSet<>(completedBoxGoals);
+                    Map<Position, Integer> transactionGoalCountBefore = new HashMap<>(goalCompletionCount);
                     SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                     List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
                     reservationTable.reservePath(subgoal.agentId, agentPath, globalTimeStep, subgoal.isAgentGoal);
@@ -2959,7 +2963,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             logVerbose(getName() + ": [REGRESS] Cleared path disturbed " 
                                     + regressedGoals.size() + " goal(s) — rollback");
                             rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
-                            restoreDisplacedGoals(transactionDisplacedBefore);
+                            restoreTransactionBookkeeping(transactionDisplacedBefore,
+                                    transactionCompletedBefore, transactionGoalCountBefore);
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
@@ -2971,7 +2976,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     if (reached) {
                         if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
                             rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
-                            restoreDisplacedGoals(transactionDisplacedBefore);
+                            restoreTransactionBookkeeping(transactionDisplacedBefore,
+                                    transactionCompletedBefore, transactionGoalCountBefore);
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
@@ -2980,7 +2986,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         if (!acceptReachedSubgoal("CLEARED", subgoal, beforeEval, tempState, level,
                                 planSizeBefore, fullPlan.size(), subgoals)) {
                             rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
-                            restoreDisplacedGoals(transactionDisplacedBefore);
+                            restoreTransactionBookkeeping(transactionDisplacedBefore,
+                                    transactionCompletedBefore, transactionGoalCountBefore);
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
@@ -2997,12 +3004,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             subgoalManager.invalidateHungarianCache();
                             cachedSubgoalOrder = null;
                         }
-                        revalidateCompletedGoals(tempState, level);
-                        
-                        // Borrow-and-return: re-plan displaced goals back
-                        if (!lastClearingDisplacedGoals.isEmpty()) {
+                        // Borrow-and-return is part of the same transaction:
+                        // the parent subgoal is not committed unless every
+                        // borrowed completed goal is restored.
+                        List<Position> borrowedGoalsToRestore = new ArrayList<>(lastClearingDisplacedGoals);
+                        if (!borrowedGoalsToRestore.isEmpty()) {
                             tempState = returnDisplacedGoals(tempState, level, fullPlan, numAgents);
+                            if (!borrowedGoalsRestored(borrowedGoalsToRestore, tempState, level)) {
+                                logNormal(getName() + ": [BORROW-RETURN] Failed to restore "
+                                        + borrowedGoalsToRestore + " after "
+                                        + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType)
+                                        + " -> " + subgoal.goalPos + " - rollback");
+                                rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
+                                restoreTransactionBookkeeping(transactionDisplacedBefore,
+                                        transactionCompletedBefore, transactionGoalCountBefore);
+                                currentState = transactionStateBefore;
+                                planMerger.clearAllPlans();
+                                storedPlanSubgoals.clear();
+                                continue;
+                            }
                         }
+                        revalidateCompletedGoals(tempState, level);
                         
                         if (!subgoal.isAgentGoal) {
                             List<Subgoal> rem = new ArrayList<>();
@@ -3021,7 +3043,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             + " -> " + subgoal.goalPos
                             + " executed but goal not reached - rollback");
                     rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
-                    restoreDisplacedGoals(transactionDisplacedBefore);
+                    restoreTransactionBookkeeping(transactionDisplacedBefore,
+                            transactionCompletedBefore, transactionGoalCountBefore);
                     currentState = transactionStateBefore;
                     planMerger.clearAllPlans();
                     storedPlanSubgoals.clear();
@@ -3929,20 +3952,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         
         // Step 2: Find boxes that are in the danger zone (excluding the target box itself)
         List<Position> blockerPositions = new ArrayList<>();
+        LinkedHashSet<Position> borrowBlockerPositions = new LinkedHashSet<>();
         int skippedProtectedBlockers = 0;
         for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
             Position bPos = entry.getKey();
             if (bPos.equals(boxPos)) continue;
             if (dangerZone.contains(bPos)) {
                 if (completedBoxGoals.contains(bPos)) {
-                    skippedProtectedBlockers++;
+                    if (pathUsesProtectedGoals) {
+                        borrowBlockerPositions.add(bPos);
+                    } else {
+                        skippedProtectedBlockers++;
+                    }
                     continue;
                 }
                 blockerPositions.add(bPos);
             }
         }
         
-        if (blockerPositions.isEmpty()) {
+        if (blockerPositions.isEmpty() && borrowBlockerPositions.isEmpty()) {
             if (skippedProtectedBlockers > 0) {
                 logVerbose("[PP] [CLEAR] Static path for " + subgoal.boxType + " -> " + subgoal.goalPos
                         + (pathUsesProtectedGoals ? " requires" : " touched")
@@ -3951,13 +3979,17 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return null;
         }
         
-        logVerbose("[PP] [CLEAR] Found " + blockerPositions.size() + " box(es) blocking path for "
-                + subgoal.boxType + " -> " + subgoal.goalPos + ": " + blockerPositions);
+        logVerbose("[PP] [CLEAR] Found " + blockerPositions.size() + " ordinary blocker(s)"
+                + (borrowBlockerPositions.isEmpty() ? "" : " and "
+                        + borrowBlockerPositions.size() + " borrowable completed-goal blocker(s)")
+                + " for " + subgoal.boxType + " -> " + subgoal.goalPos + ": "
+                + blockerPositions + (borrowBlockerPositions.isEmpty() ? "" : " borrow=" + borrowBlockerPositions));
         
         // Step 3: For each blocker, find its agent and a safe clearing position
         State currentState = state;
         boolean anyCleared = false;
         lastClearingDisplacedGoals.clear();
+        lastBorrowedGoalBoxPositions.clear();
         int displacementCount = 0;
         
         for (Position blockerPos : blockerPositions) {
@@ -4048,7 +4080,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         Character boxAtCell = currentState.getBoxes().get(pathCell);
                         if (boxAtCell != null && level.getBoxColor(boxAtCell) != agentColor) {
                             if (completedBoxGoals.contains(pathCell)) {
-                                logVerbose("[PP] [CLEAR-A2B] Leaving completed goal protected at " + pathCell);
+                                borrowBlockerPositions.add(pathCell);
                                 continue;
                             }
                             // Find same-color agent for this blocker
@@ -4111,8 +4143,80 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
         }
+
+        if (!anyCleared && !borrowBlockerPositions.isEmpty()) {
+            for (Position borrowPos : borrowBlockerPositions) {
+                State borrowed = tryBorrowCompletedGoalForClearing(
+                        borrowPos, dangerZone, currentState, level, fullPlan, numAgents);
+                if (borrowed != null) {
+                    currentState = borrowed;
+                    anyCleared = true;
+                    break;
+                }
+            }
+        }
         
         return anyCleared ? currentState : null;
+    }
+
+    private State tryBorrowCompletedGoalForClearing(Position borrowPos, Set<Position> dangerZone,
+            State state, Level level, List<Action[]> fullPlan, int numAgents) {
+        if (!completedBoxGoals.contains(borrowPos)) return null;
+
+        char goalType = level.getBoxGoal(borrowPos);
+        Character blockerType = state.getBoxes().get(borrowPos);
+        if (goalType == '\0' || blockerType == null || blockerType != goalType) return null;
+
+        int helper = findHelperAgentForBox(blockerType, state, level, borrowPos);
+        if (helper < 0) return null;
+
+        Set<Position> forbidden = new HashSet<>(dangerZone);
+        forbidden.addAll(allGoalCells(level));
+        forbidden.add(borrowPos);
+
+        Set<Position> unfreeze = new HashSet<>();
+        unfreeze.add(borrowPos);
+
+        Set<Position> protectedPositions = new HashSet<>(completedBoxGoals);
+        protectedPositions.remove(borrowPos);
+        protectedPositions.addAll(dangerZone);
+
+        int budget = Math.min(effectiveMaxBspBudget * 2,
+                Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
+                        computeDynamicBspBudget(borrowPos, borrowPos) * 2));
+
+        int planSizeBefore = fullPlan.size();
+        int timeBefore = globalTimeStep;
+        List<Action> releasePath = boxSearchPlanner.planBoxReleaseFromForbidden(
+                helper, borrowPos, blockerType, state, level,
+                forbidden, unfreeze, budget, protectedPositions);
+        if (releasePath == null || releasePath.isEmpty()) {
+            return null;
+        }
+
+        State trial = appendReliefPath(releasePath, helper, state, level, fullPlan, numAgents);
+        Position releasedPos = findRelocatedBoxPosition(state, trial, blockerType, borrowPos);
+        boolean moved = releasedPos != null
+                && !releasedPos.equals(borrowPos)
+                && !trial.getBoxes().containsKey(borrowPos)
+                && !forbidden.contains(releasedPos)
+                && level.getBoxGoal(releasedPos) == '\0'
+                && level.getAgentGoal(releasedPos.row, releasedPos.col) < 0;
+        if (!moved) {
+            rollbackPlanTo(fullPlan, planSizeBefore);
+            globalTimeStep = timeBefore;
+            planMerger.clearAllPlans();
+            storedPlanSubgoals.clear();
+            return null;
+        }
+
+        lastClearingDisplacedGoals.add(borrowPos);
+        lastBorrowedGoalBoxPositions.put(borrowPos, releasedPos);
+        displacedGoals.add(borrowPos);
+        logNormal("[PP][BORROW] borrowed completed goal " + blockerType
+                + " " + borrowPos + " -> " + releasedPos
+                + " (return required)");
+        return trial;
     }
     
     /**
@@ -4183,7 +4287,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             
             // Check if the goal is actually still unsatisfied
             Character boxAtGoal = currentState.getBoxes().get(goalPos);
-            if (boxAtGoal != null && boxAtGoal == goalType) continue; // already back
+            if (boxAtGoal != null && boxAtGoal == goalType) {
+                displacedGoals.remove(goalPos);
+                lastBorrowedGoalBoxPositions.remove(goalPos);
+                continue; // already back
+            }
             
             // Find the nearest box of this type that can be pushed back
             Color goalColor = level.getBoxColor(goalType);
@@ -4199,18 +4307,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (returnAgent < 0) continue;
             
             // Find the displaced box — nearest box of the right type not on its goal
-            Position bestBoxPos = null;
+            Position bestBoxPos = lastBorrowedGoalBoxPositions.get(goalPos);
+            if (bestBoxPos != null && currentState.getBoxAt(bestBoxPos) != goalType) {
+                bestBoxPos = null;
+            }
             int bestDist = Integer.MAX_VALUE;
-            for (Map.Entry<Position, Character> entry : currentState.getBoxes().entrySet()) {
-                if (entry.getValue() != goalType) continue;
-                Position bPos = entry.getKey();
-                // Skip boxes that are already on a satisfied goal
-                char bGoal = level.getBoxGoal(bPos.row, bPos.col);
-                if (bGoal == entry.getValue()) continue;
-                int dist = goalPos.manhattanDistance(bPos);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestBoxPos = bPos;
+            if (bestBoxPos == null) {
+                for (Map.Entry<Position, Character> entry : currentState.getBoxes().entrySet()) {
+                    if (entry.getValue() != goalType) continue;
+                    Position bPos = entry.getKey();
+                    // Skip boxes that are already on a satisfied goal
+                    char bGoal = level.getBoxGoal(bPos.row, bPos.col);
+                    if (bGoal == entry.getValue()) continue;
+                    int dist = goalPos.manhattanDistance(bPos);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestBoxPos = bPos;
+                    }
                 }
             }
             if (bestBoxPos == null) continue;
@@ -4237,6 +4350,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (atGoal != null && atGoal == goalType) {
                     completedBoxGoals.add(goalPos);
                     displacedGoals.remove(goalPos);
+                    lastBorrowedGoalBoxPositions.remove(goalPos);
                     returned++;
                     logVerbose("[PP] [RETURN] Returned " + goalType + " to " + goalPos 
                             + " (" + returnPath.size() + " steps)");
@@ -4247,10 +4361,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (returned > 0) {
             logNormal("[PP] [RETURN] Returned " + returned + "/" 
                     + lastClearingDisplacedGoals.size() + " displaced goals");
-            revalidateCompletedGoals(currentState, level);
         }
         lastClearingDisplacedGoals.clear();
         return currentState;
+    }
+
+    private boolean borrowedGoalsRestored(List<Position> borrowedGoals, State state, Level level) {
+        for (Position goalPos : borrowedGoals) {
+            char goalType = level.getBoxGoal(goalPos);
+            if (goalType == '\0') return false;
+            Character atGoal = state.getBoxes().get(goalPos);
+            if (atGoal == null || atGoal != goalType) return false;
+        }
+        return true;
     }
 
     /**
@@ -5370,6 +5493,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         displacedGoals.clear();
         displacedGoals.addAll(snapshot);
         lastClearingDisplacedGoals.clear();
+        lastBorrowedGoalBoxPositions.clear();
+    }
+
+    private void restoreTransactionBookkeeping(Set<Position> displacedSnapshot,
+                                               Set<Position> completedSnapshot,
+                                               Map<Position, Integer> completionCountSnapshot) {
+        restoreDisplacedGoals(displacedSnapshot);
+        if (completedSnapshot != null) {
+            completedBoxGoals.clear();
+            completedBoxGoals.addAll(completedSnapshot);
+        }
+        if (completionCountSnapshot != null) {
+            goalCompletionCount.clear();
+            goalCompletionCount.putAll(completionCountSnapshot);
+        }
+        cachedSubgoalOrder = null;
+        subgoalManager.invalidateHungarianCache();
     }
 
     private void logAcceptedSubgoalEval(String phase, Subgoal subgoal, SubgoalEval before,
