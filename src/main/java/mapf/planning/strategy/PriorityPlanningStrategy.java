@@ -222,6 +222,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * local-clearing loop from repeating the same impossible move.
      */
     private final Set<String> taskReliefNogoods = new HashSet<>();
+    private final Set<String> sealStagingNogoods = new HashSet<>();
     private static final int MAX_TASK_RELIEF_MOVES = 4;
 
     /**
@@ -687,6 +688,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         deferredBlockedGoals.clear();
         syntheticReliefBlacklist.clear();
         taskReliefNogoods.clear();
+        sealStagingNogoods.clear();
         regressDisturbCount.clear();
         lastProgressTime = System.currentTimeMillis();
         lastFailureReport = null;
@@ -2756,10 +2758,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         storedPlanSubgoals.clear();
                         continue; // try next subgoal in priority order
                     }
-                    if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                    SealRisk sealRisk = findSealRisk(subgoal, currentState, tempState, level, subgoals);
+                    if (sealRisk != null) {
                         rollbackPlanTo(fullPlan, planSizeBefore);
                         planMerger.clearAllPlans();
                         storedPlanSubgoals.clear();
+                        State stagedState = tryStageForSealRisk("NORMAL", subgoal, sealRisk,
+                                currentState, level, fullPlan, numAgents);
+                        if (stagedState != null) {
+                            cachedSubgoalOrder = null;
+                            subgoalManager.invalidateHungarianCache();
+                            lastProgressWasPhantom = false;
+                            return true;
+                        }
                         continue;
                     }
                     if (!acceptReachedSubgoal("NORMAL", subgoal, beforeEval, tempState, level,
@@ -2974,13 +2985,22 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     
                     boolean reached = verifyGoalReached(subgoal, tempState, level);
                     if (reached) {
-                        if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                        SealRisk sealRisk = findSealRisk(subgoal, transactionStateBefore, tempState, level, subgoals);
+                        if (sealRisk != null) {
                             rollbackPlanTo(fullPlan, transactionPlanSizeBefore);
                             restoreTransactionBookkeeping(transactionDisplacedBefore,
                                     transactionCompletedBefore, transactionGoalCountBefore);
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
+                            State stagedState = tryStageForSealRisk("CLEARED", subgoal, sealRisk,
+                                    transactionStateBefore, level, fullPlan, numAgents);
+                            if (stagedState != null) {
+                                cachedSubgoalOrder = null;
+                                subgoalManager.invalidateHungarianCache();
+                                lastProgressWasPhantom = false;
+                                return true;
+                            }
                             continue;
                         }
                         if (!acceptReachedSubgoal("CLEARED", subgoal, beforeEval, tempState, level,
@@ -3159,10 +3179,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             storedPlanSubgoals.clear();
                             continue;
                         }
-                        if (wouldSealRemainingGoals(subgoal, tempState, level, subgoals)) {
+                        SealRisk sealRisk = findSealRisk(subgoal, currentState, tempState, level, subgoals);
+                        if (sealRisk != null) {
                             rollbackPlanTo(fullPlan, planSizeBefore);
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
+                            State stagedState = tryStageForSealRisk("CYCLE-BREAK", subgoal, sealRisk,
+                                    currentState, level, fullPlan, numAgents);
+                            if (stagedState != null) {
+                                cachedSubgoalOrder = null;
+                                subgoalManager.invalidateHungarianCache();
+                                lastProgressWasPhantom = false;
+                                return true;
+                            }
                             continue;
                         }
                         if (!acceptReachedSubgoal("CYCLE-BREAK", subgoal, beforeEval, tempState, level,
@@ -5379,62 +5408,363 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return null;
     }
 
-    private boolean wouldSealRemainingGoals(Subgoal completedSubgoal, State afterState,
-                                            Level level, List<Subgoal> allSubgoals) {
+    private SealRisk findSealRisk(Subgoal completedSubgoal, State beforeState, State afterState,
+                                  Level level, List<Subgoal> allSubgoals) {
         if (completedSubgoal.isAgentGoal || isSyntheticBoxTarget(completedSubgoal, level)) {
-            return false;
+            return null;
+        }
+        if (afterState.getBoxAt(completedSubgoal.goalPos) != completedSubgoal.boxType) {
+            return null;
         }
 
-        Set<Position> frozen = new HashSet<>(completedBoxGoals);
+        Set<Position> frozen = physicallySatisfiedBoxGoals(afterState, level);
         frozen.add(completedSubgoal.goalPos);
-        List<Subgoal> goalsToCheck = cachedSubgoalOrder != null ? cachedSubgoalOrder : allSubgoals;
 
-        for (Subgoal remaining : goalsToCheck) {
-            if (remaining == completedSubgoal || remaining.isAgentGoal) continue;
-            if (isSyntheticBoxTarget(remaining, level)) continue;
-            if (remaining.goalPos.equals(completedSubgoal.goalPos)) continue;
-            if (frozen.contains(remaining.goalPos)) continue;
+        for (Subgoal future : collectFutureTasksForSeal(completedSubgoal, afterState, level, allSubgoals)) {
+            if (canServiceFutureWithFrozen(future, afterState, level, frozen)) {
+                continue;
+            }
+            SealStagingPlan staging = null;
+            boolean allowStaging = future.isAgentGoal;
+            if (allowStaging) {
+                staging = findSealStagingPlan(completedSubgoal, future,
+                        beforeState, afterState, level, frozen);
+            }
+            return new SealRisk(future, frozen, staging, allowStaging);
+        }
+        return null;
+    }
 
-            Character boxAtGoal = afterState.getBoxes().get(remaining.goalPos);
-            if (boxAtGoal != null && boxAtGoal == remaining.boxType) continue;
+    private List<Subgoal> collectFutureTasksForSeal(Subgoal completedSubgoal, State state,
+                                                    Level level, List<Subgoal> allSubgoals) {
+        Map<Position, Subgoal> future = new LinkedHashMap<>();
+        if (allSubgoals != null) {
+            for (Subgoal sg : allSubgoals) {
+                addFutureSealTask(future, sg, completedSubgoal, state, level);
+            }
+        }
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            addFutureSealGoal(future, goalType, goalPos, completedSubgoal, state, level);
+        }
+        for (Map.Entry<Integer, Position> entry : level.getAgentGoalPositionMap().entrySet()) {
+            int agentId = entry.getKey();
+            Position goalPos = entry.getValue();
+            if (agentId >= state.getNumAgents()) continue;
+            if (goalPos.equals(state.getAgentPosition(agentId))) continue;
+            future.putIfAbsent(goalPos, new Subgoal(agentId, '\0', goalPos, true));
+        }
+        return new ArrayList<>(future.values());
+    }
 
-            if (!canServiceGoalNeighborhood(remaining, afterState, level, frozen)) {
-                logVerbose("[PP][SEAL-REJECT] " + completedSubgoal.boxType + " -> "
-                        + completedSubgoal.goalPos + " would seal "
-                        + remaining.boxType + " -> " + remaining.goalPos
-                        + " with frozen=" + formatPositions(frozen));
+    private void addFutureSealTask(Map<Position, Subgoal> future, Subgoal sg,
+                                   Subgoal completedSubgoal, State state, Level level) {
+        if (sg == null || sg.goalPos.equals(completedSubgoal.goalPos)) return;
+        if (sg.isSyntheticRelief() || isSyntheticBoxTarget(sg, level)) return;
+        if (sg.isAgentGoal) {
+            Position agentPos = state.getAgentPosition(sg.agentId);
+            if (agentPos != null && !agentPos.equals(sg.goalPos)) {
+                future.putIfAbsent(sg.goalPos, sg);
+            }
+            return;
+        }
+        addFutureSealGoal(future, sg.boxType, sg.goalPos, completedSubgoal, state, level);
+    }
+
+    private void addFutureSealGoal(Map<Position, Subgoal> future, char goalType, Position goalPos,
+                                   Subgoal completedSubgoal, State state, Level level) {
+        if (goalType == '\0' || goalPos.equals(completedSubgoal.goalPos)) return;
+        if (state.getBoxAt(goalPos) == goalType) return;
+        int agentId = findHelperAgentForBox(goalType, state, level, goalPos);
+        if (agentId < 0) return;
+        future.putIfAbsent(goalPos, new Subgoal(agentId, goalType, goalPos, false));
+    }
+
+    private Set<Position> physicallySatisfiedBoxGoals(State state, Level level) {
+        Set<Position> satisfied = new HashSet<>();
+        for (Position goalPos : level.getAllBoxGoalPositions()) {
+            char goalType = level.getBoxGoal(goalPos);
+            if (goalType != '\0' && state.getBoxAt(goalPos) == goalType) {
+                satisfied.add(goalPos);
+            }
+        }
+        return satisfied;
+    }
+
+    private boolean canServiceFutureWithFrozen(Subgoal goal, State state, Level level,
+                                               Set<Position> frozen) {
+        if (goal.isAgentGoal) {
+            Set<Position> reachable = bfsReachableWithFrozenGoals(
+                    state.getAgentPosition(goal.agentId), level, frozen);
+            return reachable.contains(goal.goalPos);
+        }
+
+        Set<Position> serviceRegion = serviceRegionForGoal(goal, state, level, frozen);
+        if (serviceRegion.isEmpty()) return false;
+
+        Color goalColor = level.getBoxColor(goal.boxType);
+        if (goalColor == null) return true;
+        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
+            if (!goalColor.equals(level.getAgentColor(agentId))) continue;
+            Set<Position> reachable = bfsReachableWithFrozenGoals(
+                    state.getAgentPosition(agentId), level, frozen);
+            if (!Collections.disjoint(reachable, serviceRegion)) {
                 return true;
             }
         }
         return false;
     }
 
-    private boolean canServiceGoalNeighborhood(Subgoal goal, State state, Level level,
+    private Set<Position> serviceRegionForGoal(Subgoal goal, State state, Level level,
                                                Set<Position> frozen) {
-        Color goalColor = level.getBoxColor(goal.boxType);
-        if (goalColor == null) return true;
-
-        for (int agentId = 0; agentId < state.getNumAgents(); agentId++) {
-            if (!goalColor.equals(level.getAgentColor(agentId))) continue;
-            Set<Position> reachable = bfsReachableWithFrozenGoals(
-                    state.getAgentPosition(agentId), level, frozen);
-            if (reachable.contains(goal.goalPos)) return true;
-            for (Direction dir : Direction.values()) {
-                Position adj = goal.goalPos.move(dir);
-                if (!level.isWall(adj) && !frozen.contains(adj) && reachable.contains(adj)) {
-                    return true;
-                }
+        Set<Position> seeds = new LinkedHashSet<>();
+        if (!level.isWall(goal.goalPos) && !frozen.contains(goal.goalPos)) {
+            seeds.add(goal.goalPos);
+        }
+        for (Direction dir : Direction.values()) {
+            Position adj = goal.goalPos.move(dir);
+            if (!level.isWall(adj) && !frozen.contains(adj)) {
+                seeds.add(adj);
             }
         }
-        return false;
+
+        Set<Position> region = bfsReachableWithFrozenGoals(seeds, level, frozen);
+        if (region.isEmpty()) return Collections.emptySet();
+
+        boolean hasCandidateBox = false;
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != goal.boxType) continue;
+            Position boxPos = entry.getKey();
+            if (state.getBoxAt(boxPos) == level.getBoxGoal(boxPos)) continue;
+            if (region.contains(boxPos)) {
+                hasCandidateBox = true;
+                break;
+            }
+            for (Direction dir : Direction.values()) {
+                if (region.contains(boxPos.move(dir))) {
+                    hasCandidateBox = true;
+                    break;
+                }
+            }
+            if (hasCandidateBox) break;
+        }
+        return hasCandidateBox ? region : Collections.emptySet();
+    }
+
+    private SealStagingPlan findSealStagingPlan(Subgoal sealingSubgoal, Subgoal future,
+                                                State beforeState, State afterState,
+                                                Level level, Set<Position> frozenAfterSeal) {
+        Color futureColor = future.isAgentGoal
+                ? level.getAgentColor(future.agentId)
+                : level.getBoxColor(future.boxType);
+        if (futureColor == null) return null;
+
+        Set<Position> serviceRegion = future.isAgentGoal
+                ? terminalAgentRegionForGoal(future, level, frozenAfterSeal)
+                : serviceRegionForGoal(future, afterState, level, frozenAfterSeal);
+        if (serviceRegion.isEmpty()) return null;
+
+        Set<Position> stagingExclusion = sealStagingExclusion(sealingSubgoal, afterState, level);
+        Set<Position> preferredTargets = new HashSet<>();
+        Set<Position> fallbackTargets = new HashSet<>();
+        for (Position p : serviceRegion) {
+            if (!beforeState.isFree(p, level)) continue;
+            if (!afterState.isFree(p, level)) continue;
+            if (stagingExclusion.contains(p)) continue;
+            fallbackTargets.add(p);
+            if (!level.hasBoxGoal(p) && !level.hasAgentGoal(p)) {
+                preferredTargets.add(p);
+            }
+        }
+        if (fallbackTargets.isEmpty()) return null;
+
+        SealStagingPlan best = null;
+        for (int agentId = 0; agentId < beforeState.getNumAgents(); agentId++) {
+            if (future.isAgentGoal && agentId != future.agentId) continue;
+            if (agentId == sealingSubgoal.agentId) continue;
+            if (!futureColor.equals(level.getAgentColor(agentId))) continue;
+
+            String nogood = sealStagingNogoodKey(sealingSubgoal, future, agentId);
+            if (sealStagingNogoods.contains(nogood)) continue;
+
+            List<Action> path = findMoveOnlyPathToAny(agentId, beforeState, level, preferredTargets);
+            if ((path == null || path.isEmpty()) && !preferredTargets.equals(fallbackTargets)) {
+                path = findMoveOnlyPathToAny(agentId, beforeState, level, fallbackTargets);
+            }
+            if (path == null || path.isEmpty()) continue;
+
+            Position target = replayAgentPath(beforeState.getAgentPosition(agentId), path);
+            if (best == null || path.size() < best.path.size()) {
+                best = new SealStagingPlan(agentId, target, path);
+            }
+        }
+        return best;
+    }
+
+    private Set<Position> terminalAgentRegionForGoal(Subgoal agentGoal, Level level,
+                                                     Set<Position> frozen) {
+        if (!agentGoal.isAgentGoal) return Collections.emptySet();
+        return bfsReachableWithFrozenGoals(agentGoal.goalPos, level, frozen);
+    }
+
+    private Set<Position> sealStagingExclusion(Subgoal sealingSubgoal, State afterState, Level level) {
+        Set<Position> excluded = new HashSet<>();
+        excluded.add(sealingSubgoal.goalPos);
+        for (Direction dir : Direction.values()) {
+            Position one = sealingSubgoal.goalPos.move(dir);
+            if (!level.isWall(one)) excluded.add(one);
+            Position two = one.move(dir);
+            if (!level.isWall(two)) excluded.add(two);
+        }
+        Position sealingAgent = afterState.getAgentPosition(sealingSubgoal.agentId);
+        if (sealingAgent != null) {
+            excluded.add(sealingAgent);
+            for (Direction dir : Direction.values()) {
+                Position adj = sealingAgent.move(dir);
+                if (!level.isWall(adj)) excluded.add(adj);
+            }
+        }
+        return excluded;
+    }
+
+    private State tryStageForSealRisk(String phase, Subgoal sealingSubgoal, SealRisk risk,
+                                      State beforeState, Level level, List<Action[]> fullPlan,
+                                      int numAgents) {
+        if (!risk.allowStaging) {
+            logNormal("[PP][SEAL-REJECT] phase=" + phase
+                    + " sealing=" + subgoalLabel(sealingSubgoal)
+                    + " would-seal=" + subgoalLabel(risk.future)
+                    + " reason=blocks-future-task frozen=" + formatPositions(risk.frozen));
+            return null;
+        }
+
+        if (risk.staging == null) {
+            logNormal("[PP][SEAL-REJECT] phase=" + phase
+                    + " sealing=" + subgoalLabel(sealingSubgoal)
+                    + " would-seal=" + subgoalLabel(risk.future)
+                    + " reason=no-staging-path frozen=" + formatPositions(risk.frozen));
+            return null;
+        }
+
+        State staged = appendSerializedAgentPath(risk.staging.agentId, risk.staging.path,
+                beforeState, level, fullPlan, numAgents);
+        if (staged == null) {
+            sealStagingNogoods.add(sealStagingNogoodKey(sealingSubgoal, risk.future, risk.staging.agentId));
+            logNormal("[PP][SEAL-REJECT] phase=" + phase
+                    + " sealing=" + subgoalLabel(sealingSubgoal)
+                    + " would-seal=" + subgoalLabel(risk.future)
+                    + " reason=staging-exec-failed agent=" + risk.staging.agentId
+                    + " target=" + risk.staging.target);
+            return null;
+        }
+
+        logNormal("[PP][SEAL-STAGE] phase=" + phase
+                + " sealing=" + subgoalLabel(sealingSubgoal)
+                + " future=" + subgoalLabel(risk.future)
+                + " agent=" + risk.staging.agentId
+                + " target=" + risk.staging.target
+                + " actions=" + risk.staging.path.size());
+        return staged;
+    }
+
+    private List<Action> findMoveOnlyPathToAny(int agentId, State state, Level level,
+                                               Set<Position> targets) {
+        if (targets == null || targets.isEmpty()) return null;
+        Position start = state.getAgentPosition(agentId);
+        if (start == null) return null;
+        if (targets.contains(start)) return Collections.emptyList();
+
+        Queue<Position> queue = new ArrayDeque<>();
+        Set<Position> visited = new HashSet<>();
+        Map<Position, Position> parent = new HashMap<>();
+        Map<Position, Action> parentAction = new HashMap<>();
+        visited.add(start);
+        queue.add(start);
+
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (!level.isFree(next)) continue;
+                if (state.hasBoxAt(next)) continue;
+                if (state.hasAgentAt(next)) continue;
+
+                visited.add(next);
+                parent.put(next, current);
+                parentAction.put(next, Action.move(dir));
+                if (targets.contains(next)) {
+                    return reconstructMoveOnlyPath(start, next, parent, parentAction);
+                }
+                queue.add(next);
+            }
+        }
+        return null;
+    }
+
+    private List<Action> reconstructMoveOnlyPath(Position start, Position end,
+                                                 Map<Position, Position> parent,
+                                                 Map<Position, Action> parentAction) {
+        List<Action> path = new ArrayList<>();
+        Position current = end;
+        while (!current.equals(start)) {
+            Action action = parentAction.get(current);
+            Position prev = parent.get(current);
+            if (action == null || prev == null) return null;
+            path.add(action);
+            current = prev;
+        }
+        Collections.reverse(path);
+        return path;
+    }
+
+    private Position replayAgentPath(Position start, List<Action> path) {
+        Position current = start;
+        if (current == null || path == null) return current;
+        for (Action action : path) {
+            if (action.type == Action.ActionType.MOVE) {
+                current = current.move(action.agentDir);
+            }
+        }
+        return current;
+    }
+
+    private State appendSerializedAgentPath(int agentId, List<Action> path, State state,
+                                            Level level, List<Action[]> fullPlan, int numAgents) {
+        State current = state;
+        for (Action action : path) {
+            if (action.type != Action.ActionType.MOVE) return null;
+            if (!current.isApplicable(action, agentId, level)) return null;
+            Action[] jointAction = new Action[numAgents];
+            Arrays.fill(jointAction, Action.noOp());
+            jointAction[agentId] = action;
+            fullPlan.add(jointAction);
+            current = applyJointAction(jointAction, current, level, numAgents);
+            globalTimeStep++;
+        }
+        return current;
+    }
+
+    private String sealStagingNogoodKey(Subgoal sealingSubgoal, Subgoal future, int agentId) {
+        return sealingSubgoal.boxType + "@" + sealingSubgoal.goalPos
+                + "|future=" + future.boxType + "@" + future.goalPos
+                + "|agent=" + agentId;
     }
 
     private Set<Position> bfsReachableWithFrozenGoals(Position start, Level level, Set<Position> frozen) {
+        if (start == null) return Collections.emptySet();
+        return bfsReachableWithFrozenGoals(Collections.singleton(start), level, frozen);
+    }
+
+    private Set<Position> bfsReachableWithFrozenGoals(Collection<Position> starts, Level level, Set<Position> frozen) {
         Set<Position> visited = new HashSet<>();
-        if (start == null || level.isWall(start) || frozen.contains(start)) return visited;
         Queue<Position> queue = new LinkedList<>();
-        visited.add(start);
-        queue.add(start);
+        for (Position start : starts) {
+            if (start == null || level.isWall(start) || frozen.contains(start)) continue;
+            if (visited.add(start)) {
+                queue.add(start);
+            }
+        }
         while (!queue.isEmpty()) {
             Position current = queue.poll();
             for (Direction dir : Direction.values()) {
@@ -5619,6 +5949,33 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         }
         Collections.sort(parts);
         return String.join("|", parts);
+    }
+
+    private static class SealRisk {
+        final Subgoal future;
+        final Set<Position> frozen;
+        final SealStagingPlan staging;
+        final boolean allowStaging;
+
+        SealRisk(Subgoal future, Set<Position> frozen, SealStagingPlan staging,
+                 boolean allowStaging) {
+            this.future = future;
+            this.frozen = frozen;
+            this.staging = staging;
+            this.allowStaging = allowStaging;
+        }
+    }
+
+    private static class SealStagingPlan {
+        final int agentId;
+        final Position target;
+        final List<Action> path;
+
+        SealStagingPlan(int agentId, Position target, List<Action> path) {
+            this.agentId = agentId;
+            this.target = target;
+            this.path = path;
+        }
     }
 
     private static class SubgoalEval {
