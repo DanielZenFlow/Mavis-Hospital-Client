@@ -6,11 +6,23 @@ on:
     paths:
       - 'src/**'
       - 'complevels/**'
+      - 'complevels26/**'
+      - 'run_benchmark.py'
       - '.github/workflows/benchmark.yml'
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - level-dir: complevels
+            output-file: benchmark_results.md
+            artifact-name: benchmark-results-complevels
+          - level-dir: complevels26
+            output-file: benchmark_results_complevels26.md
+            artifact-name: benchmark-results-complevels26
 
     steps:
       - name: Checkout code
@@ -40,17 +52,24 @@ jobs:
       - name: Run Python Benchmark Script
         id: benchmark
         continue-on-error: true
+        env:
+          LEVEL_DIR: ${{ matrix.level-dir }}
+          OUTPUT_FILE: ${{ matrix.output-file }}
         run: |
+          set +e
           python run_benchmark.py
-          echo "Exit code: $?"
-          ls -la benchmark_results.md || echo "benchmark_results.md not found"
+          status=$?
+          set -e
+          echo "Exit code: $status"
+          ls -la "$OUTPUT_FILE" || echo "$OUTPUT_FILE not found"
+          exit "$status"
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         if: always()  # Upload even if some tests fail
         with:
-          name: benchmark-results
+          name: ${{ matrix.artifact-name }}
           path: |
-            benchmark_results.md
+            ${{ matrix.output-file }}
             *.log
           if-no-files-found: warn

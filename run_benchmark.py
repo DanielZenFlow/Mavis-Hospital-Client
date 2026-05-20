@@ -6,10 +6,10 @@ import sys
 import time
 
 # Configuration
-LEVEL_DIR = "complevels"
-OUTPUT_FILE = "benchmark_results.md"
+LEVEL_DIR = os.environ.get("LEVEL_DIR", "complevels")
+OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "benchmark_results.md")
 SERVER_JAR = "server.jar"
-TIMEOUT_SECONDS = 180
+TIMEOUT_SECONDS = int(os.environ.get("TIMEOUT_SECONDS", "180"))
 # Detect OS for classpath separator if needed (not needed for single path, but good practice)
 # CP_SEP = ";" if os.name == 'nt' else ":"
 CLIENT_CMD = 'java -Xmx4g -cp target/classes mapf.client.Client'
@@ -125,6 +125,7 @@ def main():
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             f.write(f"# Benchmark Results\n")
             f.write(f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Level dir:** `{LEVEL_DIR}`\n")
             f.write(f"**Score:** {success_count}/{len(levels)}\n\n")
             f.write("\n".join(results))
         
