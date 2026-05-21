@@ -224,8 +224,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private final Set<String> taskReliefNogoods = new HashSet<>();
     private final Set<String> sealStagingNogoods = new HashSet<>();
     private final Map<String, Set<Position>> taskSupportForbidden = new HashMap<>();
-    private static final int MAX_TASK_RELIEF_MOVES = 12;
-    private static final int MAX_PARKING_CANDIDATES_PER_BLOCKER = 12;
+    private static final int MAX_TASK_RELIEF_MOVES = 8;
     private static final int MAX_SUPPORT_CHAIN_DEPTH = 4;
 
     /**
@@ -2921,6 +2920,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             supportPlanSizeBefore = reliefPlanSizeBefore;
                             supportStateBefore = reliefStateBefore;
                             supportDisplacedBefore = reliefDisplacedBefore;
+                        } else if (fullPlan.size() > reliefPlanSizeBefore) {
+                            // Treat accepted blocker movement as a first-class support subgoal.
+                            // The parent task may still need another support move in the next
+                            // iteration, but rolling this back loses real monotonic progress.
+                            lastProgressWasPhantom = false;
+                            return true;
                         } else {
                             rollbackPlanTo(fullPlan, reliefPlanSizeBefore);
                             restoreDisplacedGoals(reliefDisplacedBefore);
@@ -2937,12 +2942,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     State relievedState = tryScopedSyntheticBlockerRelief(subgoal, currentState, level,
                             fullPlan, numAgents, subgoals);
                     if (relievedState != null) {
-                        if (fullPlan.size() > reliefPlanSizeBefore) {
-                            // Scoped NAMO relief can be a useful support transaction even
-                            // when the parent task still needs another clearing step.
-                            lastProgressWasPhantom = false;
-                            return true;
-                        }
                         path = planSubgoal(subgoal, relievedState, level, subgoals);
                         if (path != null && !path.isEmpty()) {
                             currentState = relievedState;
@@ -3314,32 +3313,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         int initialPlanSize = fullPlan.size();
         int initialTime = globalTimeStep;
-        Set<Position> displacedBefore = new HashSet<>(displacedGoals);
-        List<Position> borrowedGoalsBefore = new ArrayList<>(lastClearingDisplacedGoals);
-        Map<Position, Position> borrowedPositionsBefore = new HashMap<>(lastBorrowedGoalBoxPositions);
-        lastClearingDisplacedGoals.clear();
-        lastBorrowedGoalBoxPositions.clear();
         State current = state;
         int moved = 0;
         String supportKey = taskSupportKey(blockedSubgoal);
         Set<Position> usedTemps = new HashSet<>(
                 taskSupportForbidden.getOrDefault(supportKey, Collections.emptySet()));
-        Set<Position> taskCritical = taskSupportProtectedCells(blockedSubgoal, current, level, allSubgoals);
+        Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
         List<Position> initialBlockers = findAccessBlockersForTask(
                 blockedSubgoal, current, level, allSubgoals);
-        if (parentTaskExecutable(blockedSubgoal, current, level, allSubgoals)) {
-            restoreSupportBorrowBookkeeping(
-                    displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
-            return current;
-        }
-        State allocatedState = tryAllocatedParkingRelief(blockedSubgoal, current, level,
-                fullPlan, numAgents, allSubgoals, taskCritical, usedTemps, initialBlockers);
-        if (allocatedState != null) {
-            subgoalManager.invalidateHungarianCache();
-            taskSupportForbidden.put(supportKey, new HashSet<>(usedTemps));
-            cachedSubgoalOrder = null;
-            return allocatedState;
-        }
 
         for (int round = 0; round < MAX_TASK_RELIEF_MOVES; round++) {
             List<Position> blockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
@@ -3428,10 +3409,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
 
                     if (movedBlocker && madeTaskProgress) {
-                        recordSupportBorrowIfCompletedGoal(
-                                blockerPos, releasedPos, blockerType, beforeRelease, trial, level);
                         current = trial;
                         usedTemps.add(releasedPos);
+                        usedTemps.add(blockerPos);
                         moved++;
                         movedThisBlocker = true;
                         movedThisRound = true;
@@ -3487,10 +3467,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
 
                     if (movedBlocker && madeTaskProgress) {
-                        recordSupportBorrowIfCompletedGoal(
-                                blockerPos, pTemp, blockerType, current, trial, level);
                         current = trial;
                         usedTemps.add(pTemp);
+                        usedTemps.add(blockerPos);
                         moved++;
                         movedThisBlocker = true;
                         movedThisRound = true;
@@ -3541,27 +3520,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (!movedThisRound) {
                 break;
             }
-            taskCritical = taskSupportProtectedCells(blockedSubgoal, current, level, allSubgoals);
+            taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
         }
 
-        if (moved == 0) {
-            restoreSupportBorrowBookkeeping(
-                    displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
-            return null;
-        }
-        if (!parentTaskExecutable(blockedSubgoal, current, level, allSubgoals)) {
-            rollbackPlanTo(fullPlan, initialPlanSize);
-            globalTimeStep = initialTime;
-            planMerger.clearAllPlans();
-            storedPlanSubgoals.clear();
-            restoreSupportBorrowBookkeeping(
-                    displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
-            List<Position> remainingBlockers = findAccessBlockersForTask(
-                    blockedSubgoal, current, level, allSubgoals);
-            logNormal("[PP][TASK-RELIEF] support not closed for " + subgoalLabel(blockedSubgoal)
-                    + " remaining=" + remainingBlockers + " -- rollback partial relief");
-            return null;
-        }
+        if (moved == 0) return null;
         List<Position> remainingBlockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
         if (!remainingBlockers.isEmpty()) {
             boolean reducedBlockers = remainingBlockers.size() < initialBlockers.size();
@@ -3571,8 +3533,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 globalTimeStep = initialTime;
                 planMerger.clearAllPlans();
                 storedPlanSubgoals.clear();
-                restoreSupportBorrowBookkeeping(
-                        displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
                 logNormal("[PP][TASK-RELIEF] incomplete relief for " + subgoalLabel(blockedSubgoal)
                         + " remaining=" + remainingBlockers + " -- rollback partial relief");
                 return null;
@@ -3585,262 +3545,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         taskSupportForbidden.put(supportKey, new HashSet<>(usedTemps));
         cachedSubgoalOrder = null;
         return current;
-    }
-
-    private State tryAllocatedParkingRelief(Subgoal blockedSubgoal, State state, Level level,
-            List<Action[]> fullPlan, int numAgents, List<Subgoal> allSubgoals,
-            Set<Position> taskCritical, Set<Position> usedTemps,
-            List<Position> initialBlockers) {
-        if (initialBlockers == null || initialBlockers.size() < 2) return null;
-
-        int movableBlockers = 0;
-        for (Position blocker : initialBlockers) {
-            if (state.getBoxes().containsKey(blocker)) movableBlockers++;
-        }
-        if (movableBlockers < 2) return null;
-
-        int initialPlanSize = fullPlan.size();
-        int initialTime = globalTimeStep;
-        Set<Position> displacedBefore = new HashSet<>(displacedGoals);
-        List<Position> borrowedGoalsBefore = new ArrayList<>(lastClearingDisplacedGoals);
-        Map<Position, Position> borrowedPositionsBefore = new HashMap<>(lastBorrowedGoalBoxPositions);
-        State current = state;
-        Set<Position> localUsedTemps = new HashSet<>(usedTemps);
-        Set<String> localNogoods = new HashSet<>();
-        int moved = 0;
-        boolean supportClosed = parentTaskExecutable(blockedSubgoal, current, level, allSubgoals);
-
-        for (int round = 0; round < MAX_TASK_RELIEF_MOVES && !supportClosed; round++) {
-            List<Position> blockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
-            if (blockers.isEmpty()) {
-                supportClosed = parentTaskExecutable(blockedSubgoal, current, level, allSubgoals);
-                break;
-            }
-
-            List<ParkingMoveCandidate> candidates = buildParkingMoveCandidates(
-                    blockedSubgoal, blockers, current, level, taskCritical, localUsedTemps, localNogoods);
-            if (candidates.isEmpty()) {
-                break;
-            }
-
-            int blockerCountBefore = blockers.size();
-            boolean movedThisRound = false;
-
-            for (ParkingMoveCandidate candidate : candidates) {
-                Character blockerType = current.getBoxes().get(candidate.blocker);
-                if (blockerType == null || blockerType != candidate.boxType) continue;
-
-                int helper = findHelperAgentForBox(blockerType, current, level, candidate.blocker);
-                if (helper < 0) continue;
-
-                int planSizeBefore = fullPlan.size();
-                int timeBefore = globalTimeStep;
-                Set<Position> unfreeze = new HashSet<>();
-                unfreeze.add(candidate.blocker);
-                int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
-                        Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
-                                computeDynamicBspBudget(candidate.blocker, candidate.parking) * 2));
-                List<Action> reliefPath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
-                        helper, candidate.blocker, candidate.parking, blockerType,
-                        current, level, unfreeze, reliefBudget, taskCritical);
-                if (reliefPath == null || reliefPath.isEmpty()) {
-                    localNogoods.add(taskReliefNogoodKey(blockedSubgoal,
-                            candidate.blocker, candidate.parking));
-                    continue;
-                }
-
-                State trial = appendReliefPath(reliefPath, helper, current, level, fullPlan, numAgents);
-                Character parked = trial.getBoxes().get(candidate.parking);
-                int blockerCountAfter = findAccessBlockersForTask(
-                        blockedSubgoal, trial, level, allSubgoals).size();
-                boolean movedBlocker = parked != null && parked == blockerType
-                        && !trial.getBoxes().containsKey(candidate.blocker);
-                boolean madeTaskProgress = blockerCountAfter < blockerCountBefore
-                        || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
-
-                if (movedBlocker && madeTaskProgress) {
-                    recordSupportBorrowIfCompletedGoal(
-                            candidate.blocker, candidate.parking, blockerType, current, trial, level);
-                    current = trial;
-                    localUsedTemps.add(candidate.parking);
-                    moved++;
-                    movedThisRound = true;
-                    supportClosed = parentTaskExecutable(blockedSubgoal, current, level, allSubgoals);
-                    logVerbose("[PP][PARKING-ALLOC] parked blocker "
-                            + blockerType + " " + candidate.blocker + " -> " + candidate.parking
-                            + " for " + subgoalLabel(blockedSubgoal)
-                            + " blockers=" + blockerCountBefore + "->" + blockerCountAfter);
-                    break;
-                }
-
-                rollbackPlanTo(fullPlan, planSizeBefore);
-                globalTimeStep = timeBefore;
-                planMerger.clearAllPlans();
-                storedPlanSubgoals.clear();
-                localNogoods.add(taskReliefNogoodKey(blockedSubgoal,
-                        candidate.blocker, candidate.parking));
-            }
-
-            if (!movedThisRound) break;
-            taskCritical = taskSupportProtectedCells(blockedSubgoal, current, level, allSubgoals);
-        }
-
-        if (moved == 0) return null;
-        if (!supportClosed) {
-            rollbackPlanTo(fullPlan, initialPlanSize);
-            globalTimeStep = initialTime;
-            planMerger.clearAllPlans();
-            storedPlanSubgoals.clear();
-            restoreSupportBorrowBookkeeping(
-                    displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
-            List<Position> remainingBlockers = findAccessBlockersForTask(
-                    blockedSubgoal, current, level, allSubgoals);
-            logNormal("[PP][PARKING-ALLOC] support not closed for " + subgoalLabel(blockedSubgoal)
-                    + " blockers=" + initialBlockers.size() + "->" + remainingBlockers.size()
-                    + " parked=" + moved + " -- rollback partial allocation");
-            return null;
-        }
-
-        List<Position> remainingBlockers = findAccessBlockersForTask(
-                blockedSubgoal, current, level, allSubgoals);
-        boolean reducedBlockers = remainingBlockers.size() < initialBlockers.size();
-        boolean accessOpened = hasTaskAccess(blockedSubgoal, current, level, allSubgoals);
-        if (!reducedBlockers && !accessOpened) {
-            rollbackPlanTo(fullPlan, initialPlanSize);
-            globalTimeStep = initialTime;
-            planMerger.clearAllPlans();
-            storedPlanSubgoals.clear();
-            restoreSupportBorrowBookkeeping(
-                    displacedBefore, borrowedGoalsBefore, borrowedPositionsBefore);
-            return null;
-        }
-
-        usedTemps.clear();
-        usedTemps.addAll(localUsedTemps);
-        logNormal("[PP][PARKING-ALLOC] " + subgoalLabel(blockedSubgoal)
-                + " blockers=" + initialBlockers.size() + "->" + remainingBlockers.size()
-                + " parked=" + moved
-                + (remainingBlockers.isEmpty() ? "" : " remaining=" + remainingBlockers));
-        return current;
-    }
-
-    private void recordSupportBorrowIfCompletedGoal(Position originalPos, Position borrowedPos,
-            char boxType, State before, State after, Level level) {
-        if (originalPos == null || borrowedPos == null) return;
-        if (!completedBoxGoals.contains(originalPos)) return;
-        char goalType = level.getBoxGoal(originalPos);
-        if (goalType == '\0' || goalType != boxType) return;
-        if (before == null || before.getBoxAt(originalPos) != boxType) return;
-        if (after == null || after.getBoxAt(borrowedPos) != boxType) return;
-
-        if (!lastClearingDisplacedGoals.contains(originalPos)) {
-            lastClearingDisplacedGoals.add(originalPos);
-        }
-        lastBorrowedGoalBoxPositions.put(originalPos, borrowedPos);
-        displacedGoals.add(originalPos);
-        logNormal("[PP][BORROW] borrowed completed goal " + boxType
-                + " " + originalPos + " -> " + borrowedPos
-                + " (support return required)");
-    }
-
-    private void restoreSupportBorrowBookkeeping(Set<Position> displacedSnapshot,
-            List<Position> borrowedGoalsSnapshot,
-            Map<Position, Position> borrowedPositionsSnapshot) {
-        displacedGoals.clear();
-        if (displacedSnapshot != null) {
-            displacedGoals.addAll(displacedSnapshot);
-        }
-        lastClearingDisplacedGoals.clear();
-        if (borrowedGoalsSnapshot != null) {
-            lastClearingDisplacedGoals.addAll(borrowedGoalsSnapshot);
-        }
-        lastBorrowedGoalBoxPositions.clear();
-        if (borrowedPositionsSnapshot != null) {
-            lastBorrowedGoalBoxPositions.putAll(borrowedPositionsSnapshot);
-        }
-    }
-
-    private boolean parentTaskExecutable(Subgoal subgoal, State state, Level level,
-                                         List<Subgoal> allSubgoals) {
-        List<Action> path = planSubgoal(subgoal, state, level, allSubgoals);
-        return path != null && !path.isEmpty();
-    }
-
-    private List<ParkingMoveCandidate> buildParkingMoveCandidates(Subgoal blockedSubgoal,
-            List<Position> blockers, State state, Level level,
-            Set<Position> taskCritical, Set<Position> usedTemps, Set<String> localNogoods) {
-        List<ParkingMoveCandidate> candidates = new ArrayList<>();
-        for (int blockerIndex = 0; blockerIndex < blockers.size(); blockerIndex++) {
-            Position blocker = blockers.get(blockerIndex);
-            Character blockerType = state.getBoxes().get(blocker);
-            if (blockerType == null) continue;
-            int helper = findHelperAgentForBox(blockerType, state, level, blocker);
-            if (helper < 0) continue;
-
-            List<Position> parkingCandidates = findTaskReliefParkingCandidates(
-                    blocker, state, level, taskCritical, usedTemps);
-            boolean completedGoalBlocker = isCompletedGoalBlocker(blocker, blockerType, state, level);
-            Comparator<Position> parkingOrder = completedGoalBlocker
-                    ? Comparator.comparingInt((Position p) -> parkingDistanceFromBlocker(blocker, p, level))
-                    : Comparator.comparingInt((Position p) -> -parkingDistanceFromBlocker(blocker, p, level));
-            parkingCandidates.sort(parkingOrder
-                    .thenComparingInt(p -> p.row)
-                    .thenComparingInt(p -> p.col));
-            int limit = Math.min(MAX_PARKING_CANDIDATES_PER_BLOCKER, parkingCandidates.size());
-            for (int i = 0; i < limit; i++) {
-                Position parking = parkingCandidates.get(i);
-                if (localNogoods.contains(taskReliefNogoodKey(blockedSubgoal, blocker, parking))) {
-                    continue;
-                }
-                int distance = parkingDistanceFromBlocker(blocker, parking, level);
-                int score = (completedGoalBlocker ? distance : -distance) * 10000
-                        + i * 1000 + blockerIndex * 10;
-                candidates.add(new ParkingMoveCandidate(blocker, parking, blockerType, score));
-            }
-        }
-        candidates.sort(Comparator
-                .comparingInt((ParkingMoveCandidate c) -> c.score)
-                .thenComparingInt(c -> c.blocker.row)
-                .thenComparingInt(c -> c.blocker.col)
-                .thenComparingInt(c -> c.parking.row)
-                .thenComparingInt(c -> c.parking.col));
-        return candidates;
-    }
-
-    private boolean isCompletedGoalBlocker(Position blocker, char blockerType, State state, Level level) {
-        if (blocker == null || !completedBoxGoals.contains(blocker)) return false;
-        char goalType = level.getBoxGoal(blocker);
-        return goalType != '\0' && goalType == blockerType && state.getBoxAt(blocker) == blockerType;
-    }
-
-    private int parkingDistanceFromBlocker(Position blocker, Position parking, Level level) {
-        if (blocker == null || parking == null) return 0;
-        if (blocker.equals(parking)) return 0;
-
-        Queue<Position> queue = new ArrayDeque<>();
-        Map<Position, Integer> dist = new HashMap<>();
-        queue.add(blocker);
-        dist.put(blocker, 0);
-
-        while (!queue.isEmpty()) {
-            Position p = queue.poll();
-            int d = dist.get(p);
-            if (p.equals(parking)) {
-                return d;
-            }
-            for (Direction dir : Direction.values()) {
-                Position next = p.move(dir);
-                if (level.isWall(next) || immovableBoxes.contains(next)) {
-                    continue;
-                }
-                if (dist.containsKey(next)) {
-                    continue;
-                }
-                dist.put(next, d + 1);
-                queue.add(next);
-            }
-        }
-        return blocker.manhattanDistance(parking);
     }
 
     private State tryClearHelperAccessForBlocker(Subgoal parentTask, Position targetBoxPos,
@@ -4146,7 +3850,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         int initialTime = globalTimeStep;
         State current = state;
         int moved = 0;
-        boolean madeAnyTaskProgress = false;
 
         BlockerReliefSynthesizer.ReliefResult reliefResult =
                 BlockerReliefSynthesizer.synthesizeWithMeta(current, level, immovableBoxes);
@@ -4243,7 +3946,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             boolean hasAccessAfter = hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
             boolean madeTaskProgress = blockersAfter.size() < blockersBefore.size()
                     || (!hadAccessBefore && hasAccessAfter);
-            madeAnyTaskProgress |= madeTaskProgress;
 
             current = trial;
             moved++;
@@ -4266,12 +3968,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 cachedSubgoalOrder = null;
                 return current;
             }
-        }
-
-        if (moved > 0 && madeAnyTaskProgress) {
-            subgoalManager.invalidateHungarianCache();
-            cachedSubgoalOrder = null;
-            return current;
         }
 
         if (moved > 0) {
@@ -4361,22 +4057,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return cells;
     }
 
-    private Set<Position> taskSupportProtectedCells(Subgoal subgoal, State state, Level level,
-                                                    List<Subgoal> allSubgoals) {
-        if (subgoal.isAgentGoal) {
-            return taskAccessCells(subgoal, state, level, allSubgoals);
-        }
-
-        Set<Position> cells = new HashSet<>();
-        cells.add(subgoal.goalPos);
-        for (Position boxPos : sameTypeBoxesForSubgoal(subgoal, state, level, allSubgoals)) {
-            cells.add(boxPos);
-            cells.addAll(operationCells(boxPos, level));
-            cells.addAll(deliveryResourceCells(subgoal, boxPos, state, level));
-        }
-        return cells;
-    }
-
     private List<Position> findAccessBlockersForTask(Subgoal subgoal, State state, Level level,
                                                      List<Subgoal> allSubgoals) {
         Color agentColor = level.getAgentColor(subgoal.agentId);
@@ -4392,7 +4072,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         Set<Position> blockers = new LinkedHashSet<>();
 
         for (Position boxPos : candidateBoxes) {
-            blockers.addAll(findDeliveryBlockersForTask(subgoal, boxPos, state, level));
             if (hasReachableNeighbor(boxPos, reachable, level)) continue;
 
             for (Direction dir : Direction.values()) {
@@ -4420,47 +4099,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return new ArrayList<>(blockers);
-    }
-
-    private List<Position> findDeliveryBlockersForTask(Subgoal subgoal, Position boxPos,
-                                                       State state, Level level) {
-        if (boxPos == null || subgoal.isAgentGoal) return Collections.emptyList();
-
-        List<Position> blockers = new ArrayList<>();
-        for (Position p : deliveryResourceCells(subgoal, boxPos, state, level)) {
-            if (p.equals(boxPos)) continue;
-            Character box = state.getBoxes().get(p);
-            if (box != null && !immovableBoxes.contains(p)) {
-                blockers.add(p);
-            }
-        }
-        return blockers;
-    }
-
-    private Set<Position> deliveryResourceCells(Subgoal subgoal, Position boxPos,
-                                                State state, Level level) {
-        Set<Position> protectedGoals = new HashSet<>(completedBoxGoals);
-        protectedGoals.remove(boxPos);
-        protectedGoals.remove(subgoal.goalPos);
-        List<Position> path = pathAnalyzer.findPathIgnoringDynamicObstacles(
-                boxPos, subgoal.goalPos, level, protectedGoals);
-        if (path == null || path.isEmpty()) {
-            path = pathAnalyzer.findPathIgnoringDynamicObstacles(boxPos, subgoal.goalPos, level);
-        }
-        if (path == null || path.isEmpty()) return Collections.emptySet();
-
-        Set<Position> cells = new LinkedHashSet<>(path);
-        for (int i = 0; i < path.size() - 1; i++) {
-            Position from = path.get(i);
-            Position to = path.get(i + 1);
-            int dr = to.row - from.row;
-            int dc = to.col - from.col;
-            Position pushStand = new Position(from.row - dr, from.col - dc);
-            if (!level.isWall(pushStand)) {
-                cells.add(pushStand);
-            }
-        }
-        return cells;
     }
 
     private List<Position> findAgentGoalBlockersForTask(Subgoal subgoal, State state, Level level,
@@ -5123,47 +4761,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         int planSizeBefore = fullPlan.size();
         int timeBefore = globalTimeStep;
-        List<Position> parkingCandidates = findTaskReliefParkingCandidates(
-                borrowPos, state, level, protectedPositions, Collections.emptySet());
-        parkingCandidates.sort(Comparator
-                .comparingInt((Position p) -> -parkingDistanceFromBlocker(borrowPos, p, level))
-                .thenComparingInt(p -> p.row)
-                .thenComparingInt(p -> p.col));
-        int limit = Math.min(MAX_PARKING_CANDIDATES_PER_BLOCKER, parkingCandidates.size());
-        for (int i = 0; i < limit; i++) {
-            Position parking = parkingCandidates.get(i);
-            if (forbidden.contains(parking)) continue;
-
-            List<Action> parkingPath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
-                    helper, borrowPos, parking, blockerType, state, level,
-                    unfreeze, budget, protectedPositions);
-            if (parkingPath == null || parkingPath.isEmpty()) {
-                continue;
-            }
-
-            State trial = appendReliefPath(parkingPath, helper, state, level, fullPlan, numAgents);
-            Character parked = trial.getBoxes().get(parking);
-            boolean moved = parked != null
-                    && parked == blockerType
-                    && !trial.getBoxes().containsKey(borrowPos)
-                    && level.getBoxGoal(parking) == '\0'
-                    && level.getAgentGoal(parking.row, parking.col) < 0;
-            if (moved) {
-                lastClearingDisplacedGoals.add(borrowPos);
-                lastBorrowedGoalBoxPositions.put(borrowPos, parking);
-                displacedGoals.add(borrowPos);
-                logNormal("[PP][BORROW] borrowed completed goal " + blockerType
-                        + " " + borrowPos + " -> " + parking
-                        + " (return required)");
-                return trial;
-            }
-
-            rollbackPlanTo(fullPlan, planSizeBefore);
-            globalTimeStep = timeBefore;
-            planMerger.clearAllPlans();
-            storedPlanSubgoals.clear();
-        }
-
         List<Action> releasePath = boxSearchPlanner.planBoxReleaseFromForbidden(
                 helper, borrowPos, blockerType, state, level,
                 forbidden, unfreeze, budget, protectedPositions);
@@ -5584,10 +5181,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             // Plan this subgoal
             List<Action> path = planSubgoal(sg, state, level, allSubgoals);
             if (path != null && !path.isEmpty()) {
-                if (!isParallelPlanAdmissible(primarySubgoal, sg, path, state, level, allSubgoals)) {
-                    plannedComponents.add(sgComponent);
-                    continue;
-                }
                 planMerger.storePlan(sg.agentId, path, globalTimeStep);
                 storedPlanSubgoals.put(sg.agentId, sg);
                 plannedComponents.add(sgComponent);
@@ -5596,47 +5189,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         + ", " + path.size() + " steps) in component " + sgComponent);
             }
         }
-    }
-
-    private boolean isParallelPlanAdmissible(Subgoal primarySubgoal, Subgoal parallelSubgoal,
-                                             List<Action> path, State state, Level level,
-                                             List<Subgoal> allSubgoals) {
-        State simulated = replaySingleAgentPath(parallelSubgoal.agentId, path, state, level);
-        if (simulated == null || !verifyGoalReached(parallelSubgoal, simulated, level)) {
-            return false;
-        }
-        if (!parallelSubgoal.isAgentGoal && !isSyntheticBoxTarget(parallelSubgoal, level)
-                && wouldTrapAgent(parallelSubgoal, simulated, level, allSubgoals, state)) {
-            logVerbose("[PP] [PARALLEL-REJECT] " + subgoalLabel(parallelSubgoal)
-                    + " would trap agent after parallel completion");
-            return false;
-        }
-        SealRisk sealRisk = findSealRisk(parallelSubgoal, state, simulated, level, allSubgoals);
-        if (sealRisk != null) {
-            logNormal("[PP] [PARALLEL-REJECT] primary=" + subgoalLabel(primarySubgoal)
-                    + " parallel=" + subgoalLabel(parallelSubgoal)
-                    + " would-seal=" + subgoalLabel(sealRisk.future));
-            return false;
-        }
-        List<Position> regressed = detectRegressedGoals(simulated, level);
-        regressed.removeAll(displacedGoals);
-        if (!regressed.isEmpty()) {
-            logVerbose("[PP] [PARALLEL-REJECT] " + subgoalLabel(parallelSubgoal)
-                    + " would regress completed goals " + regressed);
-            return false;
-        }
-        return true;
-    }
-
-    private State replaySingleAgentPath(int agentId, List<Action> path, State state, Level level) {
-        State current = state;
-        for (Action action : path) {
-            if (!current.isApplicable(action, agentId, level)) {
-                return null;
-            }
-            current = current.apply(action, agentId);
-        }
-        return current;
     }
     
     /**
@@ -6381,19 +5933,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return null;
         }
 
-        Set<Position> frozenBeforeSeal = physicallySatisfiedBoxGoals(afterState, level);
-        frozenBeforeSeal.remove(completedSubgoal.goalPos);
-        Set<Position> frozen = new HashSet<>(frozenBeforeSeal);
+        Set<Position> frozen = physicallySatisfiedBoxGoals(afterState, level);
         frozen.add(completedSubgoal.goalPos);
 
         for (Subgoal future : collectFutureTasksForSeal(completedSubgoal, afterState, level, allSubgoals)) {
             if (canServiceFutureWithFrozen(future, afterState, level, frozen)) {
-                continue;
-            }
-            boolean newlyBlocked = canServiceFutureWithFrozen(future, afterState, level, frozenBeforeSeal);
-            boolean onFutureCriticalResource = taskCriticalCells(future, afterState, level, allSubgoals)
-                    .contains(completedSubgoal.goalPos);
-            if (!newlyBlocked && !onFutureCriticalResource) {
                 continue;
             }
             SealStagingPlan staging = null;
@@ -6405,26 +5949,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return new SealRisk(future, frozen, staging, allowStaging);
         }
         return null;
-    }
-
-    private Set<Position> taskCriticalCells(Subgoal subgoal, State state, Level level,
-                                            List<Subgoal> allSubgoals) {
-        Set<Position> critical = new HashSet<>();
-        if (subgoal.isAgentGoal) {
-            critical.addAll(pathAnalyzer.findCriticalPositionsForAgentGoal(
-                    state, level, subgoal.agentId, subgoal.goalPos, Collections.emptySet()));
-            critical.add(subgoal.goalPos);
-            return critical;
-        }
-
-        for (Position boxPos : sameTypeBoxesForSubgoal(subgoal, state, level, allSubgoals)) {
-            critical.addAll(pathAnalyzer.findCriticalPositions(
-                    state, level, subgoal.agentId, subgoal.goalPos, boxPos, Collections.emptySet()));
-            critical.addAll(deliveryResourceCells(subgoal, boxPos, state, level));
-            critical.add(boxPos);
-        }
-        critical.add(subgoal.goalPos);
-        return critical;
     }
 
     private List<Subgoal> collectFutureTasksForSeal(Subgoal completedSubgoal, State state,
@@ -7038,20 +6562,6 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             this.agentId = agentId;
             this.target = target;
             this.path = path;
-        }
-    }
-
-    private static class ParkingMoveCandidate {
-        final Position blocker;
-        final Position parking;
-        final char boxType;
-        final int score;
-
-        ParkingMoveCandidate(Position blocker, Position parking, char boxType, int score) {
-            this.blocker = blocker;
-            this.parking = parking;
-            this.boxType = boxType;
-            this.score = score;
         }
     }
 
