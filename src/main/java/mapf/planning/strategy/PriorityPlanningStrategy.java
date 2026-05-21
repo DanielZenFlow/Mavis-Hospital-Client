@@ -2942,6 +2942,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     State relievedState = tryScopedSyntheticBlockerRelief(subgoal, currentState, level,
                             fullPlan, numAgents, subgoals);
                     if (relievedState != null) {
+                        if (fullPlan.size() > reliefPlanSizeBefore) {
+                            // Scoped NAMO relief can be a useful support transaction even
+                            // when the parent task still needs another clearing step.
+                            lastProgressWasPhantom = false;
+                            return true;
+                        }
                         path = planSubgoal(subgoal, relievedState, level, subgoals);
                         if (path != null && !path.isEmpty()) {
                             currentState = relievedState;
@@ -3850,6 +3856,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         int initialTime = globalTimeStep;
         State current = state;
         int moved = 0;
+        boolean madeAnyTaskProgress = false;
 
         BlockerReliefSynthesizer.ReliefResult reliefResult =
                 BlockerReliefSynthesizer.synthesizeWithMeta(current, level, immovableBoxes);
@@ -3946,6 +3953,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             boolean hasAccessAfter = hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
             boolean madeTaskProgress = blockersAfter.size() < blockersBefore.size()
                     || (!hadAccessBefore && hasAccessAfter);
+            madeAnyTaskProgress |= madeTaskProgress;
 
             current = trial;
             moved++;
@@ -3968,6 +3976,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 cachedSubgoalOrder = null;
                 return current;
             }
+        }
+
+        if (moved > 0 && madeAnyTaskProgress) {
+            subgoalManager.invalidateHungarianCache();
+            cachedSubgoalOrder = null;
+            return current;
         }
 
         if (moved > 0) {
