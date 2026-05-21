@@ -253,7 +253,7 @@ public class BoxSearchPlanner {
 
         int h = getDistance(startPos, goalPos, level);
         SearchNode startNode = new SearchNode(initialState, null, null, 0, h, null);
-        StateKey startKey = new AgentGoalStateKey(initialState, agentId);
+        StateKey startKey = new AgentGoalStateKey(initialState, agentId, level);
         openList.add(startNode);
         bestG.put(startKey, 0);
 
@@ -286,7 +286,7 @@ public class BoxSearchPlanner {
                 Position newAgentPos = newState.getAgentPosition(agentId);
                 int newG = current.g + 1;
 
-                StateKey newKey = new AgentGoalStateKey(newState, agentId);
+                StateKey newKey = new AgentGoalStateKey(newState, agentId, level);
                 Integer existingG = bestG.get(newKey);
                 if (existingG != null && existingG <= newG) {
                     continue;
@@ -987,37 +987,18 @@ public class BoxSearchPlanner {
     }
     
     /**
-     * State key for agent goal search: tracks only agent position.
-     * 
-     * Previous version tracked all box positions (state.getBoxes().hashCode()),
-     * which caused state space explosion on levels with many boxes (e.g. 45+ boxes
-     * in pacMAn). Every incidental push/pull created a unique state key, exhausting
-     * the search budget before the agent could reach its goal.
-     * 
-     * In pull-enabled Sokoban, the agent can always push/pull same-color boxes
-     * out of the way. Tracking only agent position is safe because:
-     * - A* guarantees the shortest path (lowest g) reaches each position first
-     * - If two paths reach the same position with different box layouts, the
-     *   shorter one is preferred regardless of box arrangement
-     * - Box displacement is a side-effect of pathfinding, not the goal
+     * State key for agent goal search.
+     *
+     * Tracks the agent position plus boxes this agent can actually move. Tracking
+     * only the agent position is unsound for agent-goal tasks: reaching the same
+     * cell after relocating a same-color box can enable a route that was impossible
+     * in the earlier box layout. Tracking all boxes is too expensive on large maps,
+     * so this keeps the causal slice relevant to this agent.
      */
     private static class AgentGoalStateKey extends StateKey {
         
-        AgentGoalStateKey(State state, int agentId) {
-            super(state, agentId, null);
-        }
-        
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) return true;
-            if (!(obj instanceof AgentGoalStateKey)) return false;
-            AgentGoalStateKey other = (AgentGoalStateKey) obj;
-            return agentPos.equals(other.agentPos);
-        }
-        
-        @Override
-        public int hashCode() {
-            return agentPos.hashCode();
+        AgentGoalStateKey(State state, int agentId, Level level) {
+            super(state, agentId, null, level);
         }
     }
 

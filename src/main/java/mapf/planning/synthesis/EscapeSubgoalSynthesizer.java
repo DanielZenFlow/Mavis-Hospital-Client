@@ -1,6 +1,7 @@
 package mapf.planning.synthesis;
 
 import mapf.domain.*;
+import mapf.planning.strategy.PriorityPlanningStrategy.ReliefCertificate;
 import mapf.planning.strategy.PriorityPlanningStrategy.Subgoal;
 
 import java.util.*;
@@ -19,10 +20,10 @@ import java.util.*;
  *   input  = (state, level, goalDependsOn map)
  *   output = list of escape Subgoals to PREPEND to the normal subgoal order
  *
- * It is intentionally conservative: only emits escape subgoals for unique-box
- * 2-cycles (the canonical "swap" case from qanda.txt:79). Larger cycles or
- * multi-box-of-same-type ambiguity are left to the existing portfolio
- * (multi-seed RANDOM ordering + P0b deprioritization).
+ * It is intentionally conservative: first handle the canonical box-on-goal
+ * 2-cycle, then fall back to SCC-level staging for cycles where no box is
+ * already parked on a goal cell. That covers narrow corridor cycles whose
+ * boxes are still at their starts.
  *
  * P_temp selection (4-constraint validation per qanda.txt):
  *   1. Not a wall, not a goal cell, not currently occupied by another box.
@@ -192,23 +193,6 @@ public final class EscapeSubgoalSynthesizer {
      */
     private static Subgoal trySynthesizeForCycle(Position gA, Position gB, State state, Level level,
                                                   Set<Position> immovableBoxes, Set<Position> usedTemps) {
-        Character boxOnA = state.getBoxes().get(gA);
-        if (boxOnA == null) return null;
-
-        Color boxColor = level.getBoxColor(boxOnA);
-        if (boxColor == null) return null;
-
-        // Need at least one same-color agent to move the box.
-        int responsibleAgent = -1;
-        for (int i = 0; i < state.getNumAgents(); i++) {
-            if (level.getAgentColor(i) == boxColor) {
-                responsibleAgent = i;
-                break;
-            }
-        }
-        if (responsibleAgent == -1) return null;
-
-        // Build the set of goal cells (any color) — P_temp must avoid them.
         Set<Position> allGoalCells = new HashSet<>();
         for (List<Position> goals : level.getBoxGoalsByType().values()) {
             allGoalCells.addAll(goals);
@@ -217,10 +201,107 @@ public final class EscapeSubgoalSynthesizer {
             allGoalCells.add(agentGoal);
         }
 
-        Position pTemp = findPTempBFS(gA, state, level, immovableBoxes, allGoalCells, usedTemps);
-        if (pTemp == null) return null;
+        List<BoxStagingCandidate> candidates = cycleBoxCandidates(gA, state, level, immovableBoxes);
+        for (BoxStagingCandidate candidate : candidates) {
+            int responsibleAgent = bestReachableAgent(candidate.boxType(), candidate.boxPos(),
+                    state, level, immovableBoxes);
+            if (responsibleAgent == -1) continue;
 
-        return new Subgoal(responsibleAgent, boxOnA, pTemp, false);
+            Position pTemp = findPTempBFS(candidate.boxPos(), state, level,
+                    immovableBoxes, allGoalCells, usedTemps);
+            if (pTemp == null) continue;
+
+            ReliefCertificate certificate = ReliefCertificate.boxCorridor(
+                    candidate.boxPos(), candidate.boxPos(), gB);
+            return new Subgoal(responsibleAgent, candidate.boxType(), pTemp, false, certificate);
+        }
+        return null;
+    }
+
+    private static List<BoxStagingCandidate> cycleBoxCandidates(Position goal, State state, Level level,
+                                                                Set<Position> immovableBoxes) {
+        List<BoxStagingCandidate> candidates = new ArrayList<>();
+
+        Character boxOnGoal = state.getBoxes().get(goal);
+        if (boxOnGoal != null && level.getBoxColor(boxOnGoal) != null
+                && !immovableBoxes.contains(goal)) {
+            candidates.add(new BoxStagingCandidate(boxOnGoal, goal, 0));
+            return candidates;
+        }
+
+        char goalType = level.getBoxGoal(goal);
+        if (goalType == '\0') return candidates;
+
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != goalType) continue;
+            Position boxPos = entry.getKey();
+            if (immovableBoxes.contains(boxPos)) continue;
+            if (level.getBoxGoal(boxPos) == goalType) continue;
+            candidates.add(new BoxStagingCandidate(goalType, boxPos, boxPos.manhattanDistance(goal)));
+        }
+        candidates.sort(Comparator.comparingInt(BoxStagingCandidate::distanceToCycleGoal));
+        return candidates;
+    }
+
+    private static int bestReachableAgent(char boxType, Position boxPos, State state, Level level,
+                                          Set<Position> immovableBoxes) {
+        Color boxColor = level.getBoxColor(boxType);
+        if (boxColor == null) return -1;
+
+        int bestAgent = -1;
+        int bestDistance = Integer.MAX_VALUE;
+        for (int agent = 0; agent < state.getNumAgents(); agent++) {
+            if (level.getAgentColor(agent) != boxColor) continue;
+            int distance = distanceToOperationSide(state.getAgentPosition(agent), boxPos,
+                    state, level, immovableBoxes);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestAgent = agent;
+            }
+        }
+        return bestDistance == Integer.MAX_VALUE ? -1 : bestAgent;
+    }
+
+    private static int distanceToOperationSide(Position agentPos, Position boxPos, State state,
+                                               Level level, Set<Position> immovableBoxes) {
+        if (agentPos == null || boxPos == null) return Integer.MAX_VALUE;
+
+        Set<Position> reachable = reachableCells(agentPos, state, level, immovableBoxes);
+        int best = Integer.MAX_VALUE;
+        int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+        for (int[] d : dirs) {
+            Position side = new Position(boxPos.row + d[0], boxPos.col + d[1]);
+            if (!reachable.contains(side)) continue;
+            int dist = Math.abs(agentPos.row - side.row) + Math.abs(agentPos.col - side.col);
+            best = Math.min(best, dist);
+        }
+        return best;
+    }
+
+    private static Set<Position> reachableCells(Position start, State state, Level level,
+                                                Set<Position> immovableBoxes) {
+        Set<Position> visited = new HashSet<>();
+        if (start == null) return visited;
+
+        Deque<Position> queue = new ArrayDeque<>();
+        queue.add(start);
+        visited.add(start);
+        int[][] dirs = {{-1,0},{1,0},{0,-1},{0,1}};
+        while (!queue.isEmpty()) {
+            Position p = queue.poll();
+            for (int[] d : dirs) {
+                Position np = new Position(p.row + d[0], p.col + d[1]);
+                if (visited.contains(np)) continue;
+                if (np.row < 0 || np.row >= level.getRows()
+                        || np.col < 0 || np.col >= level.getCols()) continue;
+                if (level.isWall(np.row, np.col)) continue;
+                if (immovableBoxes.contains(np)) continue;
+                if (state.hasBoxAt(np)) continue;
+                visited.add(np);
+                queue.add(np);
+            }
+        }
+        return visited;
     }
 
     /**
@@ -249,6 +330,7 @@ public final class EscapeSubgoalSynthesizer {
                 && !goalCells.contains(p)
                 && !usedTemps.contains(p)
                 && !boxes.containsKey(p)
+                && !state.hasAgentAt(p)
                 && !immovableBoxes.contains(p)
                 && !isCorner(p, level, immovableBoxes)) {
                 return p;
@@ -286,4 +368,6 @@ public final class EscapeSubgoalSynthesizer {
         if (level.isWall(r, c)) return true;
         return immovableBoxes.contains(new Position(r, c));
     }
+
+    private record BoxStagingCandidate(char boxType, Position boxPos, int distanceToCycleGoal) {}
 }
