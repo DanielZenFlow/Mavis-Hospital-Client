@@ -47,6 +47,10 @@ init();
 
 function init() {
   scanReportsDir().then(function() {
+    return loadReportsDirManifest();
+  }).then(function() {
+    return loadManifestReports();
+  }).then(function() {
     renderReportList();
     var lastName = localStorage.getItem(STORAGE_KEY);
     var idx = 0;
@@ -121,6 +125,26 @@ function init() {
 
 function currentReport() { return state.reports[state.activeIndex] || null; }
 
+function upsertReport(report, preferFront) {
+  if (!report || !report.name) return -1;
+  var idx = state.reports.findIndex(function(r) { return r.name === report.name; });
+  if (idx >= 0) {
+    state.reports[idx] = report;
+    if (preferFront && idx !== 0) {
+      state.reports.splice(idx, 1);
+      state.reports.unshift(report);
+      return 0;
+    }
+    return idx;
+  }
+  if (preferFront) {
+    state.reports.unshift(report);
+    return 0;
+  }
+  state.reports.push(report);
+  return state.reports.length - 1;
+}
+
 function renderReportList() {
   var rows = state.reports.map(function(r, i) { return { report: r, index: i }; });
   if (state.group !== 'all') {
@@ -165,6 +189,10 @@ function renderMeta() {
 
 function showEmpty() { els.panSurface.innerHTML = ''; }
 
+function cacheBust(path) {
+  return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'v=' + Date.now();
+}
+
 // ---- .lvl loading + in-browser analysis ----
 
 async function loadLvlFile(file) {
@@ -172,8 +200,7 @@ async function loadLvlFile(file) {
     var text = await file.text();
     var level = parseLvl(text, file.name.replace(/\.lvl$/i, ''));
     var report = analyzeLevel(level);
-    state.reports.unshift(report);
-    state.activeIndex = 0;
+    state.activeIndex = upsertReport(report, true);
     localStorage.setItem(STORAGE_KEY, report.name);
     renderReportList(); renderMeta(); renderBoard(); resetView();
     await saveReportToDir(report);
@@ -190,12 +217,12 @@ async function scanReportsDir() {
     var stored = await readDirHandleFromDB();
     if (!stored) return;
     if (await stored.requestPermission({ mode: 'readwrite' }) !== 'granted') return;
-    state.dirHandle = stored;
+    var reportsDir = await resolveReportsDirHandle(stored, false);
+    if (!reportsDir) return;
+    state.dirHandle = reportsDir;
 
-    // Merge already-loaded names for dedup
-    var seen = new Set(state.reports.map(function(r) { return r.name; }));
     var entries = [];
-    var iter = stored.values();
+    var iter = reportsDir.values();
     for await (var entry of iter) {
       if (entry.kind === 'file' && entry.name.indexOf('parking-risk-') === 0 && entry.name.indexOf('.js') > 0) {
         entries.push(entry);
@@ -208,14 +235,25 @@ async function scanReportsDir() {
       try {
         var file = await entries[i].getFile();
         var text = await file.text();
+        // Load auto-saved manifest from reports directory
+        if (entries[i].name === 'parking-risk-manifest.js') {
+          var mfMatch = text.match(/window\.PARKING_RISK_MANIFEST\s*=\s*(\{[\s\S]*?\});\s*$/);
+          if (mfMatch) {
+            try {
+              var dirManifest = JSON.parse(mfMatch[1]);
+              var current = window.PARKING_RISK_MANIFEST || {};
+              var mfKeys = Object.keys(dirManifest);
+              for (var k = 0; k < mfKeys.length; k++) { current[mfKeys[k]] = dirManifest[mfKeys[k]]; }
+              window.PARKING_RISK_MANIFEST = current;
+            } catch (_) {}
+          }
+          continue;
+        }
         // Extract JSON from the JS assignment
         var match = text.match(/window\.__PARKING_RISK_REPORT__\s*=\s*([\s\S]*?);\s*$/);
         if (!match) continue;
         var report = JSON.parse(match[1]);
-        if (report && report.name && !seen.has(report.name)) {
-          seen.add(report.name);
-          state.reports.push(report);
-        }
+        upsertReport(report, false);
       } catch (_) { /* skip unreadable files */ }
     }
   } catch (_) { /* dir not accessible */ }
@@ -223,21 +261,107 @@ async function scanReportsDir() {
 
 // ---- File System Access API — save directly to reports/ ----
 
+// Load the auto-updated manifest from reports/ if present.
+// The reports/ copy is updated automatically when a new report is saved via the viewer.
+function loadReportsDirManifest() {
+  return new Promise(function(resolve) {
+    var topManifest = window.PARKING_RISK_MANIFEST || {};
+    var script = document.createElement('script');
+    script.src = cacheBust('reports/parking-risk-manifest.js');
+    script.onload = function() {
+      var dirManifest = window.PARKING_RISK_MANIFEST || {};
+      // Merge: reports-dir manifest takes precedence, keep top-level entries as fallback
+      var topKeys = Object.keys(topManifest);
+      for (var k = 0; k < topKeys.length; k++) {
+        if (!dirManifest[topKeys[k]]) dirManifest[topKeys[k]] = topManifest[topKeys[k]];
+      }
+      window.PARKING_RISK_MANIFEST = dirManifest;
+      document.head.removeChild(script);
+      resolve();
+    };
+    script.onerror = function() {
+      document.head.removeChild(script);
+      resolve();
+    };
+    document.head.appendChild(script);
+  });
+}
+
+function loadManifestReports() {
+  var manifest = window.PARKING_RISK_MANIFEST;
+  if (!manifest) return Promise.resolve();
+  var entries = [];
+  var keys = Object.keys(manifest);
+  for (var i = 0; i < keys.length; i++) {
+    entries.push({ name: keys[i], path: manifest[keys[i]] });
+  }
+  if (entries.length === 0) return Promise.resolve();
+  function loadNext(idx) {
+    if (idx >= entries.length) return Promise.resolve();
+    return new Promise(function(resolve) {
+      var script = document.createElement('script');
+      script.src = cacheBust(entries[idx].path);
+      script.onload = function() {
+        var report = window.__PARKING_RISK_REPORT__;
+        upsertReport(report, false);
+        window.__PARKING_RISK_REPORT__ = undefined;
+        document.head.removeChild(script);
+        loadNext(idx + 1).then(resolve);
+      };
+      script.onerror = function() {
+        document.head.removeChild(script);
+        loadNext(idx + 1).then(resolve);
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return loadNext(0);
+}
+
+async function resolveReportsDirHandle(handle, createIfMissing) {
+  if (!handle || handle.kind !== 'directory') return null;
+  if (handle.name === 'reports') return handle;
+  try {
+    return await handle.getDirectoryHandle('reports', { create: false });
+  } catch (_) {}
+  try {
+    var parkingRisk = await handle.getDirectoryHandle('parking-risk', { create: false });
+    return await parkingRisk.getDirectoryHandle('reports', { create: false });
+  } catch (_) {}
+  if (createIfMissing && handle.name === 'parking-risk') {
+    try {
+      return await handle.getDirectoryHandle('reports', { create: true });
+    } catch (_) {}
+  }
+  return null;
+}
+
 async function getReportsDir() {
   if (state.dirHandle) return state.dirHandle;
   try {
     var stored = await readDirHandleFromDB();
     if (stored) {
       if (await stored.requestPermission({ mode: 'readwrite' }) === 'granted') {
-        state.dirHandle = stored; return stored;
+        var storedReportsDir = await resolveReportsDirHandle(stored, false);
+        if (storedReportsDir) {
+          state.dirHandle = storedReportsDir;
+          return storedReportsDir;
+        }
       }
     }
   } catch (_) {}
+  if (typeof window.showDirectoryPicker !== 'function') return null;
   try {
-    var handle = await window.showDirectoryPicker({ mode: 'readwrite' });
-    state.dirHandle = handle;
-    await writeDirHandleToDB(handle);
-    return handle;
+    window.alert('Select the reports folder, or select the parking-risk folder that contains reports.');
+    var handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'parking-risk-reports' });
+    var reportsDir = await resolveReportsDirHandle(handle, true);
+    if (!reportsDir) {
+      window.alert('That folder is not reports and does not contain a reports folder. The report will be downloaded instead.');
+      return null;
+    }
+    state.dirHandle = reportsDir;
+    await writeDirHandleToDB(reportsDir);
+    return reportsDir;
   } catch (_) { return null; }
 }
 
@@ -284,8 +408,22 @@ async function saveReportToDir(report) {
       var writable = await fileHandle.createWritable();
       await writable.write(content);
       await writable.close();
+
+      // Update in-memory manifest and save to reports directory
+      var manifest = window.PARKING_RISK_MANIFEST || {};
+      manifest[name] = 'reports/' + filename;
+      window.PARKING_RISK_MANIFEST = manifest;
+      try {
+        var mfContent = '// Parking Risk manifest - maps level name to report file path.\n// Auto-updated on save.\nwindow.PARKING_RISK_MANIFEST = ' + JSON.stringify(manifest, null, 2) + ';\n';
+        var mfHandle = await dir.getFileHandle('parking-risk-manifest.js', { create: true });
+        var mfWritable = await mfHandle.createWritable();
+        await mfWritable.write(mfContent);
+        await mfWritable.close();
+      } catch (_) {}
+
+      appendMetaLine('Saved to reports/' + filename);
       return;
-    } catch (_) {}
+    } catch (_) { state.dirHandle = null; }
   }
   // Fallback download
   var blob = new Blob([content], { type: 'application/javascript' });
@@ -294,6 +432,11 @@ async function saveReportToDir(report) {
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click();
   document.body.removeChild(a); URL.revokeObjectURL(url);
+  appendMetaLine('Could not write to reports; downloaded ' + filename + ' instead.');
+}
+
+function appendMetaLine(text) {
+  if (els.meta) els.meta.innerHTML += '<br>' + escapeHtml(text);
 }
 
 // ---- .lvl parser ----

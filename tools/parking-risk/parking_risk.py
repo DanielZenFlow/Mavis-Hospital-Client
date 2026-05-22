@@ -456,7 +456,7 @@ def collect_level_paths(root: Path, args: argparse.Namespace) -> List[Path]:
 
 
 def copy_viewer_assets(tool_dir: Path, out_dir: Path, refresh: bool) -> None:
-    for name in ("index.html", "viewer.css", "viewer.js"):
+    for name in ("index.html", "viewer.css", "viewer.js", "parking-risk-manifest.js"):
         src = tool_dir / name
         dst = out_dir / name
         if refresh or not dst.exists():

@@ -2,7 +2,7 @@
 """
 Generate a JS manifest of all .lvl files for the level-viewer HTML tool.
 
-Scans levels/ and complevels/ relative to the repo root and emits
+Scans levels/, complevels/, and complevels26/ relative to the repo root and emits
 target/diagnostics/level-viewer/levels-manifest.js, which assigns
 window.LEVELS_MANIFEST to a list of {group, name, path, content} entries
 so the static HTML can populate its sidebar without an HTTP server.
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import List, Dict
 
 
-GROUPS = ("levels", "complevels")
+GROUPS = ("levels", "complevels", "complevels26")
 OUT_REL = Path("target/diagnostics/level-viewer/levels-manifest.js")
 
 

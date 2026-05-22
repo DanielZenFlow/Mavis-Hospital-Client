@@ -1168,7 +1168,8 @@ public class PortfolioController implements SearchStrategy {
         State state = initialState;
         for (Action[] jointAction : plan) {
             try {
-                state = state.applyJointAction(jointAction, level);
+                Action[] effective = state.sanitizeJointAction(jointAction, level);
+                state = state.applyJointAction(effective, level);
             } catch (Exception e) {
                 return state; // Return whatever state we reached
             }

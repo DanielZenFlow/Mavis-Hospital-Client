@@ -240,6 +240,80 @@ public class State {
                 return false;
         }
     }
+
+    /**
+     * Returns the joint action that the server would effectively apply from this
+     * state: individually inapplicable actions and mutually conflicting actions
+     * are converted to NoOp. This is useful before replaying or sending a plan,
+     * because planner internals may already have treated those entries as failed
+     * while leaving the original action object in the returned plan.
+     */
+    public Action[] sanitizeJointAction(Action[] jointAction, Level level) {
+        Action[] effective = Arrays.copyOf(jointAction, jointAction.length);
+        boolean[] applicable = new boolean[jointAction.length];
+        boolean[] conflicted = new boolean[jointAction.length];
+        Position[] agentToPositions = new Position[jointAction.length];
+        Position[] boxFromPositions = new Position[jointAction.length];
+        Position[] boxToPositions = new Position[jointAction.length];
+
+        for (int agentId = 0; agentId < jointAction.length; agentId++) {
+            Action action = jointAction[agentId];
+            if (action == null || action.type == Action.ActionType.NOOP) {
+                effective[agentId] = Action.noOp();
+                applicable[agentId] = true;
+                continue;
+            }
+
+            Position agentPos = agentPositions[agentId];
+            if (agentPos == null || !isApplicable(action, agentId, level)) {
+                effective[agentId] = Action.noOp();
+                continue;
+            }
+
+            applicable[agentId] = true;
+            switch (action.type) {
+                case MOVE:
+                    agentToPositions[agentId] = agentPos.move(action.agentDir);
+                    break;
+                case PUSH: {
+                    Position boxPos = agentPos.move(action.agentDir);
+                    agentToPositions[agentId] = boxPos;
+                    boxFromPositions[agentId] = boxPos;
+                    boxToPositions[agentId] = boxPos.move(action.boxDir);
+                    break;
+                }
+                case PULL:
+                    agentToPositions[agentId] = agentPos.move(action.agentDir);
+                    boxFromPositions[agentId] = agentPos.move(action.boxDir.opposite());
+                    boxToPositions[agentId] = agentPos;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        for (int i = 0; i < jointAction.length; i++) {
+            if (!applicable[i] || isNoOp(effective[i])) continue;
+            for (int j = i + 1; j < jointAction.length; j++) {
+                if (!applicable[j] || isNoOp(effective[j])) continue;
+
+                if (sameNonNull(boxFromPositions[i], boxFromPositions[j])
+                        || movingObjectsShareDestination(agentToPositions[i], boxToPositions[i],
+                                                         agentToPositions[j], boxToPositions[j])) {
+                    conflicted[i] = true;
+                    conflicted[j] = true;
+                }
+            }
+        }
+
+        for (int agentId = 0; agentId < effective.length; agentId++) {
+            if (conflicted[agentId]) {
+                effective[agentId] = Action.noOp();
+            }
+        }
+
+        return effective;
+    }
     
     /**
      * Applies an action and returns the resulting state.

@@ -28,7 +28,7 @@ import java.util.*;
 public class Client {
 
     /** Client name sent to the server */
-    private static final String CLIENT_NAME = "HospitalClient";
+    private static final String CLIENT_NAME = "DayBreak";
 
     /** Input reader for server communication */
     private final BufferedReader serverIn;
@@ -188,6 +188,8 @@ public class Client {
                 debugOut.println("WARNING: Exceeded maximum actions limit");
                 break;
             }
+
+            actions = currentState.sanitizeJointAction(actions, level);
 
             // Send actions to server
             sendActions(actions);
