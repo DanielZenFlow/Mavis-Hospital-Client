@@ -521,15 +521,12 @@ public class State {
     private static boolean INAPPLICABLE_LOGGED = false;
 
     private static void logInapplicableJointActionOnce(int agentId, Action action, Position agentPos) {
+        if (!shouldLogInvalidJointActions()) return;
         if (INAPPLICABLE_LOGGED) return;
         INAPPLICABLE_LOGGED = true;
         System.err.println("[State.applyJointAction] Inapplicable action for agent " + agentId
                 + " at " + agentPos + " ; action=" + action + " -- treating as NoOp.");
-        StackTraceElement[] st = Thread.currentThread().getStackTrace();
-        int n = Math.min(st.length, 12);
-        for (int i = 1; i < n; i++) {
-            System.err.println("    at " + st[i]);
-        }
+        logInvalidJointActionStack();
     }
 
     /** Returns true iff applying this joint-action entry would put an agent or box off-grid. */
@@ -566,11 +563,35 @@ public class State {
     private static boolean OUT_OF_GRID_LOGGED = false;
 
     private static void logOutOfGridJointActionOnce(int agentId, Action action, Position agentPos, Level level) {
+        if (!shouldLogInvalidJointActions()) return;
         if (OUT_OF_GRID_LOGGED) return;
         OUT_OF_GRID_LOGGED = true;
         System.err.println("[State.applyJointAction] Out-of-grid action for agent " + agentId
                 + " at " + agentPos + " (grid " + level.getRows() + "x" + level.getCols() + ")"
                 + " ; action=" + action + " -- treating as NoOp.");
+        logInvalidJointActionStack();
+    }
+
+    /** One-time stderr warning when PUSH/PULL references a position with no box. */
+    private static boolean BOX_MISMATCH_LOGGED = false;
+
+    private static void logBoxMismatchOnce(int agentId, Action action, Position agentPos, Position boxPos) {
+        if (!shouldLogInvalidJointActions()) return;
+        if (BOX_MISMATCH_LOGGED) return;
+        BOX_MISMATCH_LOGGED = true;
+        System.err.println("[State.applyJointAction] Box-source mismatch: agent " + agentId
+                + " at " + agentPos + " ; action=" + action
+                + " ; expected box at " + boxPos + " but none found"
+                + " -- treating action as NoOp.");
+        logInvalidJointActionStack();
+    }
+
+    private static boolean shouldLogInvalidJointActions() {
+        return truthyEnv("MAVIS_LOG_INVALID_ACTIONS");
+    }
+
+    private static void logInvalidJointActionStack() {
+        if (!truthyEnv("MAVIS_LOG_INVALID_ACTION_STACK")) return;
         StackTraceElement[] st = Thread.currentThread().getStackTrace();
         int n = Math.min(st.length, 12);
         for (int i = 1; i < n; i++) {
@@ -578,21 +599,13 @@ public class State {
         }
     }
 
-    /** One-time stderr warning when PUSH/PULL references a position with no box. */
-    private static boolean BOX_MISMATCH_LOGGED = false;
-
-    private static void logBoxMismatchOnce(int agentId, Action action, Position agentPos, Position boxPos) {
-        if (BOX_MISMATCH_LOGGED) return;
-        BOX_MISMATCH_LOGGED = true;
-        System.err.println("[State.applyJointAction] Box-source mismatch: agent " + agentId
-                + " at " + agentPos + " ; action=" + action
-                + " ; expected box at " + boxPos + " but none found"
-                + " -- treating action as NoOp.");
-        StackTraceElement[] st = Thread.currentThread().getStackTrace();
-        int n = Math.min(st.length, 12);
-        for (int i = 1; i < n; i++) {
-            System.err.println("    at " + st[i]);
-        }
+    private static boolean truthyEnv(String name) {
+        String value = System.getenv(name);
+        return value != null && (
+                "1".equals(value.trim())
+                        || "true".equalsIgnoreCase(value.trim())
+                        || "yes".equalsIgnoreCase(value.trim())
+                        || "on".equalsIgnoreCase(value.trim()));
     }
 
     /**

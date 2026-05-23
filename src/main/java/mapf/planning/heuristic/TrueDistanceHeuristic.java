@@ -1,6 +1,7 @@
 package mapf.planning.heuristic;
 
 import mapf.domain.*;
+import mapf.planning.SearchConfig;
 
 import java.util.*;
 
@@ -279,11 +280,13 @@ public class TrueDistanceHeuristic implements Heuristic {
      * Subsequent occurrences are silent to keep stderr clean.
      */
     private static void logOutOfBoundsOnce(String where, Position from, Position goal) {
+        if (!SearchConfig.isNormal()) return;
         if (OOB_LOGGED) return;
         OOB_LOGGED = true;
         System.err.println("[TrueDistanceHeuristic] OOB lookup at " + where +
                 " from=(" + from.row + "," + from.col + ") goal=(" +
                 goal.row + "," + goal.col + ") -- returning UNREACHABLE.");
+        if (!SearchConfig.isVerbose()) return;
         StackTraceElement[] st = Thread.currentThread().getStackTrace();
         int n = Math.min(st.length, 12);
         for (int i = 1; i < n; i++) {

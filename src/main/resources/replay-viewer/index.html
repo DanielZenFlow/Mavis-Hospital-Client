@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AIMS Replay Reviewer</title>
+  <link rel="icon" href="favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="stylesheet" href="viewer.css">
 </head>
 <body>
@@ -13,7 +16,7 @@
         <div class="brandBlock">
           <div class="titleBlock">
             <h1>AIMS Replay Reviewer</h1>
-            <span class="versionText">v1.0.0</span>
+            <span class="versionText">v1.0.2</span>
           </div>
           <div class="githubMeta">
             <a
@@ -47,11 +50,11 @@
             </div>
             <div>
               <strong>Navigation</strong>
-              <p>Use Play, the step buttons, the slider, or the step number field. Use the mouse wheel to zoom, and use the reset control in the lower-right corner to restore the board view.</p>
+              <p>Use Play, the step buttons, the slider, or the step number field. Drag the board to pan, use the mouse wheel to zoom, hover an agent to inspect intent details, and use the reset control in the lower-right corner to restore the board view.</p>
             </div>
             <div>
               <strong>Debugging Tools</strong>
-              <p>Track an object with values like agent0 or boxA, highlight coordinates with row,column, and scan reachability changes for a selected agent and target cell.</p>
+              <p>Track an object with values like agent0 or boxA, highlight coordinates with row,column, hover an agent for detailed intent/action fields, pin one agent from the lower-right Agent menu, use Lock View to follow it, adjust interface and log text with the px control, and open Highlights for high-signal current-step events.</p>
             </div>
           </div>
           <div class="dialogFooter">
@@ -69,15 +72,36 @@
           <ol id="onboardingSteps" class="onboardingSteps" aria-label="Tutorial progress"></ol>
 
           <section class="onboardingBody">
-            <p id="onboardingStepCount" class="onboardingStepCount">Step 1 of 5</p>
+            <p id="onboardingStepCount" class="onboardingStepCount">Step 1 of 8</p>
             <h4 id="onboardingStepTitle">Load a replay</h4>
-            <p id="onboardingStepBody">Choose a replay JSON file or drag one onto the drop zone.</p>
+            <p id="onboardingStepBody">The newest generated replay loads automatically when available. You can also use Load replay JSON or drag a JSON file onto the drop zone.</p>
           </section>
 
           <div class="dialogFooter">
             <button id="tutorialSkipBtn" type="button" class="secondaryDialogBtn">Skip</button>
             <button id="tutorialBackBtn" type="button" class="secondaryDialogBtn">Back</button>
             <button id="tutorialNextBtn" type="button">Next</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="fontSettingsDialog" class="dialogOverlay fontSettingsOverlay" role="dialog" aria-modal="true" aria-labelledby="fontSettingsTitle" hidden>
+        <div class="dialogBox fontSettingsDialog">
+          <p class="onboardingKicker">Display</p>
+          <h3 id="fontSettingsTitle">Text size</h3>
+
+          <section class="fontSettingsBody">
+            <label class="fontSettingRow">Interface font size (px)
+              <input id="uiFontSizeInput" type="number" min="9" max="24" step="1" value="12">
+            </label>
+            <label class="fontSettingRow">Log font size (px)
+              <input id="logFontSizeInput" type="number" min="8" max="24" step="1" value="11">
+            </label>
+          </section>
+
+          <div class="dialogFooter">
+            <button id="fontSettingsResetBtn" type="button" class="secondaryDialogBtn">Reset</button>
+            <button id="fontSettingsCloseBtn" type="button">Close</button>
           </div>
         </div>
       </div>
@@ -107,21 +131,12 @@
       <label class="searchLabel">Track object
         <input id="trackInput" placeholder="agent7 or boxG">
       </label>
-      <label class="checkLine"><input id="reachInput" type="checkbox"> Show selected agent reachability</label>
       <div class="searchLabel">Highlight coordinate</div>
       <div class="inputRow">
         <input id="coordInput" placeholder="28,3">
         <button id="coordGoBtn">Go</button>
         <button id="coordClearBtn">Clear</button>
       </div>
-      <label class="searchLabel">Reachability target
-        <input id="targetInput" placeholder="28,3">
-      </label>
-      <button id="scanBtn" class="wideBtn">Scan reachability regression</button>
-      <section>
-        <h2>Suspicious events</h2>
-        <div id="events" class="events"></div>
-      </section>
       <section>
         <h2>Actions</h2>
         <div id="actions" class="actions"></div>
@@ -145,8 +160,42 @@
         <span id="statusInfo" class="statusInfo"></span>
         <span class="statusSpacer"></span>
         <span id="zoomInfo" class="statusInfo">100%</span>
+        <button id="stepEventsBtn" class="toolbarBtn stepEventsBtn" type="button" title="Inspect current step highlights" aria-label="Inspect current step highlights" hidden>Highlights 0</button>
+        <button id="agentMenuBtn" class="toolbarBtn agentMenuBtn" type="button" title="Monitor agent actions" aria-label="Monitor agent actions" aria-haspopup="true" aria-expanded="false" hidden>Agent</button>
+        <button id="fontSettingsBtn" class="toolbarBtn fontSettingsBtn" type="button" title="Text size" aria-label="Text size">12px</button>
         <button id="resetView" class="toolbarBtn" title="Reset view" aria-label="Reset view">&#8857;</button>
       </div>
+      <aside id="agentMenuPanel" class="agentMenuPanel" aria-label="Choose agent to monitor" hidden>
+        <p class="stepInspectorKicker">Agent Monitor</p>
+        <ol id="agentMenuList" class="agentMenuList"></ol>
+      </aside>
+      <aside id="agentActionPanel" class="agentActionPanel" aria-labelledby="agentActionTitle" hidden>
+        <div class="agentActionHeader">
+          <div>
+            <p class="stepInspectorKicker">Agent Monitor</p>
+            <h2 id="agentActionTitle">Agent actions</h2>
+          </div>
+          <button id="agentActionClose" class="toolbarBtn" type="button" title="Close agent monitor" aria-label="Close agent monitor">x</button>
+        </div>
+        <div id="agentActionBody" class="agentActionBody"></div>
+        <label class="agentActionFooter" for="lockViewInput">
+          <span>Lock View</span>
+          <span class="switchControl">
+            <input id="lockViewInput" type="checkbox" checked>
+            <span class="switchTrack" aria-hidden="true"></span>
+          </span>
+        </label>
+      </aside>
+      <aside id="stepInspector" class="stepInspector" aria-labelledby="stepInspectorTitle" hidden>
+        <div class="stepInspectorHeader">
+          <div>
+            <p class="stepInspectorKicker">Step Inspector</p>
+            <h2 id="stepInspectorTitle">Highlights</h2>
+          </div>
+          <button id="stepInspectorClose" class="toolbarBtn" type="button" title="Close inspector" aria-label="Close inspector">x</button>
+        </div>
+        <div id="stepInspectorBody" class="stepInspectorBody"></div>
+      </aside>
     </section>
 
     <div id="notificationToast" class="notificationToast" role="alert" hidden>

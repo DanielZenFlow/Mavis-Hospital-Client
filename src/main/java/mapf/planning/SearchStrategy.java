@@ -1,6 +1,7 @@
 package mapf.planning;
 
 import mapf.domain.*;
+import mapf.planning.diag.PlanTrace;
 import java.util.List;
 
 /**
@@ -22,6 +23,14 @@ public interface SearchStrategy {
      * @return list of joint actions (each Action[] has one action per agent), or null if no solution
      */
     List<Action[]> search(State initialState, Level level);
+
+    /**
+     * Optional structured explanation for the last returned plan.
+     * Strategies that do not emit intent diagnostics can keep the default empty trace.
+     */
+    default PlanTrace getLastPlanTrace() {
+        return new PlanTrace();
+    }
     
     /**
      * @return the name of this strategy (for logging)

@@ -158,7 +158,9 @@ public class AStar {
         }
         
         // No solution found
-        System.err.println("A* explored " + exploredCount + " states without finding solution");
+        if (SearchConfig.isNormal()) {
+            System.err.println("A* explored " + exploredCount + " states without finding solution");
+        }
         return null;
     }
     

@@ -107,7 +107,7 @@ public class JointAStar {
             closedList.add(current.state);
             exploredCount++;
             
-            if (exploredCount % SearchConfig.PROGRESS_LOG_INTERVAL == 0) {
+            if (SearchConfig.isNormal() && exploredCount % SearchConfig.PROGRESS_LOG_INTERVAL == 0) {
                 System.err.println("JointA* explored " + exploredCount + " states, open=" + openList.size());
             }
             
@@ -135,7 +135,9 @@ public class JointAStar {
             }
         }
         
-        System.err.println("JointA* explored " + exploredCount + " states without finding solution");
+        if (SearchConfig.isNormal()) {
+            System.err.println("JointA* explored " + exploredCount + " states without finding solution");
+        }
         return null;
     }
     

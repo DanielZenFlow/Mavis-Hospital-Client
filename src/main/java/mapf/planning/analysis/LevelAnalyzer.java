@@ -146,7 +146,7 @@ public class LevelAnalyzer {
         // P3: Agent-to-Agent path conflict static prediction
         PathConflictAnalysis pathConflicts = computePathConflictAnalysis(
                 activeGoals, level, state, taskFilter.immovableBoxes);
-        if (pathConflicts.analyzedPaths > 0) {
+        if (SearchConfig.isNormal() && pathConflicts.analyzedPaths > 0) {
             int totalOverlaps = pathConflicts.conflictScores.values().stream()
                     .mapToInt(Integer::intValue).sum() / 2;
             System.err.println("[LevelAnalyzer] P3 Path conflict analysis: " + totalOverlaps
@@ -230,6 +230,7 @@ public class LevelAnalyzer {
         // Find root position representing "Main Open Space" (agent accessible area)
         Position root = findOpenSpaceRoot(level, goals, immovableBoxes);
         if (root == null) {
+            if (!SearchConfig.isNormal()) return dependsOn;
             System.err.println("[LevelAnalyzer] Warning: No open space root found");
             return dependsOn;
         }
@@ -344,7 +345,13 @@ public class LevelAnalyzer {
                 }
             }
         }
-        System.err.println("[LevelAnalyzer] Found " + dependencyCount + " Hard Goal-to-Goal dependencies");
+        if (SearchConfig.isNormal()) {
+            System.err.println("[LevelAnalyzer] Found " + dependencyCount + " Hard Goal-to-Goal dependencies");
+        }
+
+        int structuralDepCount = addStructuralGoalDominanceDependencies(
+                dependsOn, goals, level, state, immovableBoxes);
+        dependencyCount += structuralDepCount;
 
         // =========================================================================================
         // PHASE 2: Start-to-Goal Dependencies (Soft Blocking / Initial Layout)
@@ -459,6 +466,65 @@ public class LevelAnalyzer {
         }
         
         return dependsOn;
+    }
+
+    /**
+     * Adds generic single-entry/dead-end ordering constraints.
+     *
+     * Existing goal-to-goal checks reason through full box serviceability, which
+     * intentionally treats movable boxes as movable. For target chains this can
+     * miss the simpler PP invariant: once a shallow goal is frozen, every deeper
+     * cell behind it may become unreachable from the servicing side. This pass is
+     * purely topological and level-agnostic: if blocking goal I disconnects goal J
+     * from all same-color service roots, then I must wait for J.
+     */
+    private static int addStructuralGoalDominanceDependencies(
+            Map<Position, Set<Position>> dependsOn,
+            List<Position> goals,
+            Level level,
+            State state,
+            Set<Position> immovableBoxes) {
+
+        int added = 0;
+        Set<Position> emptyBlocks = Collections.emptySet();
+        Set<Position> movableIgnored = Collections.emptySet();
+
+        for (Position target : goals) {
+            Color servicingColor = getGoalServicingColor(target, level);
+            Set<Position> effectiveImpassable = immovableBoxes;
+            List<Position> serviceRoots = findServiceRoots(target, level, state,
+                    servicingColor, effectiveImpassable);
+            if (serviceRoots.isEmpty()) continue;
+
+            boolean reachableWithoutBlock = anyRootReachableWithMultipleBlocks(
+                    serviceRoots, target, level, emptyBlocks, movableIgnored, immovableBoxes);
+            if (!reachableWithoutBlock) continue;
+
+            for (Position blocker : goals) {
+                if (blocker.equals(target)) continue;
+                if (level.getBoxGoal(blocker.row, blocker.col) == '\0') continue;
+
+                Set<Position> blocked = Collections.singleton(blocker);
+                boolean reachableWithBlock = anyRootReachableWithMultipleBlocks(
+                        serviceRoots, target, level, blocked, movableIgnored, immovableBoxes);
+                if (reachableWithBlock) continue;
+
+                Set<Position> deps = dependsOn.get(blocker);
+                if (deps != null && deps.add(target)) {
+                    added++;
+                    if (SearchConfig.isVerbose()) {
+                        System.err.println("[LevelAnalyzer] Structural dep: filling "
+                                + blocker + " disconnects " + target);
+                    }
+                }
+            }
+        }
+
+        if (added > 0 && SearchConfig.isNormal()) {
+            System.err.println("[LevelAnalyzer] Added " + added
+                    + " structural single-entry goal dependencies");
+        }
+        return added;
     }
 
     /**

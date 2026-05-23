@@ -4,6 +4,7 @@ import mapf.domain.Direction;
 import mapf.domain.Level;
 import mapf.domain.Position;
 import mapf.domain.State;
+import mapf.planning.SearchConfig;
 
 import java.util.*;
 
@@ -172,6 +173,7 @@ public class GoalTransitAnalyzer {
      * Called once at planning start — output is compact (1-3 lines per TRANSIT/CHOKEPOINT).
      */
     public static void printDiagnostic(Map<Position, GoalProfile> profiles, String levelName) {
+        if (!SearchConfig.isNormal()) return;
         if (profiles.isEmpty()) return;
 
         long transitCount    = profiles.values().stream().filter(p -> p.profile == TransitProfile.TRANSIT).count();
