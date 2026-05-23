@@ -6804,29 +6804,23 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         
-        // Strategy 3: Random reorder and retry
-        Collections.shuffle(subgoals, random);
+        // Strategy 3: Dependency-safe alternate-order retry.
+        //
+        // The old recovery path shuffled all subgoals and committed the first locally
+        // executable one. That bypassed hard dependencies and the normal acceptance
+        // checks, so it could make plausible local progress while sealing future goals.
+        // Keep diversification as a last probe, but only among dependency-eligible
+        // goals and route execution through tryExecuteSubgoals' standard validation.
+        List<Subgoal> retryable = new ArrayList<>();
         for (Subgoal sg : subgoals) {
-            List<Action> path = planSubgoal(sg, currentState, level, subgoals);
-            if (path != null && !path.isEmpty()) {
-                State tempState = currentState;
-                for (Action action : path) {
-                    Action[] jointAction = planMerger.createJointActionWithMerging(
-                        sg.agentId, action, tempState, level, numAgents, sg.isAgentGoal, completedBoxGoals);
-                    jointAction = conflictResolver.resolveConflicts(jointAction, tempState, level, sg.agentId);
-                    fullPlan.add(jointAction);
-                    tempState = applyJointAction(jointAction, tempState, level, numAgents);
-                }
-                if (verifyGoalReached(sg, tempState, level)) {
-                    if (!sg.isAgentGoal) {
-                        completedBoxGoals.add(sg.goalPos);
-                        subgoalManager.invalidateHungarianCache();
-                    }
-                    return true;
-                }
-            }
+            if (!areDependenciesMet(sg.goalPos, level)) continue;
+            retryable.add(sg);
         }
-        
+        if (retryable.size() > 1) {
+            Collections.shuffle(retryable, random);
+            return tryExecuteSubgoals(retryable, fullPlan, currentState, level, numAgents, initialState);
+        }
+
         return false;
     }
 
