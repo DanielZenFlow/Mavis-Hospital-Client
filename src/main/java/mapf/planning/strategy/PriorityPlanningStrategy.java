@@ -4666,6 +4666,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 .comparingInt((Position p) -> p.manhattanDistance(blockerPos))
                 .thenComparingInt(p -> p.row)
                 .thenComparingInt(p -> p.col);
+        if (preferDeepParking) {
+            safe.addAll(fallback);
+            safe.sort(byDistance);
+            return safe;
+        }
         safe.sort(byDistance);
         fallback.sort(byDistance);
         safe.addAll(fallback);
