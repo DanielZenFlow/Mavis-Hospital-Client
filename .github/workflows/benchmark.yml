@@ -10,6 +10,9 @@ on:
       - 'run_benchmark.py'
       - '.github/workflows/benchmark.yml'
 
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     runs-on: ubuntu-latest
