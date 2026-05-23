@@ -4634,9 +4634,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     && !state.hasBoxAt(p)
                     && !immovableBoxes.contains(p)
                     && !goalCells.contains(p)
-                    && !taskCritical.contains(p)
                     && !usedTemps.contains(p)) {
-                if (countFreeNeighborsForTaskRelief(p, state, level) <= 1) {
+                int freeNeighbors = countFreeNeighborsForTaskRelief(p, state, level);
+                boolean critical = taskCritical.contains(p);
+                boolean sourceStackParkingCell = preferDeepParking && critical && freeNeighbors <= 2;
+                if (critical && !sourceStackParkingCell) {
+                    continue;
+                }
+                if (freeNeighbors <= 1) {
                     safe.add(p);
                 } else {
                     fallback.add(p);
@@ -4656,12 +4661,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 ? staticDistancesFrom(entryPos, level)
                 : Collections.emptyMap();
         Comparator<Position> byDistance = preferDeepParking
-                ? Comparator
-                .comparingInt((Position p) -> entryDistances.getOrDefault(p, p.manhattanDistance(blockerPos)))
-                .reversed()
-                .thenComparingInt((Position p) -> p.manhattanDistance(blockerPos))
-                .thenComparingInt(p -> p.row)
-                .thenComparingInt(p -> p.col)
+                ? (a, b) -> {
+                    int classA = countFreeNeighborsForTaskRelief(a, state, level) <= 2 ? 0 : 1;
+                    int classB = countFreeNeighborsForTaskRelief(b, state, level) <= 2 ? 0 : 1;
+                    if (classA != classB) return Integer.compare(classA, classB);
+                    int distA = entryDistances.getOrDefault(a, a.manhattanDistance(blockerPos));
+                    int distB = entryDistances.getOrDefault(b, b.manhattanDistance(blockerPos));
+                    if (distA != distB) return Integer.compare(distB, distA);
+                    int nearA = a.manhattanDistance(blockerPos);
+                    int nearB = b.manhattanDistance(blockerPos);
+                    if (nearA != nearB) return Integer.compare(nearA, nearB);
+                    if (a.row != b.row) return Integer.compare(a.row, b.row);
+                    return Integer.compare(a.col, b.col);
+                }
                 : Comparator
                 .comparingInt((Position p) -> p.manhattanDistance(blockerPos))
                 .thenComparingInt(p -> p.row)
