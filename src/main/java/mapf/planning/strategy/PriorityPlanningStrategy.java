@@ -3397,7 +3397,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         blockerType = reachableType;
                     }
                 }
-                boolean sourceStackRelief = taskAgentColor != null
+                boolean sourceStackRelief = !blockedSubgoal.isAgentGoal && taskAgentColor != null
                         && sameColorAccessClusterSize(taskBlockerPos, current, level,
                         taskAgentColor, blockedSubgoal.boxType) >= 3;
                 Position sourceStackEntry = sourceStackRelief
