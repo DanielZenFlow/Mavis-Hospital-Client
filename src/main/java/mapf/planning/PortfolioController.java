@@ -5,6 +5,7 @@ import mapf.planning.analysis.LevelAnalyzer;
 import mapf.planning.analysis.LevelAnalyzer.LevelFeatures;
 import mapf.planning.analysis.LevelAnalyzer.StrategyType;
 import mapf.planning.analysis.ImmovableFusion;
+import mapf.planning.diag.PlanTrace;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
@@ -27,6 +28,7 @@ public class PortfolioController implements SearchStrategy {
     private long timeoutMs;
     private LevelFeatures features;
     private Level lastLevel;  // captured at search() entry for use by diagnostics (printAttemptSummary)
+    private PlanTrace lastPlanTrace = new PlanTrace();
     
     // Cached heuristic - expensive to compute, reuse across strategies
     private Heuristic cachedHeuristic;
@@ -49,6 +51,11 @@ public class PortfolioController implements SearchStrategy {
     public String getName() {
         return "Portfolio Controller";
     }
+
+    @Override
+    public PlanTrace getLastPlanTrace() {
+        return lastPlanTrace.copy();
+    }
     
     @Override
     public void setTimeout(long timeoutMs) {
@@ -66,6 +73,7 @@ public class PortfolioController implements SearchStrategy {
         long remainingTime = timeoutMs;
         attempts.clear();
         this.lastLevel = level;
+        this.lastPlanTrace = new PlanTrace();
 
         // Step 1: Pre-analyze level
         features = LevelAnalyzer.analyze(level, initialState);
@@ -89,7 +97,7 @@ public class PortfolioController implements SearchStrategy {
             ImmovableFusion.FusedProblem fused = ImmovableFusion.fuse(
                     level, initialState, features.taskFilter.immovableBoxes);
             if (fused.changed) {
-                if (SearchConfig.isMinimal()) {
+                if (SearchConfig.isNormal()) {
                     System.err.println("[Portfolio] Immovable-box fusion: " +
                             fused.fusedPositions.size() + " boxes → walls (of " +
                             features.taskFilter.immovableBoxes.size() + " immovable detected)");
@@ -116,6 +124,7 @@ public class PortfolioController implements SearchStrategy {
         // This is a shortcut: if all groups solve, return immediately.
         // If any group fails (partial), fall through to normal portfolio as fallback.
         List<Action[]> bestPartialPlan = null;
+        Map<List<Action[]>, PlanTrace> traceByPlan = new IdentityHashMap<>();
         
         if (initialState.getNumAgents() > 1) {
             List<List<Integer>> independentGroups = detectIndependentGroups(initialState, level);
@@ -125,7 +134,7 @@ public class PortfolioController implements SearchStrategy {
             // independent and can be solved as separate subproblems.
             List<List<Integer>> refinedGroups = refineGroupsByFootprint(
                     independentGroups, initialState, level);
-            if (refinedGroups.size() > independentGroups.size() && SearchConfig.isMinimal()) {
+            if (refinedGroups.size() > independentGroups.size() && SearchConfig.isNormal()) {
                 System.err.println("[Portfolio] Footprint refinement: "
                         + independentGroups.size() + " -> " + refinedGroups.size() + " groups");
             }
@@ -150,13 +159,13 @@ public class PortfolioController implements SearchStrategy {
                 // Empirical: ClosedAI 5→1 collapse REGRESSED (60s timeout); 5→2 BigSplit
                 // is the sweet spot. Keep merge effective when it preserves parallelism.
                 if (mergedGroups.size() < independentGroups.size() && mergedGroups.size() >= 2) {
-                    if (SearchConfig.isMinimal()) {
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] P3 cross-group dependency merge: "
                                 + independentGroups.size() + " -> " + mergedGroups.size() + " groups");
                     }
                     independentGroups = mergedGroups;
                 } else if (mergedGroups.size() == 1 && independentGroups.size() > 1
-                        && SearchConfig.isMinimal()) {
+                        && SearchConfig.isNormal()) {
                     System.err.println("[Portfolio] P3: dependency analysis suggests full coupling ("
                             + independentGroups.size() + " -> 1); keeping original "
                             + independentGroups.size() + " groups for warm-up + fallback path");
@@ -173,7 +182,7 @@ public class PortfolioController implements SearchStrategy {
                 List<List<Integer>> namoMerged = mergeGroupsByNAMOCoupling(
                         independentGroups, initialState, level);
                 if (namoMerged.size() < independentGroups.size() && namoMerged.size() >= 2) {
-                    if (SearchConfig.isMinimal()) {
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] D13 NAMO-coupling merge: "
                                 + independentGroups.size() + " -> " + namoMerged.size() + " groups");
                     }
@@ -182,7 +191,7 @@ public class PortfolioController implements SearchStrategy {
             }
 
             if (independentGroups.size() > 1) {
-                if (SearchConfig.isMinimal()) {
+                if (SearchConfig.isNormal()) {
                     System.err.println("[Portfolio] Detected " + independentGroups.size() + 
                         " independent agent groups: " + independentGroups);
                 }
@@ -190,14 +199,15 @@ public class PortfolioController implements SearchStrategy {
                 if (mergedPlan != null && !mergedPlan.isEmpty()) {
                     State finalState = replayPlan(mergedPlan, initialState, level);
                     if (finalState != null && finalState.isGoalState(level)) {
-                        if (SearchConfig.isMinimal()) {
+                        if (SearchConfig.isNormal()) {
                             System.err.println("[Portfolio] Independence detection: SOLVED (" + mergedPlan.size() + " steps)");
                         }
                         return mergedPlan;
                     }
                     // Partial — save as fallback, continue with normal portfolio
                     bestPartialPlan = mergedPlan;
-                    if (SearchConfig.isMinimal()) {
+                    traceByPlan.put(mergedPlan, lastPlanTrace.copyUpTo(mergedPlan.size()));
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] Independence detection: partial (" + mergedPlan.size() + 
                             " steps) — falling back to normal portfolio");
                     }
@@ -212,7 +222,7 @@ public class PortfolioController implements SearchStrategy {
         // Step 2: Build strategy sequence based on analysis
         List<StrategyConfig> strategies = buildStrategySequence(features, initialState);
         
-        if (SearchConfig.isMinimal()) {
+        if (SearchConfig.isNormal()) {
             System.err.println("[Portfolio] Strategy sequence: " + 
                 strategies.stream().map(s -> s.type.name() + 
                     (s.orderingMode != null ? "(" + s.orderingMode + 
@@ -266,7 +276,9 @@ public class PortfolioController implements SearchStrategy {
 
         for (StrategyConfig strategyConfig : strategies) {
             if (remainingTime <= 0) {
-                System.err.println("[Portfolio] Timeout - no more time for attempts");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] Timeout - no more time for attempts");
+                }
                 break;
             }
             // Plan-A guard: if we already saved a partial and there's not enough
@@ -274,16 +286,18 @@ public class PortfolioController implements SearchStrategy {
             // than burning the rest of the budget on a strategy that will never
             // get to return.
             if (bestPartialPlan != null && remainingTime < MIN_ATTEMPT_MS) {
-                System.err.println("[Portfolio] Remaining time " + remainingTime
-                    + "ms < " + MIN_ATTEMPT_MS + "ms — shipping best partial ("
-                    + bestPartialPlan.size() + " steps) instead of new attempt");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] Remaining time " + remainingTime
+                        + "ms < " + MIN_ATTEMPT_MS + "ms — shipping best partial ("
+                        + bestPartialPlan.size() + " steps) instead of new attempt");
+                }
                 break;
             }
             
             // Allocate time for this attempt
             long attemptTimeout = computeAttemptTimeout(strategyConfig, remainingTime, strategies.size());
             
-            if (SearchConfig.isMinimal()) {
+            if (SearchConfig.isNormal()) {
                 String modeStr = "";
                 if (strategyConfig.orderingMode != null) {
                     modeStr = "(" + strategyConfig.orderingMode;
@@ -333,6 +347,9 @@ public class PortfolioController implements SearchStrategy {
                 e.printStackTrace(System.err);
             }
             long attemptDuration = System.currentTimeMillis() - attemptStart;
+            if (result != null && !result.isEmpty()) {
+                traceByPlan.put(result, strategy.getLastPlanTrace().copyUpTo(result.size()));
+            }
 
             // P0a: log structured failure signal when present (PP nulls it on success).
             // P0b: also accumulate the failed subgoal's goal position into deprioritizedGoals
@@ -360,14 +377,14 @@ public class PortfolioController implements SearchStrategy {
                                 + (sg.isAgentGoal ? "->@" : "->" + sg.boxType + "@")
                                 + (sg.goalPos != null ? sg.goalPos.toString() : "?");
                     }
-                    if (SearchConfig.isMinimal()) {
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] FailureReport from " + strategyConfig.type
                                 + ": " + report.summary());
                     }
                     if (report.lastAttemptedSubgoal != null && report.lastAttemptedSubgoal.goalPos != null) {
                         Position failedGoal = report.lastAttemptedSubgoal.goalPos;
                         if (deprioritizedGoals.add(failedGoal)
-                                && SearchConfig.isMinimal()) {
+                                && SearchConfig.isNormal()) {
                             System.err.println("[Portfolio] P0b: deprioritize goal "
                                     + failedGoal
                                     + " for next attempt (now " + deprioritizedGoals.size() + " total)");
@@ -396,7 +413,7 @@ public class PortfolioController implements SearchStrategy {
                                     if (prioritizedGoals.add(src)) promotedThisRound++;
                                 }
                             }
-                            if (promotedThisRound > 0 && SearchConfig.isMinimal()) {
+                            if (promotedThisRound > 0 && SearchConfig.isNormal()) {
                                 System.err.println("[Portfolio] P4: promote " + promotedThisRound
                                         + " blocker goal(s) of " + failedGoal
                                         + " for next attempt (now " + prioritizedGoals.size() + " total)");
@@ -412,7 +429,7 @@ public class PortfolioController implements SearchStrategy {
                                 ? features.taskFilter.immovableBoxes : Collections.emptySet();
                         escapeSubgoals = mapf.planning.synthesis.EscapeSubgoalSynthesizer.synthesize(
                                 initialState, level, features.goalDependsOn, immovable);
-                        if (SearchConfig.isMinimal()) {
+                        if (SearchConfig.isNormal()) {
                             System.err.println("[Portfolio] P1: synthesized "
                                     + escapeSubgoals.size() + " escape subgoal(s) for cyclic level");
                         }
@@ -467,7 +484,7 @@ public class PortfolioController implements SearchStrategy {
                                 suspendedBoxGoals.clear();
                                 suspendedBoxGoals.addAll(relRes.suspendedBoxGoals);
                             }
-                            if (SearchConfig.isMinimal()) {
+                            if (SearchConfig.isNormal()) {
                                 System.err.println("[Portfolio] P5 (NAMO): synthesized "
                                         + reliefs.size() + " blocker-relief subgoal(s)"
                                         + " (F2: " + suspendedBoxGoals.size() + " suspended)");
@@ -502,24 +519,25 @@ public class PortfolioController implements SearchStrategy {
                 // Keep best partial as fallback, but only return immediately for full solutions.
                 State finalState = replayPlan(result, initialState, level);
                 if (finalState != null && finalState.isGoalState(level)) {
-                    if (SearchConfig.isMinimal()) {
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] SUCCESS with " + strategyConfig.type + 
                             " (" + result.size() + " actions, " + attemptDuration + "ms)");
                     }
+                    lastPlanTrace = traceByPlan.getOrDefault(result, new PlanTrace()).copyUpTo(result.size());
                     return result;
                 }
                 // Partial plan — save if best so far, continue trying
                 if (bestPartialPlan == null || result.size() > bestPartialPlan.size()) {
                     bestPartialPlan = result;
                     bestPartialReport = lastReportForSnapshot;
-                    if (SearchConfig.isMinimal()) {
+                    if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] Partial plan from " + strategyConfig.type + 
                             " (" + result.size() + " steps, saved as best so far)");
                     }
                 }
             }
             
-            if (SearchConfig.isMinimal()) {
+            if (SearchConfig.isNormal()) {
                 System.err.println("[Portfolio] " + strategyConfig.type + " " +
                     (result != null && !result.isEmpty() ? "partial" : "failed") + " after " + attemptDuration + "ms");
             }
@@ -556,10 +574,12 @@ public class PortfolioController implements SearchStrategy {
                 int rawInitialNogoods = cbsrNogoods.size();
                 cbsrNogoods = deduplicateNogoods(cbsrNogoods);
 
-                System.err.println("[CBSR] Starting loop: baseOrder=" + features.executionOrder.size()
-                        + " goals, initialNogoods=" + cbsrNogoods.size()
-                        + " (raw=" + rawInitialNogoods + ")"
-                        + ", budget=" + cbsrBudget + "ms");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[CBSR] Starting loop: baseOrder=" + features.executionOrder.size()
+                            + " goals, initialNogoods=" + cbsrNogoods.size()
+                            + " (raw=" + rawInitialNogoods + ")"
+                            + ", budget=" + cbsrBudget + "ms");
+                }
 
                 final int MAX_CBSR_ITER = 8;
                 // RANDOM fallback seeds used when directed ordering stabilizes
@@ -572,7 +592,9 @@ public class PortfolioController implements SearchStrategy {
                 for (int cbsrIter = 1; cbsrIter <= MAX_CBSR_ITER; cbsrIter++) {
                     long cbsrRemaining = timeoutMs - (System.currentTimeMillis() - startTime);
                     if (cbsrRemaining < 3_000) {
-                        System.err.println("[CBSR] Stopping: remaining=" + cbsrRemaining + "ms < 3s");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[CBSR] Stopping: remaining=" + cbsrRemaining + "ms < 3s");
+                        }
                         break;
                     }
 
@@ -592,8 +614,10 @@ public class PortfolioController implements SearchStrategy {
                         if (repairedOrder.equals(cbsrOrder) && cbsrIter > 1) {
                             // Ordering has converged — switch to random diversification
                             orderingStable = true;
-                            System.err.println("[CBSR] Ordering converged after " + (cbsrIter - 1)
-                                    + " directed iters — switching to random diversification");
+                            if (SearchConfig.isNormal()) {
+                                System.err.println("[CBSR] Ordering converged after " + (cbsrIter - 1)
+                                        + " directed iters — switching to random diversification");
+                            }
                         } else {
                             cbsrOrder = repairedOrder;
                         }
@@ -602,19 +626,25 @@ public class PortfolioController implements SearchStrategy {
                     if (orderingStable) {
                         // Phase 2: random-seeded fallback (the original RANDOM#42/137 role)
                         if (randomSeedIdx >= CBSR_RANDOM_SEEDS.length) {
-                            System.err.println("[CBSR] All random seeds exhausted — stopping");
+                            if (SearchConfig.isNormal()) {
+                                System.err.println("[CBSR] All random seeds exhausted — stopping");
+                            }
                             break;
                         }
                         int seed = CBSR_RANDOM_SEEDS[randomSeedIdx++];
-                        System.err.println("[CBSR] Iteration #" + cbsrIter
-                                + " [RANDOM#" + seed + "], budget=" + perIterBudget + "ms");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[CBSR] Iteration #" + cbsrIter
+                                    + " [RANDOM#" + seed + "], budget=" + perIterBudget + "ms");
+                        }
                         cbsrPP.setOrderingMode(OrderingMode.RANDOM);
                         cbsrPP.setRandomSeed(seed);
                     } else {
-                        System.err.println("[CBSR] Iteration #" + cbsrIter
-                                + ", nogoods=" + cbsrNogoods.size()
-                                + ", ordering(first5)=" + cbsrOrder.subList(0, Math.min(5, cbsrOrder.size()))
-                                + ", budget=" + perIterBudget + "ms");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[CBSR] Iteration #" + cbsrIter
+                                    + ", nogoods=" + cbsrNogoods.size()
+                                    + ", ordering(first5)=" + cbsrOrder.subList(0, Math.min(5, cbsrOrder.size()))
+                                    + ", budget=" + perIterBudget + "ms");
+                        }
                         cbsrPP.setGoalExecutionOrder(cbsrOrder);
                     }
 
@@ -631,9 +661,14 @@ public class PortfolioController implements SearchStrategy {
                     try {
                         cbsrResult = cbsrStrategy.search(initialState, level);
                     } catch (Exception e) {
-                        System.err.println("[CBSR] Iteration #" + cbsrIter + " exception: " + e.getMessage());
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[CBSR] Iteration #" + cbsrIter + " exception: " + e.getMessage());
+                        }
                     }
                     long iterDuration = System.currentTimeMillis() - iterStart;
+                    if (cbsrResult != null && !cbsrResult.isEmpty()) {
+                        traceByPlan.put(cbsrResult, cbsrStrategy.getLastPlanTrace().copyUpTo(cbsrResult.size()));
+                    }
 
                     // Extract failure report from this CBSR iteration
                     mapf.planning.signal.FailureReport cbsrReport = cbsrPP.getLastFailureReport();
@@ -667,9 +702,12 @@ public class PortfolioController implements SearchStrategy {
                             0, suspendedBoxGoals.size()));
 
                     if (cbsrFull) {
-                        System.err.println("[CBSR] Total iterations=" + cbsrIter
-                                + ", totalNogoods=" + cbsrNogoods.size() + ", result=SUCCESS");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[CBSR] Total iterations=" + cbsrIter
+                                    + ", totalNogoods=" + cbsrNogoods.size() + ", result=SUCCESS");
+                        }
                         printAttemptSummary();
+                        lastPlanTrace = traceByPlan.getOrDefault(cbsrResult, new PlanTrace()).copyUpTo(cbsrResult.size());
                         return cbsrResult;
                     }
 
@@ -712,20 +750,26 @@ public class PortfolioController implements SearchStrategy {
                             cbsrNogoods.addAll(newNogoods);
                             cbsrNogoods = deduplicateNogoods(cbsrNogoods);
                             if (cbsrNogoods.size() == beforeNogoods) {
-                                System.err.println("[CBSR] Iteration #" + cbsrIter
-                                        + " learned only duplicate/merged nogoods");
+                                if (SearchConfig.isNormal()) {
+                                    System.err.println("[CBSR] Iteration #" + cbsrIter
+                                            + " learned only duplicate/merged nogoods");
+                                }
                             }
                         }
                     }
 
-                    System.err.println("[CBSR] Iteration #" + cbsrIter + " "
-                            + (cbsrResult != null && !cbsrResult.isEmpty() ? "partial(" + (cbsrResult != null ? cbsrResult.size() : 0) + ")" : "failed")
-                            + " (" + iterDuration + "ms), nogoods=" + cbsrNogoods.size());
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[CBSR] Iteration #" + cbsrIter + " "
+                                + (cbsrResult != null && !cbsrResult.isEmpty() ? "partial(" + (cbsrResult != null ? cbsrResult.size() : 0) + ")" : "failed")
+                                + " (" + iterDuration + "ms), nogoods=" + cbsrNogoods.size());
+                    }
                 } // end CBSR iteration loop
 
                 finalCbsrOrder = new ArrayList<>(cbsrOrder); // save for residual-order repair
-                System.err.println("[CBSR] Loop done, nogoods=" + cbsrNogoods.size()
-                        + ", result=TIMEOUT/UNSAT");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[CBSR] Loop done, nogoods=" + cbsrNogoods.size()
+                            + ", result=TIMEOUT/UNSAT");
+                }
             } // end if cbsrApplicable
         } // end CBSR block
         // ===== END CBSR =====
@@ -760,9 +804,11 @@ public class PortfolioController implements SearchStrategy {
                     if (!unsatFirst.isEmpty()) {
                         List<Position> residualRepairOrder = new ArrayList<>(unsatFirst);
                         residualRepairOrder.addAll(satLast);
-                        System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                + ": unsatisfied-first ordering ("
-                                + unsatFirst.size() + " unsat, " + satLast.size() + " sat)");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                    + ": unsatisfied-first ordering ("
+                                    + unsatFirst.size() + " unsat, " + satLast.size() + " sat)");
+                        }
 
                         // Try TOPOLOGICAL with this ordering from initialState (fresh start)
                         for (int residualRepairSeed : new int[]{0, 9001}) { // 0 = no-random (topological), 9001 = random seed
@@ -789,8 +835,10 @@ public class PortfolioController implements SearchStrategy {
                             try {
                                 residualRepairResult = residualRepairStrategy.search(initialState, level);
                             } catch (Exception e) {
-                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                        + " exception: " + e.getMessage());
+                                if (SearchConfig.isNormal()) {
+                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                            + " exception: " + e.getMessage());
+                                }
                             }
                             long residualRepairAttemptMs = System.currentTimeMillis() - residualRepairAttemptStart;
                             mapf.planning.signal.FailureReport residualRepairReport =
@@ -799,11 +847,15 @@ public class PortfolioController implements SearchStrategy {
                                             : null;
                             boolean residualRepairFull = false;
                             if (residualRepairResult != null && !residualRepairResult.isEmpty()) {
+                                traceByPlan.put(residualRepairResult,
+                                        residualRepairStrategy.getLastPlanTrace().copyUpTo(residualRepairResult.size()));
                                 State residualRepairFinal = replayPlan(residualRepairResult, initialState, level);
                                 residualRepairFull = residualRepairFinal != null && residualRepairFinal.isGoalState(level);
                                 if (residualRepairFull) {
-                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                            + " SOLVED level (" + residualRepairResult.size() + " actions)");
+                                    if (SearchConfig.isNormal()) {
+                                        System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                                + " SOLVED level (" + residualRepairResult.size() + " actions)");
+                                    }
                                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER,
                                             residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
                                             residualRepairSeed,
@@ -811,24 +863,32 @@ public class PortfolioController implements SearchStrategy {
                                             residualRepairAttemptMs, true, residualRepairResult.size(), 0,
                                             null, "SUCCESS", 0, suspendedBoxGoals.size()));
                                     printAttemptSummary();
+                                    lastPlanTrace = traceByPlan.getOrDefault(residualRepairResult, new PlanTrace())
+                                            .copyUpTo(residualRepairResult.size());
                                     return residualRepairResult;
                                 }
                                 int residualRepairGoals = countSatisfiedGoals(residualRepairFinal, level);
                                 int bestCurrent = countSatisfiedGoals(replayPlan(bestPartialPlan, initialState, level), level);
-                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                        + " goals=" + residualRepairGoals
-                                        + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
-                                                + level.getAgentGoalPositionMap().size())
-                                        + " steps=" + residualRepairResult.size() + " (current best=" + bestCurrent + ")");
+                                if (SearchConfig.isNormal()) {
+                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                            + " goals=" + residualRepairGoals
+                                            + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
+                                                    + level.getAgentGoalPositionMap().size())
+                                            + " steps=" + residualRepairResult.size() + " (current best=" + bestCurrent + ")");
+                                }
                                 if (residualRepairGoals > bestCurrent
                                         || (residualRepairGoals == bestCurrent && residualRepairResult.size() < bestPartialPlan.size())) {
                                     bestPartialPlan = residualRepairResult;
-                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                            + " improved best to " + residualRepairGoals + " goals");
+                                    if (SearchConfig.isNormal()) {
+                                        System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                                + " improved best to " + residualRepairGoals + " goals");
+                                    }
                                 }
                             } else {
-                                System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
-                                        + " no result (seed=" + residualRepairSeed + ")");
+                                if (SearchConfig.isNormal()) {
+                                    System.err.println("[Portfolio] " + PHASE_RESIDUAL_ORDER_REPAIR
+                                            + " no result (seed=" + residualRepairSeed + ")");
+                                }
                             }
                             attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER,
                                     residualRepairSeed == 0 ? OrderingMode.TOPOLOGICAL : OrderingMode.RANDOM,
@@ -882,9 +942,11 @@ public class PortfolioController implements SearchStrategy {
                 long perWarmBudget = Math.min(remainingForWarm - 1000, 30_000L);
 
                 if (SearchConfig.isVerbose()) {
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter + " from "
-                            + bestPartialPlan.size() + "-step plan, seed=" + seed
-                            + " budget=" + perWarmBudget + "ms (remaining=" + remainingForWarm + "ms)");
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter + " from "
+                                + bestPartialPlan.size() + "-step plan, seed=" + seed
+                                + " budget=" + perWarmBudget + "ms (remaining=" + remainingForWarm + "ms)");
+                    }
                 }
 
                 StrategyConfig warmCfg = new StrategyConfig(
@@ -905,8 +967,10 @@ public class PortfolioController implements SearchStrategy {
                 try {
                     tail = warmStrategy.search(replayed, level);
                 } catch (Exception e) {
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                            + " exception: " + e.getMessage());
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                + " exception: " + e.getMessage());
+                    }
                 }
                 long warmMs = System.currentTimeMillis() - warmStartMs;
                 mapf.planning.signal.FailureReport warmReport =
@@ -918,16 +982,24 @@ public class PortfolioController implements SearchStrategy {
                     List<Action[]> combined = new ArrayList<>(bestPartialPlan.size() + tail.size());
                     combined.addAll(bestPartialPlan);
                     combined.addAll(tail);
+                    PlanTrace combinedTrace = PlanTrace.concat(
+                            traceByPlan.get(bestPartialPlan),
+                            warmStrategy.getLastPlanTrace().copyUpTo(tail.size()),
+                            bestPartialPlan.size());
+                    traceByPlan.put(combined, combinedTrace.copyUpTo(combined.size()));
                     State combinedFinal = replayPlan(combined, initialState, level);
                     if (combinedFinal != null && combinedFinal.isGoalState(level)) {
-                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                + " SOLVED level ("
-                                + combined.size() + " actions)");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                    + " SOLVED level ("
+                                    + combined.size() + " actions)");
+                        }
                         attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                                 seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
                                 warmMs, true, tail.size(), 0, null, "SUCCESS",
                                 0, suspendedBoxGoals.size()));
                         printAttemptSummary();
+                        lastPlanTrace = traceByPlan.getOrDefault(combined, new PlanTrace()).copyUpTo(combined.size());
                         return combined;
                     }
                     // Compare by goal count (primary), then by plan length (secondary, less is better)
@@ -937,11 +1009,13 @@ public class PortfolioController implements SearchStrategy {
                             && combined.size() < bestPartialPlan.size();
 
                     if (SearchConfig.isVerbose()) {
-                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                + " goals=" + combinedGoalCount
-                                + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
-                                         + level.getAgentGoalPositionMap().size())
-                                + " steps=" + combined.size());
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                    + " goals=" + combinedGoalCount
+                                    + "/" + (level.getBoxGoalsByType().values().stream().mapToInt(java.util.List::size).sum()
+                                             + level.getAgentGoalPositionMap().size())
+                                    + " steps=" + combined.size());
+                        }
                     }
 
                     if (goalImproved || lengthImproved) {
@@ -954,17 +1028,21 @@ public class PortfolioController implements SearchStrategy {
                                     ((PriorityPlanningStrategy) warmStrategy).getLastFailureReport();
                             if (wr != null) bestPartialReport = wr;
                         }
-                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                + " improved: goals "
-                                + prevGoalCount + " -> " + combinedGoalCount
-                                + ", steps=" + combined.size());
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                    + " improved: goals "
+                                    + prevGoalCount + " -> " + combinedGoalCount
+                                    + ", steps=" + combined.size());
+                        }
                         continuationConsecutiveNoImprovement = 0;
                     } else {
                         continuationConsecutiveNoImprovement++;
                         if (SearchConfig.isVerbose()) {
-                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                    + " no improvement (consec="
-                                    + continuationConsecutiveNoImprovement + ")");
+                            if (SearchConfig.isNormal()) {
+                                System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                        + " no improvement (consec="
+                                        + continuationConsecutiveNoImprovement + ")");
+                            }
                         }
                     }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
@@ -975,9 +1053,11 @@ public class PortfolioController implements SearchStrategy {
                 } else {
                     continuationConsecutiveNoImprovement++;
                     if (SearchConfig.isVerbose()) {
-                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
-                                + " no result (consec="
-                                + continuationConsecutiveNoImprovement + ")");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION + "." + continuationIter
+                                    + " no result (consec="
+                                    + continuationConsecutiveNoImprovement + ")");
+                        }
                     }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                             seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
@@ -988,8 +1068,10 @@ public class PortfolioController implements SearchStrategy {
 
                 // Stop if 3+ consecutive non-improvements (budget conservation)
                 if (continuationConsecutiveNoImprovement >= 3) {
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
-                            + " stopping: 3 consecutive non-improvements");
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
+                                + " stopping: 3 consecutive non-improvements");
+                    }
                     break;
                 }
             } // end partial-plan continuation loop
@@ -1000,9 +1082,11 @@ public class PortfolioController implements SearchStrategy {
                 int byGoals = countSatisfiedGoals(replayPlan(bestByGoalsPlan, initialState, level), level);
                 if (byGoals > curGoals) {
                     bestPartialPlan = bestByGoalsPlan;
-                    System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
-                            + " final: restored best-by-goals plan ("
-                            + byGoals + " vs " + curGoals + ")");
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_PARTIAL_PLAN_CONTINUATION
+                                + " final: restored best-by-goals plan ("
+                                + byGoals + " vs " + curGoals + ")");
+                    }
                 }
             }
         }
@@ -1018,9 +1102,11 @@ public class PortfolioController implements SearchStrategy {
             int cbsrBaseCurrentBest = countSatisfiedGoals(replayPlan(bestPartialPlan, initialState, level), level);
             final int[] cbsrBaseSeeds = {42, 137, 9999, 12345, 7777, 55555};
             int cbsrBaseIter = 0;
-            System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + ": trying "
-                    + cbsrBaseSeeds.length + " seeds from CBSR base ("
-                    + originalCbsrBestPlan.size() + " steps, " + cbsrBaseGoals + " goals), current best=" + cbsrBaseCurrentBest);
+            if (SearchConfig.isNormal()) {
+                System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + ": trying "
+                        + cbsrBaseSeeds.length + " seeds from CBSR base ("
+                        + originalCbsrBestPlan.size() + " steps, " + cbsrBaseGoals + " goals), current best=" + cbsrBaseCurrentBest);
+            }
             for (int cbsrBaseSeed : cbsrBaseSeeds) {
                 long cbsrBaseElapsed = System.currentTimeMillis() - startTime;
                 long cbsrBaseRemaining = timeoutMs - cbsrBaseElapsed;
@@ -1030,9 +1116,11 @@ public class PortfolioController implements SearchStrategy {
 
                 cbsrBaseIter++;
                 long cbsrBaseBudget = Math.min(cbsrBaseRemaining - 1000, 30_000L);
-                System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
-                        + " from CBSR base, seed=" + cbsrBaseSeed
-                        + " budget=" + cbsrBaseBudget + "ms");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                            + " from CBSR base, seed=" + cbsrBaseSeed
+                            + " budget=" + cbsrBaseBudget + "ms");
+                }
 
                 StrategyConfig cbsrBaseCfg = new StrategyConfig(
                         StrategyType.STRICT_ORDER, 1.0,
@@ -1051,8 +1139,10 @@ public class PortfolioController implements SearchStrategy {
                 try {
                     cbsrBaseTail = cbsrBaseStrategy.search(cbsrFinal, level);
                 } catch (Exception e) {
-                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
-                            + " exception: " + e.getMessage());
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                + " exception: " + e.getMessage());
+                    }
                 }
                 long cbsrBaseMs = System.currentTimeMillis() - cbsrBaseStartMs;
                 mapf.planning.signal.FailureReport cbsrBaseReport =
@@ -1064,28 +1154,40 @@ public class PortfolioController implements SearchStrategy {
                     List<Action[]> cbsrBaseCombined = new ArrayList<>(originalCbsrBestPlan.size() + cbsrBaseTail.size());
                     cbsrBaseCombined.addAll(originalCbsrBestPlan);
                     cbsrBaseCombined.addAll(cbsrBaseTail);
+                    PlanTrace cbsrBaseTrace = PlanTrace.concat(
+                            traceByPlan.get(originalCbsrBestPlan),
+                            cbsrBaseStrategy.getLastPlanTrace().copyUpTo(cbsrBaseTail.size()),
+                            originalCbsrBestPlan.size());
+                    traceByPlan.put(cbsrBaseCombined, cbsrBaseTrace.copyUpTo(cbsrBaseCombined.size()));
                     State cbsrBaseFinal = replayPlan(cbsrBaseCombined, initialState, level);
                     if (cbsrBaseFinal != null && cbsrBaseFinal.isGoalState(level)) {
-                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
-                                + " SOLVED level ("
-                                + cbsrBaseCombined.size() + " actions)");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                    + " SOLVED level ("
+                                    + cbsrBaseCombined.size() + " actions)");
+                        }
                         attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                                 cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
                                 cbsrBaseMs, true, cbsrBaseTail.size(), 0, null, "SUCCESS",
                                 0, suspendedBoxGoals.size()));
                         printAttemptSummary();
+                        lastPlanTrace = traceByPlan.getOrDefault(cbsrBaseCombined, new PlanTrace()).copyUpTo(cbsrBaseCombined.size());
                         return cbsrBaseCombined;
                     }
                     int cbsrBaseGoalsAfterTail = countSatisfiedGoals(cbsrBaseFinal, level);
-                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
-                            + " goals=" + cbsrBaseGoalsAfterTail
-                            + " steps=" + cbsrBaseCombined.size());
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                + " goals=" + cbsrBaseGoalsAfterTail
+                                + " steps=" + cbsrBaseCombined.size());
+                    }
                     if (cbsrBaseGoalsAfterTail > cbsrBaseCurrentBest
                             || (cbsrBaseGoalsAfterTail == cbsrBaseCurrentBest && cbsrBaseCombined.size() < bestPartialPlan.size())) {
                         bestPartialPlan = cbsrBaseCombined;
                         cbsrBaseCurrentBest = cbsrBaseGoalsAfterTail;
-                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
-                                + " improved best to " + cbsrBaseGoalsAfterTail + " goals");
+                        if (SearchConfig.isNormal()) {
+                            System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter
+                                    + " improved best to " + cbsrBaseGoalsAfterTail + " goals");
+                        }
                     }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                             cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
@@ -1093,7 +1195,9 @@ public class PortfolioController implements SearchStrategy {
                             unsatCountOf(cbsrBaseReport), failedSubgoalOf(cbsrBaseReport),
                             failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size()));
                 } else {
-                    System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter + " no result");
+                    if (SearchConfig.isNormal()) {
+                        System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter + " no result");
+                    }
                     attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                             cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
                             cbsrBaseMs, false, 0,
@@ -1107,7 +1211,7 @@ public class PortfolioController implements SearchStrategy {
             // Count satisfied goals in the final partial plan state
             State finalPartial = replayPlan(bestPartialPlan, initialState, level);
             int satisfiedGoals = 0, totalGoals = 0;
-            if (finalPartial != null) {
+            if (SearchConfig.isNormal() && finalPartial != null) {
                 for (int row = 0; row < level.getRows(); row++) {
                     for (int col = 0; col < level.getCols(); col++) {
                         char goalType = level.getBoxGoal(row, col);
@@ -1124,10 +1228,12 @@ public class PortfolioController implements SearchStrategy {
                     }
                 }
             }
-            System.err.println("[Portfolio] No full solution found. Returning best partial plan ("
-                + bestPartialPlan.size() + " steps, " + satisfiedGoals + "/" + totalGoals + " goals satisfied)");
+            if (SearchConfig.isNormal()) {
+                System.err.println("[Portfolio] No full solution found. Returning best partial plan ("
+                    + bestPartialPlan.size() + " steps, " + satisfiedGoals + "/" + totalGoals + " goals satisfied)");
+            }
             // Diagnostic: show which goals are NOT satisfied
-            if (finalPartial != null) {
+            if (SearchConfig.isNormal() && finalPartial != null) {
                 StringBuilder unsatGoals = new StringBuilder("[Portfolio] Unsatisfied goals:");
                 for (int row = 0; row < level.getRows(); row++) {
                     for (int col = 0; col < level.getCols(); col++) {
@@ -1151,12 +1257,17 @@ public class PortfolioController implements SearchStrategy {
             }
             printAttemptSummary();
             writeFailureSnapshot(level, initialState, bestPartialPlan, lastPP, lastReportForSnapshot, bestPartialReport);
+            lastPlanTrace = traceByPlan.getOrDefault(bestPartialPlan, new PlanTrace())
+                    .copyUpTo(bestPartialPlan.size());
             return bestPartialPlan;
         }
         
-        System.err.println("[Portfolio] All strategies failed");
+        if (SearchConfig.isNormal()) {
+            System.err.println("[Portfolio] All strategies failed");
+        }
         printAttemptSummary();
         writeFailureSnapshot(level, initialState, null, lastPP, lastReportForSnapshot, null);
+        lastPlanTrace = new PlanTrace();
         return null;
     }
     
@@ -1230,8 +1341,10 @@ public class PortfolioController implements SearchStrategy {
                 // Many box goals: SingleAgentStrategy's full-state closed list causes 
                 // state explosion (e.g., pacMAn with 45+ same-type boxes).
                 // Use PriorityPlanningStrategy which decomposes into one-box-at-a-time subgoals.
-                System.err.println("[Portfolio] Single agent with " + activeBoxGoals + 
-                    " active goals → using PP decomposition instead of full-state A*");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] Single agent with " + activeBoxGoals + 
+                        " active goals → using PP decomposition instead of full-state A*");
+                }
                 // Warm-start orderings only; CBSR handles the remaining budget with nogood-guided repair.
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.40));
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.35));
@@ -1246,8 +1359,10 @@ public class PortfolioController implements SearchStrategy {
                 // Spiral/maze topology (high corridor ratio): outer goals must be filled
                 // before inner goals block narrow corridors with cross-color boxes.
                 // DISTANCE_FARTHEST is the primary strategy.
-                System.err.println("[Portfolio] Cyclic + spiral topology (corridorRatio=" + 
-                    String.format("%.2f", f.corridorRatio) + ") → FARTHEST-first");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] Cyclic + spiral topology (corridorRatio=" + 
+                        String.format("%.2f", f.corridorRatio) + ") → FARTHEST-first");
+                }
                 // Warm-start orderings only; CBSR handles the remaining budget with nogood-guided repair.
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_FARTHEST, 0, 0.40));
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.30));
@@ -1255,8 +1370,10 @@ public class PortfolioController implements SearchStrategy {
                 // Open-room cyclic topology (low corridor ratio): TOPO uses partial
                 // ordering from dependency analysis (valuable even with cycles).
                 // GREEDY nearest-first is a good fallback for coordination-heavy levels.
-                System.err.println("[Portfolio] Cyclic + open topology (corridorRatio=" + 
-                    String.format("%.2f", f.corridorRatio) + ") → TOPO-first");
+                if (SearchConfig.isNormal()) {
+                    System.err.println("[Portfolio] Cyclic + open topology (corridorRatio=" + 
+                        String.format("%.2f", f.corridorRatio) + ") → TOPO-first");
+                }
                 // Warm-start orderings only; CBSR handles the remaining budget with nogood-guided repair.
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.TOPOLOGICAL, 0, 0.35));
                 strategies.add(new StrategyConfig(StrategyType.STRICT_ORDER, 1.0, OrderingMode.DISTANCE_GREEDY, 0, 0.35));
@@ -1344,14 +1461,19 @@ public class PortfolioController implements SearchStrategy {
     }
     
     /**
-     * Write a structured failure snapshot to {@code target/diagnostics/}. Best-effort:
-     * never throws. See {@link mapf.planning.diag.FailureSnapshot}.
+     * Write a structured failure snapshot to {@code target/diagnostics/}. Disabled by
+     * default because the replay JSON is now the primary diagnostic artifact.
+     * Set {@code MAVIS_FAILURE_SNAPSHOT=1} to opt in. Best-effort: never throws.
+     * See {@link mapf.planning.diag.FailureSnapshot}.
      */
     private void writeFailureSnapshot(Level level, State initialState,
                                       List<Action[]> bestPartialPlan,
                                       PriorityPlanningStrategy lastPP,
                                       mapf.planning.signal.FailureReport lastReport,
                                       mapf.planning.signal.FailureReport bestPartialReport) {
+        if (!isFailureSnapshotEnabled()) {
+            return;
+        }
         try {
             State partialFinal = (bestPartialPlan != null && !bestPartialPlan.isEmpty())
                     ? replayPlan(bestPartialPlan, initialState, level)
@@ -1379,6 +1501,15 @@ public class PortfolioController implements SearchStrategy {
         } catch (Throwable t) {
             System.err.println("[SNAPSHOT] failed: " + t);
         }
+    }
+
+    private boolean isFailureSnapshotEnabled() {
+        String value = System.getenv("MAVIS_FAILURE_SNAPSHOT");
+        return value != null && (
+                "1".equals(value.trim())
+                        || "true".equalsIgnoreCase(value.trim())
+                        || "yes".equalsIgnoreCase(value.trim())
+                        || "on".equalsIgnoreCase(value.trim()));
     }
 
     private void applyContinuationReliefs(PriorityPlanningStrategy pp,
@@ -1420,7 +1551,7 @@ public class PortfolioController implements SearchStrategy {
     }
 
     private void printAttemptSummary() {
-        if (!SearchConfig.isMinimal()) return;
+        if (!SearchConfig.isNormal()) return;
         if (attempts.isEmpty()) {
             System.err.println("\n=== Portfolio Attempt Summary === (no attempts)");
             return;
@@ -2110,13 +2241,14 @@ public class PortfolioController implements SearchStrategy {
             State projState = projectState(originalIds, initialState, reachableArea);
             Level projLevel = projectLevel(originalIds, newIdMap, level, reachableArea);
             
-            if (SearchConfig.isMinimal()) {
+            if (SearchConfig.isNormal()) {
                 System.err.println("[Portfolio] Solving group " + group + " (" + group.size() + 
                     " agents, timeout=" + groupTimeout + "ms)");
             }
             
             // Solve this group independently
-            List<Action[]> groupPlan = solveGroup(projState, projLevel, groupTimeout);
+            GroupPlanResult groupResult = solveGroup(projState, projLevel, groupTimeout);
+            List<Action[]> groupPlan = groupResult.plan;
             
             // Check if group subproblem was fully solved
             boolean groupSolved = false;
@@ -2124,15 +2256,19 @@ public class PortfolioController implements SearchStrategy {
                 State finalState = replayPlan(groupPlan, projState, projLevel);
                 groupSolved = finalState != null && finalState.isGoalState(projLevel);
             }
-            results.add(new GroupResult(originalIds, groupPlan));
+            results.add(new GroupResult(originalIds, groupPlan, groupResult.trace));
             
-            if (SearchConfig.isMinimal()) {
+            if (SearchConfig.isNormal()) {
                 System.err.println("[Portfolio] Group " + group + ": " + 
                     (groupPlan != null ? groupPlan.size() + " steps" + (groupSolved ? " SOLVED" : " PARTIAL") : "FAILED"));
             }
         }
         
-        return mergeGroupPlans(results, numAgents);
+        List<Action[]> merged = mergeGroupPlans(results, numAgents);
+        if (merged != null && !merged.isEmpty()) {
+            lastPlanTrace = mergeGroupTraces(results).copyUpTo(merged.size());
+        }
+        return merged;
     }
     
     /**
@@ -2231,7 +2367,7 @@ public class PortfolioController implements SearchStrategy {
     /**
      * Runs the full strategy sequence for a projected group subproblem.
      */
-    private List<Action[]> solveGroup(State projState, Level projLevel, long timeout) {
+    private GroupPlanResult solveGroup(State projState, Level projLevel, long timeout) {
         LevelFeatures groupFeatures = LevelAnalyzer.analyze(projLevel, projState);
         List<StrategyConfig> strategies = buildStrategySequence(groupFeatures, projState);
         
@@ -2242,7 +2378,7 @@ public class PortfolioController implements SearchStrategy {
             heuristic = new ManhattanHeuristic();
         }
         
-        if (SearchConfig.isMinimal()) {
+        if (SearchConfig.isNormal()) {
             System.err.println("  Strategy sequence: " + 
                 strategies.stream().map(s -> s.type.name() + 
                     (s.orderingMode != null ? "(" + s.orderingMode + 
@@ -2252,6 +2388,7 @@ public class PortfolioController implements SearchStrategy {
         long groupStart = System.currentTimeMillis();
         long remaining = timeout;
         List<Action[]> bestPartial = null;
+        PlanTrace bestPartialTrace = new PlanTrace();
         
         mapf.planning.strategy.SubgoalManager groupSubgoalManager = 
             new mapf.planning.strategy.SubgoalManager(heuristic);
@@ -2290,17 +2427,18 @@ public class PortfolioController implements SearchStrategy {
             if (result != null && !result.isEmpty()) {
                 State finalState = replayPlan(result, projState, projLevel);
                 if (finalState != null && finalState.isGoalState(projLevel)) {
-                    return result;
+                    return new GroupPlanResult(result, strategy.getLastPlanTrace().copyUpTo(result.size()));
                 }
                 if (bestPartial == null || result.size() > bestPartial.size()) {
                     bestPartial = result;
+                    bestPartialTrace = strategy.getLastPlanTrace().copyUpTo(result.size());
                 }
             }
             
             remaining = timeout - (System.currentTimeMillis() - groupStart);
         }
         
-        return bestPartial;
+        return new GroupPlanResult(bestPartial, bestPartialTrace);
     }
     
     /**
@@ -2334,13 +2472,36 @@ public class PortfolioController implements SearchStrategy {
         }
         return merged;
     }
+
+    private PlanTrace mergeGroupTraces(List<GroupResult> results) {
+        List<PlanTrace> traces = new ArrayList<>();
+        for (GroupResult gr : results) {
+            if (gr.trace != null) {
+                traces.add(gr.trace.remapAgents(gr.originalIds));
+            }
+        }
+        return PlanTrace.mergeParallel(traces);
+    }
+
+    private static class GroupPlanResult {
+        final List<Action[]> plan;
+        final PlanTrace trace;
+
+        GroupPlanResult(List<Action[]> plan, PlanTrace trace) {
+            this.plan = plan;
+            this.trace = trace == null ? new PlanTrace() : trace;
+        }
+    }
     
     private static class GroupResult {
         final int[] originalIds;
         final List<Action[]> plan;
-        GroupResult(int[] originalIds, List<Action[]> plan) {
+        final PlanTrace trace;
+
+        GroupResult(int[] originalIds, List<Action[]> plan, PlanTrace trace) {
             this.originalIds = originalIds;
             this.plan = plan;
+            this.trace = trace == null ? new PlanTrace() : trace;
         }
     }
     
@@ -2369,8 +2530,10 @@ public class PortfolioController implements SearchStrategy {
         PriorityPlanningStrategy.Subgoal failed = report.lastAttemptedSubgoal;
         if (failed.goalPos == null) return Collections.emptyList();
         if (failed.isSyntheticRelief()) {
-            System.err.println("[CBSR] Skip nogood from synthetic relief failure: "
-                    + failed.boxType + "@" + failed.goalPos);
+            if (SearchConfig.isNormal()) {
+                System.err.println("[CBSR] Skip nogood from synthetic relief failure: "
+                        + failed.boxType + "@" + failed.goalPos);
+            }
             return Collections.emptyList();
         }
         Set<Position> executionOrderSet = executionOrder == null
@@ -2436,9 +2599,11 @@ public class PortfolioController implements SearchStrategy {
         if (required.isEmpty()) return Collections.emptyList();
 
         OrderingNogood nogood = new OrderingNogood(required, failed.goalPos);
-        System.err.println("[CBSR] Learned nogood: " + nogood
-                + " reason=" + report.kind
-                + " cause=" + report.cause);
+        if (SearchConfig.isNormal()) {
+            System.err.println("[CBSR] Learned nogood: " + nogood
+                    + " reason=" + report.kind
+                    + " cause=" + report.cause);
+        }
         return Collections.singletonList(nogood);
     }
 

@@ -146,7 +146,7 @@ public class LevelAnalyzer {
         // P3: Agent-to-Agent path conflict static prediction
         PathConflictAnalysis pathConflicts = computePathConflictAnalysis(
                 activeGoals, level, state, taskFilter.immovableBoxes);
-        if (pathConflicts.analyzedPaths > 0) {
+        if (SearchConfig.isNormal() && pathConflicts.analyzedPaths > 0) {
             int totalOverlaps = pathConflicts.conflictScores.values().stream()
                     .mapToInt(Integer::intValue).sum() / 2;
             System.err.println("[LevelAnalyzer] P3 Path conflict analysis: " + totalOverlaps
@@ -230,6 +230,7 @@ public class LevelAnalyzer {
         // Find root position representing "Main Open Space" (agent accessible area)
         Position root = findOpenSpaceRoot(level, goals, immovableBoxes);
         if (root == null) {
+            if (!SearchConfig.isNormal()) return dependsOn;
             System.err.println("[LevelAnalyzer] Warning: No open space root found");
             return dependsOn;
         }
@@ -344,7 +345,9 @@ public class LevelAnalyzer {
                 }
             }
         }
-        System.err.println("[LevelAnalyzer] Found " + dependencyCount + " Hard Goal-to-Goal dependencies");
+        if (SearchConfig.isNormal()) {
+            System.err.println("[LevelAnalyzer] Found " + dependencyCount + " Hard Goal-to-Goal dependencies");
+        }
 
         int structuralDepCount = addStructuralGoalDominanceDependencies(
                 dependsOn, goals, level, state, immovableBoxes);

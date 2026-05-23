@@ -2,6 +2,7 @@ package mapf.client;
 
 import mapf.domain.*;
 import mapf.planning.*;
+import mapf.planning.diag.PlanTrace;
 import mapf.planning.diag.ReplayRecorder;
 import mapf.planning.heuristic.Heuristic;
 import mapf.planning.heuristic.ManhattanHeuristic;
@@ -47,6 +48,9 @@ public class Client {
 
     /** Search configuration */
     private final SearchConfig config;
+
+    /** Intent diagnostics for the last plan returned by the portfolio. */
+    private PlanTrace lastPlanTrace = new PlanTrace();
 
     /**
      * Creates a new Client with standard I/O streams.
@@ -110,7 +114,9 @@ public class Client {
         // Step 2: Read and parse level
         parseLevel();
 
-        debugOut.println("Level: " + level.getName() + " | " + level.getRows() + "x" + level.getCols() + " | " + level.getNumAgents() + " agents");
+        if (SearchConfig.isMinimal()) {
+            debugOut.println("Level: " + level.getName() + " | " + level.getRows() + "x" + level.getCols() + " | " + level.getNumAgents() + " agents");
+        }
 
         // Step 3: Plan and execute
         planAndExecute();
@@ -119,8 +125,10 @@ public class Client {
             debugOut.println("Goal reached!");
         } else {
             debugOut.println("Partial plan executed - goal NOT reached. Check agent/box positions for debugging.");
-            debugOut.println("Final state:");
-            debugOut.println(currentState.toGridString(level));
+            if (SearchConfig.isNormal()) {
+                debugOut.println("Final state:");
+                debugOut.println(currentState.toGridString(level));
+            }
         }
     }
 
@@ -156,6 +164,7 @@ public class Client {
 
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
+        replayRecorder.setPlanTrace(lastPlanTrace);
 
         if (plan == null || plan.isEmpty()) {
             debugOut.println("ERROR: No plan found with any strategy!");
@@ -170,7 +179,9 @@ public class Client {
                     " > " + SearchConfig.MAX_ACTIONS + ")");
         }
 
-        debugOut.println("Plan found with " + plan.size() + " steps");
+        if (SearchConfig.isMinimal()) {
+            debugOut.println("Plan found with " + plan.size() + " steps");
+        }
 
         // Execute the plan step by step
         int step = 0;
@@ -178,7 +189,9 @@ public class Client {
 
         for (Action[] actions : plan) {
             if (currentState.isGoalState(level)) {
-                debugOut.println("Goal reached early at step " + step);
+                if (SearchConfig.isNormal()) {
+                    debugOut.println("Goal reached early at step " + step);
+                }
                 break;
             }
 
@@ -211,6 +224,9 @@ public class Client {
         java.nio.file.Path file = replayRecorder.writeDefault();
         if (file != null) {
             debugOut.println("[REPLAY] wrote " + file);
+            for (java.nio.file.Path diagnostic : replayRecorder.getLastDiagnosticFiles()) {
+                debugOut.println("[REPLAY] diagnostic " + diagnostic);
+            }
             debugOut.println("[REPLAY] viewer target\\diagnostics\\replay-viewer\\index.html");
         }
     }
@@ -219,7 +235,9 @@ public class Client {
      * Searches for a plan using PortfolioController (which handles multi-strategy fallback internally).
      */
     private List<Action[]> searchWithFallback() {
-        debugOut.println("[Client] Using Portfolio Controller");
+        if (SearchConfig.isNormal()) {
+            debugOut.println("[Client] Using Portfolio Controller");
+        }
         PortfolioController portfolio = new PortfolioController(config);
         // Resolve effective wall-clock budget. Server -t is server-side and not
         // exposed via protocol, so allow override via env var MAVIS_TIMEOUT_MS
@@ -237,8 +255,12 @@ public class Client {
         }
         long planningTimeout = Math.max(effectiveServerTimeoutMs - 10_000, effectiveServerTimeoutMs / 2);
         portfolio.setTimeout(planningTimeout);
-        debugOut.println("[Client] Planning budget: " + planningTimeout + "ms (server=" + effectiveServerTimeoutMs + "ms)");
-        return portfolio.search(currentState, level);
+        if (SearchConfig.isNormal()) {
+            debugOut.println("[Client] Planning budget: " + planningTimeout + "ms (server=" + effectiveServerTimeoutMs + "ms)");
+        }
+        List<Action[]> plan = portfolio.search(currentState, level);
+        lastPlanTrace = portfolio.getLastPlanTrace();
+        return plan;
     }
 
     /**

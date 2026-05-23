@@ -359,6 +359,140 @@ public class SubgoalManager {
         return null;
     }
 
+    public BoxSelectionDiagnosis diagnoseBestBoxForGoal(PriorityPlanningStrategy.Subgoal subgoal,
+                                                        State state,
+                                                        Level level,
+                                                        List<PriorityPlanningStrategy.Subgoal> allPendingSubgoals,
+                                                        Set<Position> completedBoxGoals) {
+        Map<String, String> details = new LinkedHashMap<>();
+        Map<String, Integer> rejectCounts = new LinkedHashMap<>();
+        List<String> samples = new ArrayList<>();
+        List<BoxCandidate> candidates = new ArrayList<>();
+        Position agentPos = state.getAgentPosition(subgoal.agentId);
+        Set<Position> immovableBoxes = immovableDetector.getImmovableBoxes(state, level);
+        int rawBoxesOfType = 0;
+        int operationSideFallbacks = 0;
+
+        String hungarianStatus = "no-cache";
+        if (hungarianCache != null) {
+            HungarianBoxAssigner.AssignmentResult result = hungarianCache.get(subgoal.boxType);
+            if (result == null) {
+                hungarianStatus = "no-assignment-for-box-type";
+            } else {
+                Position assignedBox = result.getAssignedBox(subgoal.goalPos);
+                if (assignedBox == null) {
+                    hungarianStatus = "no-assigned-box-for-goal";
+                } else {
+                    details.put("hungarianAssignedBox", positionText(assignedBox));
+                    Character boxAtPos = state.getBoxes().get(assignedBox);
+                    if (boxAtPos == null || boxAtPos != subgoal.boxType) {
+                        hungarianStatus = "assigned-box-moved-or-wrong-type";
+                    } else if (immovableBoxes.contains(assignedBox)) {
+                        hungarianStatus = "assigned-box-immovable";
+                    } else if (level.getBoxGoal(assignedBox) == subgoal.boxType) {
+                        hungarianStatus = "assigned-box-already-on-goal";
+                    } else if (!isBoxMovable(assignedBox, state, level)) {
+                        hungarianStatus = "assigned-box-has-no-operation-side";
+                    } else {
+                        int agentToBox = estimateAgentToBoxWorkDistance(
+                                subgoal.agentId, subgoal.boxType, agentPos, assignedBox,
+                                state, level, immovableBoxes);
+                        int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(
+                                assignedBox, subgoal.goalPos, state, level);
+                        if (agentToBox == Integer.MAX_VALUE) {
+                            hungarianStatus = "assigned-box-agent-unreachable";
+                        } else if (boxToGoal == Integer.MAX_VALUE) {
+                            hungarianStatus = "assigned-box-goal-unreachable";
+                        } else if (!isAllocationFeasible(assignedBox, subgoal, state, level, allPendingSubgoals)) {
+                            hungarianStatus = "assigned-box-allocation-infeasible";
+                        } else {
+                            hungarianStatus = "would-select";
+                            details.put("selectedBox", positionText(assignedBox));
+                            details.put("selectionLayer", "hungarian");
+                            details.put("agentToBoxWorkDistance", Integer.toString(agentToBox));
+                            details.put("boxToGoalDistance", Integer.toString(boxToGoal));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != subgoal.boxType) continue;
+            rawBoxesOfType++;
+            Position boxPos = entry.getKey();
+
+            String rejectReason = null;
+            if (level.getBoxGoal(boxPos) == subgoal.boxType) {
+                rejectReason = "already-satisfied-goal";
+            } else if (subgoal.boxType == level.getBoxGoal(boxPos) && completedBoxGoals.contains(boxPos)) {
+                rejectReason = "completed-goal-frozen";
+            } else if (immovableBoxes.contains(boxPos)) {
+                rejectReason = "immovable";
+            } else if (!isBoxMovable(boxPos, state, level)) {
+                rejectReason = "no-operation-side";
+            }
+
+            if (rejectReason != null) {
+                increment(rejectCounts, rejectReason);
+                addSample(samples, boxPos, rejectReason);
+                continue;
+            }
+
+            int operationSide = estimateAgentToOperationSide(agentPos, boxPos, state, level, immovableBoxes);
+            int agentToBox = estimateAgentToBoxWorkDistance(
+                    subgoal.agentId, subgoal.boxType, agentPos, boxPos, state, level, immovableBoxes);
+            if (agentToBox == Integer.MAX_VALUE) {
+                increment(rejectCounts, "agent-to-box-unreachable");
+                addSample(samples, boxPos, "agent-to-box-unreachable");
+                continue;
+            }
+            if (operationSide == Integer.MAX_VALUE) {
+                operationSideFallbacks++;
+            }
+
+            int boxToGoal = immovableDetector.getDistanceWithImmovableBoxes(boxPos, subgoal.goalPos, state, level);
+            if (boxToGoal == Integer.MAX_VALUE) {
+                increment(rejectCounts, "box-to-goal-unreachable");
+                addSample(samples, boxPos, "box-to-goal-unreachable");
+                continue;
+            }
+
+            candidates.add(new BoxCandidate(boxPos, agentToBox + boxToGoal));
+        }
+
+        candidates.sort(Comparator.comparingInt(c -> c.dist));
+        int allocationFailed = 0;
+        for (BoxCandidate candidate : candidates) {
+            if (isAllocationFeasible(candidate.pos, subgoal, state, level, allPendingSubgoals)) {
+                if (!"would-select".equals(hungarianStatus)) {
+                    details.put("selectedBox", positionText(candidate.pos));
+                    details.put("selectionLayer", "greedy");
+                    details.put("selectedDistance", Integer.toString(candidate.dist));
+                }
+                return new BoxSelectionDiagnosis("would-select", detailsWithSelectionCounts(details,
+                        hungarianStatus, rawBoxesOfType, candidates.size(), operationSideFallbacks,
+                        allocationFailed, rejectCounts, samples));
+            }
+            allocationFailed++;
+            increment(rejectCounts, "allocation-feasibility-failed");
+            addSample(samples, candidate.pos, "allocation-feasibility-failed");
+        }
+
+        String reason;
+        if (rawBoxesOfType == 0) {
+            reason = "no-box-of-type";
+        } else if (candidates.isEmpty()) {
+            reason = dominantReason(rejectCounts, "no-usable-box-candidate");
+        } else {
+            reason = "allocation-feasibility-failed";
+        }
+        details.put("dominantReason", reason);
+        return new BoxSelectionDiagnosis(reason, detailsWithSelectionCounts(details, hungarianStatus,
+                rawBoxesOfType, candidates.size(), operationSideFallbacks, allocationFailed,
+                rejectCounts, samples));
+    }
+
     /**
      * Retrieves the Hungarian-assigned box for a subgoal, if the assignment is still valid.
      * Returns null if no Hungarian cache exists, the box type has no assignment,
@@ -396,6 +530,61 @@ public class SubgoalManager {
         Position pos;
         int dist;
         BoxCandidate(Position p, int d) { pos = p; dist = d; }
+    }
+
+    public record BoxSelectionDiagnosis(String reason, Map<String, String> details) {
+    }
+
+    private static Map<String, String> detailsWithSelectionCounts(Map<String, String> details,
+                                                                  String hungarianStatus,
+                                                                  int rawBoxesOfType,
+                                                                  int usableCandidates,
+                                                                  int operationSideFallbacks,
+                                                                  int allocationFailed,
+                                                                  Map<String, Integer> rejectCounts,
+                                                                  List<String> samples) {
+        Map<String, String> out = new LinkedHashMap<>(details);
+        out.put("hungarianStatus", hungarianStatus);
+        out.put("rawBoxesOfType", Integer.toString(rawBoxesOfType));
+        out.put("usableBoxCandidates", Integer.toString(usableCandidates));
+        out.put("operationSideFallbackCandidates", Integer.toString(operationSideFallbacks));
+        out.put("allocationFailedCandidates", Integer.toString(allocationFailed));
+        if (!rejectCounts.isEmpty()) {
+            List<String> parts = new ArrayList<>();
+            for (Map.Entry<String, Integer> entry : rejectCounts.entrySet()) {
+                parts.add(entry.getKey() + "=" + entry.getValue());
+            }
+            out.put("candidateRejectCounts", String.join(", ", parts));
+        }
+        if (!samples.isEmpty()) {
+            out.put("candidateSamples", String.join("; ", samples.subList(0, Math.min(8, samples.size()))));
+        }
+        return out;
+    }
+
+    private static void increment(Map<String, Integer> counts, String key) {
+        counts.merge(key, 1, Integer::sum);
+    }
+
+    private static void addSample(List<String> samples, Position position, String reason) {
+        if (samples.size() >= 8) return;
+        samples.add(positionText(position) + ":" + reason);
+    }
+
+    private static String dominantReason(Map<String, Integer> counts, String fallback) {
+        String best = fallback;
+        int bestCount = -1;
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            if (entry.getValue() > bestCount) {
+                best = entry.getKey();
+                bestCount = entry.getValue();
+            }
+        }
+        return best;
+    }
+
+    private static String positionText(Position position) {
+        return position == null ? "null" : position.row + "," + position.col;
     }
 
     /**

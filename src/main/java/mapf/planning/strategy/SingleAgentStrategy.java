@@ -3,6 +3,7 @@ package mapf.planning.strategy;
 import mapf.domain.*;
 import mapf.planning.SearchConfig;
 import mapf.planning.SearchStrategy;
+import mapf.planning.diag.PlanTrace;
 import mapf.planning.heuristic.Heuristic;
 
 import java.util.*;
@@ -18,6 +19,7 @@ public class SingleAgentStrategy implements SearchStrategy {
     private long timeoutMs;
     private int maxStates;
     private double weight;
+    private final PlanTrace lastPlanTrace = new PlanTrace();
     
     public SingleAgentStrategy(Heuristic heuristic, SearchConfig config) {
         this.heuristic = heuristic;
@@ -45,10 +47,16 @@ public class SingleAgentStrategy implements SearchStrategy {
     public void setWeight(double weight) {
         this.weight = weight;
     }
+
+    @Override
+    public PlanTrace getLastPlanTrace() {
+        return lastPlanTrace.copy();
+    }
     
     @Override
     public List<Action[]> search(State initialState, Level level) {
         long startTime = System.currentTimeMillis();
+        lastPlanTrace.clear();
         
         PriorityQueue<SearchNode> openList = new PriorityQueue<>();
         Set<State> closedList = new HashSet<>();
@@ -64,16 +72,22 @@ public class SingleAgentStrategy implements SearchStrategy {
         while (!openList.isEmpty() && exploredCount < maxStates) {
             // Check timeout
             if (System.currentTimeMillis() - startTime > timeoutMs) {
-                System.err.println(getName() + ": Timeout after " + exploredCount + " states");
+                if (SearchConfig.isNormal()) {
+                    System.err.println(getName() + ": Timeout after " + exploredCount + " states");
+                }
                 return null;
             }
             
             SearchNode current = openList.poll();
             stateToNode.remove(current.state);
-            
+
             if (current.state.isGoalState(level)) {
-                System.err.println(getName() + ": Solution found after " + exploredCount + " states");
-                return reconstructPath(current);
+                if (SearchConfig.isNormal()) {
+                    System.err.println(getName() + ": Solution found after " + exploredCount + " states");
+                }
+                List<Action[]> path = reconstructPath(current);
+                recordFullStateTrace(path);
+                return path;
             }
             
             if (closedList.contains(current.state)) {
@@ -107,8 +121,24 @@ public class SingleAgentStrategy implements SearchStrategy {
             }
         }
         
-        System.err.println(getName() + ": No solution found after " + exploredCount + " states");
+        if (SearchConfig.isNormal()) {
+            System.err.println(getName() + ": No solution found after " + exploredCount + " states");
+        }
         return null;
+    }
+
+    private void recordFullStateTrace(List<Action[]> path) {
+        if (path == null) return;
+        for (int i = 0; i < path.size(); i++) {
+            Action action = path.get(i) != null && path.get(i).length > 0 && path.get(i)[0] != null
+                    ? path.get(i)[0]
+                    : Action.noOp();
+            lastPlanTrace.recordIntentStep(i, "SINGLE_AGENT", 0,
+                    "full-state-search", "full projected goal state",
+                    null, null, i + 1, path.size(),
+                    action.toServerString(), action.toServerString(),
+                    "single-agent-a-star");
+        }
     }
     
     private List<Action[]> reconstructPath(SearchNode goalNode) {

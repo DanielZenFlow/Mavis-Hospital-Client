@@ -92,11 +92,13 @@ public class SearchConfig {
     /**
      * Log level for controlling output verbosity.
      * 0 = SILENT (no output except critical errors)
-     * 1 = MINIMAL (only [OK], [FAIL], final result)
+     * 1 = MINIMAL (run summary, final result, replay path)
      * 2 = NORMAL (+ iteration progress, warnings)
      * 3 = VERBOSE (+ detailed debug info)
+     *
+     * Override with MAVIS_LOG_LEVEL=0..3.
      */
-    public static final int LOG_LEVEL = 2;
+    public static final int LOG_LEVEL = readLogLevel();
     
     /** Helper method to check if verbose logging is enabled */
     public static boolean isVerbose() { return LOG_LEVEL >= 3; }
@@ -106,6 +108,19 @@ public class SearchConfig {
     
     /** Helper method to check if minimal logging is enabled */
     public static boolean isMinimal() { return LOG_LEVEL >= 1; }
+
+    private static int readLogLevel() {
+        String raw = System.getenv("MAVIS_LOG_LEVEL");
+        if (raw == null || raw.trim().isEmpty()) {
+            return 1;
+        }
+        try {
+            int parsed = Integer.parseInt(raw.trim());
+            return Math.max(0, Math.min(3, parsed));
+        } catch (NumberFormatException ignored) {
+            return 1;
+        }
+    }
     
     // Instance configuration
     private long timeoutMs = DEFAULT_TIMEOUT_MS;

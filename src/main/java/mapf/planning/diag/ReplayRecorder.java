@@ -33,10 +33,12 @@ public final class ReplayRecorder {
 
     private final Level level;
     private final List<Frame> frames = new ArrayList<>();
+    private PlanTrace planTrace = new PlanTrace();
     private final long createdAt = System.currentTimeMillis();
     private String outcome = "unknown";
     private int executedSteps = 0;
     private int plannedSteps = 0;
+    private List<Path> lastDiagnosticFiles = List.of();
 
     private ReplayRecorder(Level level, State initialState) {
         this.level = level;
@@ -55,6 +57,15 @@ public final class ReplayRecorder {
         this.outcome = solved ? "solved" : (plannedSteps > 0 ? "partial" : "no-plan");
         this.executedSteps = Math.max(0, executedSteps);
         this.plannedSteps = Math.max(0, plannedSteps);
+        this.planTrace.truncate(this.executedSteps);
+    }
+
+    public void setPlanTrace(PlanTrace planTrace) {
+        this.planTrace = planTrace == null ? new PlanTrace() : planTrace.copy();
+    }
+
+    public List<Path> getLastDiagnosticFiles() {
+        return lastDiagnosticFiles;
     }
 
     public Path writeDefault() {
@@ -72,6 +83,7 @@ public final class ReplayRecorder {
             Path stamped = replayDir.resolve(levelName + "__" + stamp + "__"
                     + safeName(outcome) + "__" + executedSteps + "-steps.json");
             Files.writeString(stamped, json, StandardCharsets.UTF_8);
+            writeDiagnosticDigests(stamped);
             writeLatestReplayScript(viewerDir, json);
             return stamped;
         } catch (RuntimeException | IOException e) {
@@ -94,7 +106,8 @@ public final class ReplayRecorder {
         sb.append(indent(1)).append("\"frames\": [\n");
         for (int i = 0; i < frames.size(); i++) {
             if (i > 0) sb.append(",\n");
-            appendFrame(sb, frames.get(i), 2);
+            Frame previous = i > 0 ? frames.get(i - 1) : null;
+            appendFrame(sb, previous, frames.get(i), 2);
         }
         sb.append('\n').append(indent(1)).append("]\n");
         sb.append("}\n");
@@ -109,8 +122,18 @@ public final class ReplayRecorder {
         numberField(sb, 2, "plannedSteps", plannedSteps, true);
         numberField(sb, 2, "frames", frames.size(), true);
         numberField(sb, 2, "satisfiedBoxGoals", countSatisfiedBoxGoals(finalState), true);
-        numberField(sb, 2, "totalBoxGoals", level.getAllBoxGoalPositions().size(), false);
+        numberField(sb, 2, "totalBoxGoals", level.getAllBoxGoalPositions().size(), true);
+        numberField(sb, 2, "events", countEvents(), false);
         sb.append(indent(1)).append('}');
+    }
+
+    private int countEvents() {
+        int count = 0;
+        for (int i = 1; i < frames.size(); i++) {
+            count += deriveEvents(frames.get(i - 1), frames.get(i)).size();
+        }
+        count += planTrace.count();
+        return count;
     }
 
     private int countSatisfiedBoxGoals(State state) {
@@ -194,7 +217,7 @@ public final class ReplayRecorder {
         sb.append(indent(1)).append('}');
     }
 
-    private void appendFrame(StringBuilder sb, Frame frame, int depth) {
+    private void appendFrame(StringBuilder sb, Frame previous, Frame frame, int depth) {
         sb.append(indent(depth)).append("{\n");
         numberField(sb, depth + 1, "t", frame.t, true);
         sb.append(indent(depth + 1)).append("\"actions\": [");
@@ -216,7 +239,144 @@ public final class ReplayRecorder {
         appendAgents(sb, frame.state, depth + 1);
         sb.append(",\n");
         appendBoxes(sb, frame.state, depth + 1);
+        List<Object> events = new ArrayList<>();
+        events.addAll(deriveEvents(previous, frame));
+        events.addAll(planTrace.eventsForFrame(frame.t));
+        if (!events.isEmpty()) {
+            sb.append(",\n");
+            appendEvents(sb, events, depth + 1);
+        }
         sb.append('\n').append(indent(depth)).append('}');
+    }
+
+    private List<StepEvent> deriveEvents(Frame previous, Frame frame) {
+        List<StepEvent> events = new ArrayList<>();
+        if (previous == null || frame.actions == null) return events;
+
+        for (int agentId = 0; agentId < frame.actions.length; agentId++) {
+            Action action = frame.actions[agentId] != null ? frame.actions[agentId] : Action.noOp();
+            boolean accepted = frame.accepted != null
+                    && agentId < frame.accepted.length
+                    && frame.accepted[agentId];
+            if (accepted && action.type == Action.ActionType.NOOP) {
+                continue;
+            }
+
+            Position from = previous.state.getAgentPosition(agentId);
+            Position to = frame.state.getAgentPosition(agentId);
+            ActionIntent intent = actionIntent(previous.state, action, from);
+
+            String actionText = action.toServerString();
+            String title = "agent" + agentId + " " + actionText;
+            String kind = accepted ? "agent-action" : "rejected-action";
+            String severity = accepted ? "info" : "warning";
+            String message = accepted
+                    ? "Server accepted the action and this frame records the resulting state."
+                    : "Server rejected the action; the effective action for this agent was NoOp.";
+
+            events.add(new StepEvent(kind, severity, title, message, agentId, actionText,
+                    accepted, from, to, intent.agentTo, intent.boxType, intent.boxFrom,
+                    intent.boxTo));
+        }
+        return events;
+    }
+
+    private ActionIntent actionIntent(State state, Action action, Position from) {
+        if (state == null || from == null || action == null) {
+            return new ActionIntent(null, null, null, null);
+        }
+        return switch (action.type) {
+            case MOVE -> new ActionIntent(from.move(action.agentDir), null, null, null);
+            case PUSH -> {
+                Position boxFrom = from.move(action.agentDir);
+                Position boxTo = boxFrom.move(action.boxDir);
+                Character boxType = state.hasBoxAt(boxFrom) ? state.getBoxAt(boxFrom) : null;
+                yield new ActionIntent(boxFrom, boxType, boxFrom, boxTo);
+            }
+            case PULL -> {
+                Position agentTo = from.move(action.agentDir);
+                Position boxFrom = from.move(action.boxDir.opposite());
+                Character boxType = state.hasBoxAt(boxFrom) ? state.getBoxAt(boxFrom) : null;
+                yield new ActionIntent(agentTo, boxType, boxFrom, from);
+            }
+            case NOOP -> new ActionIntent(from, null, null, null);
+        };
+    }
+
+    private void appendEvents(StringBuilder sb, List<Object> events, int depth) {
+        sb.append(indent(depth)).append("\"events\": [\n");
+        for (int i = 0; i < events.size(); i++) {
+            if (i > 0) sb.append(",\n");
+            Object event = events.get(i);
+            if (event instanceof StepEvent stepEvent) {
+                appendEvent(sb, stepEvent, depth + 1);
+            } else if (event instanceof PlanTrace.Event planEvent) {
+                appendEvent(sb, planEvent, depth + 1);
+            }
+        }
+        sb.append('\n').append(indent(depth)).append(']');
+    }
+
+    private void appendEvent(StringBuilder sb, StepEvent event, int depth) {
+        sb.append(indent(depth)).append("{\n");
+        field(sb, depth + 1, "kind", event.kind, true);
+        field(sb, depth + 1, "severity", event.severity, true);
+        field(sb, depth + 1, "title", event.title, true);
+        field(sb, depth + 1, "message", event.message, true);
+        numberField(sb, depth + 1, "agentId", event.agentId, true);
+        field(sb, depth + 1, "action", event.action, true);
+        booleanField(sb, depth + 1, "accepted", event.accepted, true);
+        positionField(sb, depth + 1, "from", event.from, true);
+        positionField(sb, depth + 1, "to", event.to, event.intentAgentTo != null
+                || event.boxType != null || event.boxFrom != null || event.boxTo != null);
+        if (event.intentAgentTo != null) {
+            positionField(sb, depth + 1, "attemptedTo", event.intentAgentTo,
+                    event.boxType != null || event.boxFrom != null || event.boxTo != null);
+        }
+        if (event.boxType != null) {
+            field(sb, depth + 1, "boxType", String.valueOf(event.boxType),
+                    event.boxFrom != null || event.boxTo != null);
+        }
+        if (event.boxFrom != null) {
+            positionField(sb, depth + 1, "boxFrom", event.boxFrom, event.boxTo != null);
+        }
+        if (event.boxTo != null) {
+            positionField(sb, depth + 1, "boxTo", event.boxTo, false);
+        }
+        sb.append(indent(depth)).append('}');
+    }
+
+    private void appendEvent(StringBuilder sb, PlanTrace.Event event, int depth) {
+        sb.append(indent(depth)).append("{\n");
+        field(sb, depth + 1, "kind", event.kind(), true);
+        field(sb, depth + 1, "severity", event.severity(), true);
+        field(sb, depth + 1, "title", event.title(), true);
+        field(sb, depth + 1, "message", event.message(), true);
+        if (event.agentId() != null) numberField(sb, depth + 1, "agentId", event.agentId(), true);
+        if (event.phase() != null) field(sb, depth + 1, "phase", event.phase(), true);
+        if (event.subgoal() != null) field(sb, depth + 1, "subgoal", event.subgoal(), true);
+        if (event.subgoalType() != null) field(sb, depth + 1, "subgoalType", event.subgoalType(), true);
+        if (event.goal() != null) positionField(sb, depth + 1, "goal", event.goal(), true);
+        if (event.boxType() != null) field(sb, depth + 1, "boxType", String.valueOf(event.boxType()), true);
+        if (event.stepInSegment() != null) numberField(sb, depth + 1, "stepInSegment", event.stepInSegment(), true);
+        if (event.segmentSteps() != null) numberField(sb, depth + 1, "segmentSteps", event.segmentSteps(), true);
+        if (event.action() != null) field(sb, depth + 1, "action", event.action(), true);
+        if (event.actualAction() != null) field(sb, depth + 1, "actualAction", event.actualAction(), true);
+        if (event.reason() != null) field(sb, depth + 1, "reason", event.reason(), true);
+        if (event.verdict() != null) field(sb, depth + 1, "verdict", event.verdict(), true);
+        if (event.synthetic() != null) booleanField(sb, depth + 1, "synthetic", event.synthetic(), true);
+        if (event.agentReachBefore() != null) numberField(sb, depth + 1, "agentReachBefore", event.agentReachBefore(), true);
+        if (event.agentReachAfter() != null) numberField(sb, depth + 1, "agentReachAfter", event.agentReachAfter(), true);
+        if (event.totalReachBefore() != null) numberField(sb, depth + 1, "totalReachBefore", event.totalReachBefore(), true);
+        if (event.totalReachAfter() != null) numberField(sb, depth + 1, "totalReachAfter", event.totalReachAfter(), true);
+        if (event.goalAdjBefore() != null) booleanField(sb, depth + 1, "goalAdjBefore", event.goalAdjBefore(), true);
+        if (event.goalAdjAfter() != null) booleanField(sb, depth + 1, "goalAdjAfter", event.goalAdjAfter(), true);
+        for (Map.Entry<String, String> detail : event.details().entrySet()) {
+            if (detail.getKey() == null || detail.getValue() == null) continue;
+            field(sb, depth + 1, detail.getKey(), detail.getValue(), true);
+        }
+        trimTrailingComma(sb);
+        sb.append(indent(depth)).append('}');
     }
 
     private void appendAgents(StringBuilder sb, State state, int depth) {
@@ -256,6 +416,10 @@ public final class ReplayRecorder {
         writeStaticViewerFile(viewerDir, "index.html");
         writeStaticViewerFile(viewerDir, "viewer.css");
         writeStaticViewerFile(viewerDir, "viewer.js");
+        writeStaticViewerFile(viewerDir, "favicon.ico");
+        writeStaticViewerFile(viewerDir, "favicon.png");
+        writeStaticViewerFile(viewerDir, "favicon-32.png");
+        writeStaticViewerFile(viewerDir, "apple-touch-icon.png");
     }
 
     private void writeStaticViewerFile(Path viewerDir, String fileName) throws IOException {
@@ -292,6 +456,27 @@ public final class ReplayRecorder {
         sb.append('\n');
     }
 
+    private static void booleanField(StringBuilder sb, int depth, String name, boolean value, boolean comma) {
+        sb.append(indent(depth));
+        quoted(sb, name);
+        sb.append(": ").append(value);
+        if (comma) sb.append(',');
+        sb.append('\n');
+    }
+
+    private static void positionField(StringBuilder sb, int depth, String name, Position value, boolean comma) {
+        sb.append(indent(depth));
+        quoted(sb, name);
+        sb.append(": ");
+        if (value == null) {
+            sb.append("null");
+        } else {
+            sb.append("{\"r\":").append(value.row).append(",\"c\":").append(value.col).append('}');
+        }
+        if (comma) sb.append(',');
+        sb.append('\n');
+    }
+
     private static void quoted(StringBuilder sb, String value) {
         sb.append('"');
         if (value != null) {
@@ -322,10 +507,45 @@ public final class ReplayRecorder {
         return name.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
-    private record Frame(int t, Action[] actions, boolean[] accepted, State state) {
+    record Frame(int t, Action[] actions, boolean[] accepted, State state) {
         static Frame initial(State state) {
             return new Frame(0, new Action[0], new boolean[0], state);
         }
+    }
+
+    private void writeDiagnosticDigests(Path replayPath) {
+        try {
+            State finalState = frames.isEmpty() ? null : frames.get(frames.size() - 1).state;
+            lastDiagnosticFiles = new DiagnosticDigestWriter().write(
+                    replayPath,
+                    level,
+                    frames,
+                    planTrace,
+                    outcome,
+                    executedSteps,
+                    plannedSteps,
+                    countSatisfiedBoxGoals(finalState),
+                    level.getAllBoxGoalPositions().size());
+        } catch (IOException e) {
+            lastDiagnosticFiles = List.of();
+            System.err.println("[ReplayRecorder] diagnostic digest write failed: " + e.getMessage());
+        }
+    }
+
+    private static void trimTrailingComma(StringBuilder sb) {
+        int comma = sb.length() - 2;
+        if (comma >= 0 && sb.charAt(comma) == ',') {
+            sb.deleteCharAt(comma);
+        }
+    }
+
+    private record ActionIntent(Position agentTo, Character boxType, Position boxFrom, Position boxTo) {
+    }
+
+    private record StepEvent(String kind, String severity, String title, String message,
+                             int agentId, String action, boolean accepted,
+                             Position from, Position to, Position intentAgentTo,
+                             Character boxType, Position boxFrom, Position boxTo) {
     }
 
 }

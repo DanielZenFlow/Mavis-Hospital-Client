@@ -7,6 +7,7 @@ import mapf.planning.heuristic.TrueDistanceHeuristic;
 import mapf.planning.spacetime.ReservationTable;
 
 import java.util.*;
+import java.util.function.Predicate;
 
 /**
  * Handles A* search algorithms for box and agent goal planning.
@@ -22,6 +23,7 @@ public class BoxSearchPlanner {
 
     private final Heuristic heuristic;
     private int maxStatesOverride = -1;
+    private SearchStats lastSearchStats = SearchStats.notRun();
 
     /** Weight for Weighted A*: 1.0 = standard A*, higher = faster but less optimal. */
     private double weight = 1.0;
@@ -37,6 +39,10 @@ public class BoxSearchPlanner {
 
     public double getWeight() {
         return weight;
+    }
+
+    public SearchStats getLastSearchStats() {
+        return lastSearchStats;
     }
 
     /**
@@ -96,7 +102,11 @@ public class BoxSearchPlanner {
 
             // Check if goal is achieved — target box must be at goal, not just any same-type box
             if (goalPos.equals(current.targetBoxPos)) {
-                return reconstructPath(current);
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("box-2d-a-star", exploredCount,
+                        effectiveMaxStates, openList.size(), result.size(),
+                        hardFrozenGoals.size(), softFrozenGoals.size(), 0);
+                return result;
             }
 
             // Expand node
@@ -139,6 +149,10 @@ public class BoxSearchPlanner {
         // System.err.println("[BSP-DEBUG] 2D-A* FAILED (" + (hardFreeze ? "tier1" : "tier2") + "): box=" + boxType + " " + boxStart + " -> " + goalPos 
         //    + " explored=" + exploredCount + "/" + effectiveMaxStates 
         //    + " openListRemaining=" + openList.size() + " hardFrozen=" + hardFrozenGoals.size() + " softFrozen=" + softFrozenGoals.size());
+        lastSearchStats = SearchStats.failure("box-2d-a-star",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, effectiveMaxStates, openList.size(),
+                hardFrozenGoals.size(), softFrozenGoals.size(), 0);
         return null;
     }
 
@@ -167,13 +181,19 @@ public class BoxSearchPlanner {
 
         int exploredCount = 0;
 
-        while (!openList.isEmpty() && exploredCount < getEffectiveMaxStates()) {
+        int effectiveMaxStates = getEffectiveMaxStates();
+
+        while (!openList.isEmpty() && exploredCount < effectiveMaxStates) {
             SearchNode current = openList.poll();
             exploredCount++;
 
             // Check if goal is achieved — target box must be at goal, not just any same-type box
             if (goalPos.equals(current.targetBoxPos)) {
-                return reconstructPath(current);
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("box-space-time-a-star", exploredCount,
+                        effectiveMaxStates, openList.size(), result.size(),
+                        frozenGoals.size(), 0, 0);
+                return result;
             }
 
             int nextTime = current.time + 1;
@@ -229,6 +249,10 @@ public class BoxSearchPlanner {
             }
         }
 
+        lastSearchStats = SearchStats.failure("box-space-time-a-star",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, effectiveMaxStates, openList.size(),
+                frozenGoals.size(), 0, 0);
         return null;
     }
 
@@ -259,13 +283,19 @@ public class BoxSearchPlanner {
 
         int exploredCount = 0;
 
-        while (!openList.isEmpty() && exploredCount < getEffectiveMaxStates()) {
+        int effectiveMaxStates = getEffectiveMaxStates();
+
+        while (!openList.isEmpty() && exploredCount < effectiveMaxStates) {
             SearchNode current = openList.poll();
             exploredCount++;
 
             Position currentAgentPos = current.state.getAgentPosition(agentId);
             if (currentAgentPos.equals(goalPos)) {
-                return reconstructPath(current);
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("agent-goal-a-star", exploredCount,
+                        effectiveMaxStates, openList.size(), result.size(),
+                        frozenGoals.size(), 0, 0);
+                return result;
             }
 
             for (Action action : PlanningUtils.getAllActions()) {
@@ -300,6 +330,10 @@ public class BoxSearchPlanner {
             }
         }
 
+        lastSearchStats = SearchStats.failure("agent-goal-a-star",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, effectiveMaxStates, openList.size(),
+                frozenGoals.size(), 0, 0);
         return null;
     }
 
@@ -392,6 +426,8 @@ public class BoxSearchPlanner {
         
         Character actualBox = initialState.getBoxAt(boxPos);
         if (actualBox == null || actualBox != boxType) {
+            lastSearchStats = SearchStats.failure("box-displacement", "initial-box-missing",
+                    0, getEffectiveMaxStates() / 2, 0, 0, 0, 0);
             return null;
         }
 
@@ -426,7 +462,11 @@ public class BoxSearchPlanner {
 
             Position currentBoxPos = findBoxPosition(current.state, boxType, current.targetBoxPos);
             if (currentBoxPos != null && currentBoxPos.equals(targetPos)) {
-                return reconstructPath(current);
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("box-displacement", exploredCount,
+                        maxStates, openList.size(), result.size(),
+                        frozenGoals.size(), 0, 0);
+                return result;
             }
 
             for (Action action : PlanningUtils.getAllActions()) {
@@ -461,6 +501,10 @@ public class BoxSearchPlanner {
             }
         }
 
+        lastSearchStats = SearchStats.failure("box-displacement",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, maxStates, openList.size(),
+                frozenGoals.size(), 0, 0);
         return null;
     }
 
@@ -491,9 +535,21 @@ public class BoxSearchPlanner {
             char boxType, State initialState, Level level,
             Set<Position> unfreezePositions, int maxStatesOverride,
             Set<Position> protectedPositions) {
+        return planBoxDisplacementWithUnfreeze(agentId, boxPos, targetPos, boxType,
+                initialState, level, unfreezePositions, maxStatesOverride,
+                protectedPositions, null);
+    }
+
+    public List<Action> planBoxDisplacementWithUnfreeze(int agentId, Position boxPos, Position targetPos,
+            char boxType, State initialState, Level level,
+            Set<Position> unfreezePositions, int maxStatesOverride,
+            Set<Position> protectedPositions, Predicate<State> goalStatePredicate) {
 
         Character actualBox = initialState.getBoxAt(boxPos);
         if (actualBox == null || actualBox != boxType) {
+            lastSearchStats = SearchStats.failure("box-displacement", "initial-box-missing",
+                    0, maxStatesOverride, 0, 0, 0,
+                    protectedPositions == null ? 0 : protectedPositions.size());
             return null;
         }
 
@@ -528,8 +584,14 @@ public class BoxSearchPlanner {
             exploredCount++;
 
             Position currentBoxPos = findBoxPosition(current.state, boxType, current.targetBoxPos);
-            if (currentBoxPos != null && currentBoxPos.equals(targetPos)) {
-                return reconstructPath(current);
+            if (currentBoxPos != null && currentBoxPos.equals(targetPos)
+                    && (goalStatePredicate == null || goalStatePredicate.test(current.state))) {
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("box-displacement", exploredCount,
+                        maxStatesOverride, openList.size(), result.size(),
+                        frozenGoals.size(), 0,
+                        protectedPositions == null ? 0 : protectedPositions.size());
+                return result;
             }
 
             for (Action action : PlanningUtils.getAllActions()) {
@@ -539,7 +601,7 @@ public class BoxSearchPlanner {
                 // Protected positions: reject if a non-target box would be moved
                 // from or into a protected cell. The target box is allowed to pass
                 // through protected cells while being displaced.
-                if (!protectedPositions.isEmpty() 
+                if (protectedPositions != null && !protectedPositions.isEmpty()
                         && wouldMoveBoxOnProtected(action, agentId, current.state, 
                                 current.targetBoxPos, protectedPositions)) continue;
 
@@ -558,6 +620,11 @@ public class BoxSearchPlanner {
             }
         }
 
+        lastSearchStats = SearchStats.failure("box-displacement",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, maxStatesOverride, openList.size(),
+                frozenGoals.size(), 0,
+                protectedPositions == null ? 0 : protectedPositions.size());
         return null;
     }
 
@@ -576,6 +643,10 @@ public class BoxSearchPlanner {
 
         Character actualBox = initialState.getBoxAt(boxPos);
         if (actualBox == null || actualBox != boxType) {
+            lastSearchStats = SearchStats.failure("box-release", "initial-box-missing",
+                    0, maxStatesOverride, 0, 0,
+                    forbiddenPositions == null ? 0 : forbiddenPositions.size(),
+                    protectedPositions == null ? 0 : protectedPositions.size());
             return null;
         }
 
@@ -609,14 +680,19 @@ public class BoxSearchPlanner {
             if (currentBoxPos != null
                     && !forbiddenPositions.contains(currentBoxPos)
                     && !frozenGoals.contains(currentBoxPos)) {
-                return reconstructPath(current);
+                List<Action> result = reconstructPath(current);
+                lastSearchStats = SearchStats.success("box-release", exploredCount,
+                        maxStatesOverride, openList.size(), result.size(),
+                        frozenGoals.size(), forbiddenPositions.size(),
+                        protectedPositions == null ? 0 : protectedPositions.size());
+                return result;
             }
 
             for (Action action : PlanningUtils.getAllActions()) {
                 if (action.type == Action.ActionType.NOOP) continue;
                 if (!current.state.isApplicable(action, agentId, level)) continue;
                 if (wouldDisturbSatisfiedGoal(action, agentId, current.state, frozenGoals)) continue;
-                if (!protectedPositions.isEmpty()
+                if (protectedPositions != null && !protectedPositions.isEmpty()
                         && wouldMoveBoxOnProtected(action, agentId, current.state,
                                 current.targetBoxPos, protectedPositions)) continue;
 
@@ -635,7 +711,62 @@ public class BoxSearchPlanner {
             }
         }
 
+        lastSearchStats = SearchStats.failure("box-release",
+                openList.isEmpty() ? "search-space-exhausted" : "budget-exhausted",
+                exploredCount, maxStatesOverride, openList.size(),
+                frozenGoals.size(), forbiddenPositions.size(),
+                protectedPositions == null ? 0 : protectedPositions.size());
         return null;
+    }
+
+    public record SearchStats(String algorithm,
+                              String outcome,
+                              String reason,
+                              int explored,
+                              int budget,
+                              int openRemaining,
+                              int pathLength,
+                              int hardFrozenCount,
+                              int softOrForbiddenCount,
+                              int protectedCount) {
+        static SearchStats notRun() {
+            return new SearchStats("none", "not-run", "not-run", 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        static SearchStats success(String algorithm, int explored, int budget, int openRemaining,
+                                   int pathLength, int hardFrozenCount, int softOrForbiddenCount,
+                                   int protectedCount) {
+            return new SearchStats(algorithm, "success", "found-path", explored, budget,
+                    openRemaining, pathLength, hardFrozenCount, softOrForbiddenCount, protectedCount);
+        }
+
+        static SearchStats failure(String algorithm, String reason, int explored, int budget,
+                                   int openRemaining, int hardFrozenCount,
+                                   int softOrForbiddenCount, int protectedCount) {
+            return new SearchStats(algorithm, "failure", reason, explored, budget,
+                    openRemaining, 0, hardFrozenCount, softOrForbiddenCount, protectedCount);
+        }
+
+        public Map<String, String> toDetailMap(String prefix) {
+            String p = prefix == null || prefix.isBlank() ? "" : prefix;
+            Map<String, String> details = new LinkedHashMap<>();
+            details.put(detailKey(p, "algorithm"), algorithm);
+            details.put(detailKey(p, "outcome"), outcome);
+            details.put(detailKey(p, "reason"), reason);
+            details.put(detailKey(p, "explored"), Integer.toString(explored));
+            details.put(detailKey(p, "budget"), Integer.toString(budget));
+            details.put(detailKey(p, "openRemaining"), Integer.toString(openRemaining));
+            if (pathLength > 0) details.put(detailKey(p, "pathLength"), Integer.toString(pathLength));
+            details.put(detailKey(p, "hardFrozenCount"), Integer.toString(hardFrozenCount));
+            details.put(detailKey(p, "softOrForbiddenCount"), Integer.toString(softOrForbiddenCount));
+            details.put(detailKey(p, "protectedCount"), Integer.toString(protectedCount));
+            return details;
+        }
+
+        private static String detailKey(String prefix, String suffix) {
+            if (prefix == null || prefix.isBlank()) return suffix;
+            return prefix + Character.toUpperCase(suffix.charAt(0)) + suffix.substring(1);
+        }
     }
 
     /**
