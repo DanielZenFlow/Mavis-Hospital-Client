@@ -3407,6 +3407,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 boolean sourceStackRelief = taskAgentColor != null
                         && sameColorAccessClusterSize(taskBlockerPos, current, level,
                         taskAgentColor, blockedSubgoal.boxType) >= 3;
+                boolean realBoxGoalTask = !blockedSubgoal.isAgentGoal
+                        && blockedSubgoal.boxType != '\0'
+                        && !isSyntheticBoxTarget(blockedSubgoal, level)
+                        && level.getBoxGoal(blockedSubgoal.goalPos) == blockedSubgoal.boxType;
                 Position sourceStackEntry = sourceStackRelief
                         ? reachableEntryForBlocker(blockerPos, current, level, blockedSubgoal.agentId)
                         : null;
@@ -3488,6 +3492,15 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 List<Position> parkingCandidates = findTaskReliefParkingCandidates(
                         blockerPos, current, level, taskCritical, usedTemps,
                         sourceStackRelief, sourceStackEntry);
+                if (realBoxGoalTask && sourceStackRelief) {
+                    List<Position> laneCandidates = findSourceStackParkingLaneCandidates(
+                            blockerPos, current, level, taskCritical, usedTemps, sourceStackEntry);
+                    if (!laneCandidates.isEmpty()) {
+                        LinkedHashSet<Position> merged = new LinkedHashSet<>(laneCandidates);
+                        merged.addAll(parkingCandidates);
+                        parkingCandidates = new ArrayList<>(merged);
+                    }
+                }
                 for (Position pTemp : parkingCandidates) {
                     String nogoodKey = taskReliefNogoodKey(blockedSubgoal, blockerPos, pTemp);
                     if (taskReliefNogoods.contains(nogoodKey)) {
@@ -4682,6 +4695,57 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         fallback.sort(byDistance);
         safe.addAll(fallback);
         return safe;
+    }
+
+    private List<Position> findSourceStackParkingLaneCandidates(Position blockerPos, State state, Level level,
+                                                               Set<Position> taskCritical,
+                                                               Set<Position> usedTemps,
+                                                               Position entryPos) {
+        Set<Position> goalCells = new HashSet<>();
+        for (List<Position> goals : level.getBoxGoalsByType().values()) goalCells.addAll(goals);
+        goalCells.addAll(level.getAgentGoalPositionMap().values());
+
+        List<Position> candidates = new ArrayList<>();
+        Set<Position> visited = new HashSet<>();
+        Queue<Position> queue = new LinkedList<>();
+        queue.add(blockerPos);
+        visited.add(blockerPos);
+
+        int expansions = 0;
+        while (!queue.isEmpty() && expansions++ < 160) {
+            Position p = queue.poll();
+            if (!p.equals(blockerPos)
+                    && taskCritical.contains(p)
+                    && !level.isWall(p)
+                    && !state.hasBoxAt(p)
+                    && !immovableBoxes.contains(p)
+                    && !goalCells.contains(p)
+                    && !usedTemps.contains(p)
+                    && countFreeNeighborsForTaskRelief(p, state, level) <= 2) {
+                candidates.add(p);
+            }
+
+            for (Direction dir : Direction.values()) {
+                Position next = p.move(dir);
+                if (visited.contains(next)) continue;
+                if (level.isWall(next) || immovableBoxes.contains(next)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+
+        Map<Position, Integer> entryDistances = staticDistancesFrom(entryPos, level);
+        candidates.sort((a, b) -> {
+            int distA = entryDistances.getOrDefault(a, a.manhattanDistance(blockerPos));
+            int distB = entryDistances.getOrDefault(b, b.manhattanDistance(blockerPos));
+            if (distA != distB) return Integer.compare(distB, distA);
+            int nearA = a.manhattanDistance(blockerPos);
+            int nearB = b.manhattanDistance(blockerPos);
+            if (nearA != nearB) return Integer.compare(nearA, nearB);
+            if (a.row != b.row) return Integer.compare(a.row, b.row);
+            return Integer.compare(a.col, b.col);
+        });
+        return candidates;
     }
 
     private Map<Position, Integer> staticDistancesFrom(Position start, Level level) {
