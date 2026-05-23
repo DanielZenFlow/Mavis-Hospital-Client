@@ -2353,7 +2353,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return 0;
         int count = 0;
         for (Position dep : deps) {
-            if (deferredBlockedGoals.contains(dep)) continue;
+            if (isDeferredDependencySoftened(goal, dep, level)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) count++;
@@ -2373,7 +2373,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (deps == null || deps.isEmpty()) return true;
 
         for (Position dep : deps) {
-            if (deferredBlockedGoals.contains(dep)) continue;
+            if (isDeferredDependencySoftened(goal, dep, level)) continue;
             boolean isBoxGoal = level.getBoxGoal(dep) != '\0';
             if (isBoxGoal) {
                 if (!completedBoxGoals.contains(dep)) return false;
@@ -2385,6 +2385,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return true;
+    }
+
+    private boolean isDeferredDependencySoftened(Position goal, Position dep, Level level) {
+        if (!deferredBlockedGoals.contains(dep)) return false;
+        boolean goalIsRealBoxGoal = level.getBoxGoal(goal) != '\0';
+        boolean depIsRealBoxGoal = level.getBoxGoal(dep) != '\0';
+        return !(goalIsRealBoxGoal && depIsRealBoxGoal);
     }
 
     private void moveDeferredGoalsToTail(List<Subgoal> subgoals) {
@@ -2599,7 +2606,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (goalDependsOn.containsKey(subgoal.goalPos)) {
                 boolean depMet = true;
                 for (Position dep : goalDependsOn.get(subgoal.goalPos)) {
-                    if (deferredBlockedGoals.contains(dep)) continue;
+                    if (isDeferredDependencySoftened(subgoal.goalPos, dep, level)) continue;
                     boolean isBoxG = level.getBoxGoal(dep.row, dep.col) != '\0';
                     if (isBoxG && !completedBoxGoals.contains(dep)) {
                         depMet = false;
