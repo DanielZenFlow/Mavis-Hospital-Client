@@ -3532,8 +3532,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     boolean madeAccessProgress = !blockerPos.equals(taskBlockerPos)
                             && sameColorAccessDepthToBlocker(
                             blockedSubgoal, taskBlockerPos, trial, level) < accessDepthBefore;
+                    List<Position> ordinaryBlockersAfter = Collections.emptyList();
+                    boolean leavesTaskPathBlocked = false;
+                    if (realBoxGoalTask && blockerCountAfter == 0) {
+                        ordinaryBlockersAfter = findOrdinaryPathBlockersForTask(
+                                blockedSubgoal, trial, level, allSubgoals);
+                        leavesTaskPathBlocked = !ordinaryBlockersAfter.isEmpty();
+                    }
 
-                    if (movedBlocker && (madeTaskProgress || madeAccessProgress)) {
+                    if (movedBlocker && (madeTaskProgress || madeAccessProgress)
+                            && !leavesTaskPathBlocked) {
                         current = trial;
                         usedTemps.add(pTemp);
                         usedTemps.add(blockerPos);
@@ -3551,6 +3559,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 blockedSubgoal, taskBlockerPos, trial, level)
                                 : ""));
                         break;
+                    }
+                    if (leavesTaskPathBlocked) {
+                        logVerbose("[PP][TASK-RELIEF] rejected " + blockerType + " "
+                                + blockerPos + " -> " + pTemp + " for "
+                                + subgoalLabel(blockedSubgoal)
+                                + " because ordinary blockers remain "
+                                + ordinaryBlockersAfter);
                     }
 
                     rollbackPlanTo(fullPlan, planSizeBefore);
@@ -4746,6 +4761,68 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             return Integer.compare(a.col, b.col);
         });
         return candidates;
+    }
+
+    private List<Position> findOrdinaryPathBlockersForTask(Subgoal subgoal, State state, Level level,
+                                                          List<Subgoal> allSubgoals) {
+        if (subgoal == null || subgoal.isAgentGoal || subgoal.boxType == '\0') {
+            return Collections.emptyList();
+        }
+
+        Position boxPos = subgoalManager.findBestBoxForGoal(
+                subgoal, state, level, allSubgoals, completedBoxGoals);
+        if (boxPos == null) {
+            boxPos = nearestStaticBoxForSubgoal(subgoal, state, level);
+        }
+        if (boxPos == null) return Collections.emptyList();
+
+        Set<Position> protectedGoals = new HashSet<>(completedBoxGoals);
+        protectedGoals.remove(boxPos);
+        protectedGoals.remove(subgoal.goalPos);
+        List<Position> idealPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                boxPos, subgoal.goalPos, level, protectedGoals);
+        if (idealPath == null) {
+            idealPath = pathAnalyzer.findPathIgnoringDynamicObstacles(boxPos, subgoal.goalPos, level);
+        }
+        if (idealPath == null || idealPath.isEmpty()) return Collections.emptyList();
+
+        Set<Position> dangerZone = new HashSet<>(idealPath);
+        for (int i = 0; i < idealPath.size() - 1; i++) {
+            Position from = idealPath.get(i);
+            Position to = idealPath.get(i + 1);
+            int dr = to.row - from.row;
+            int dc = to.col - from.col;
+            Position agentPush = new Position(from.row - dr, from.col - dc);
+            if (!level.isWall(agentPush)) {
+                dangerZone.add(agentPush);
+            }
+        }
+
+        List<Position> blockers = new ArrayList<>();
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            Position bPos = entry.getKey();
+            if (!bPos.equals(boxPos) && dangerZone.contains(bPos)) {
+                blockers.add(bPos);
+            }
+        }
+        return blockers;
+    }
+
+    private Position nearestStaticBoxForSubgoal(Subgoal subgoal, State state, Level level) {
+        Position best = null;
+        int bestDistance = Integer.MAX_VALUE;
+        for (Map.Entry<Position, Character> entry : state.getBoxes().entrySet()) {
+            if (entry.getValue() != subgoal.boxType) continue;
+            if (immovableBoxes.contains(entry.getKey())) continue;
+            List<Position> path = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                    entry.getKey(), subgoal.goalPos, level);
+            int distance = path == null ? Integer.MAX_VALUE : path.size();
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = entry.getKey();
+            }
+        }
+        return best;
     }
 
     private Map<Position, Integer> staticDistancesFrom(Position start, Level level) {
