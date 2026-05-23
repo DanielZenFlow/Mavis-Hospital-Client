@@ -4497,6 +4497,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 + " trying " + candidates.size() + " NAMO relief candidate(s)"
                 + " (directChain=" + selected.size() + ", moveCap=" + maxScopedMoves + ")");
 
+        Set<Position> scopedTemps = new HashSet<>();
         for (Subgoal relief : candidates) {
             if (moved >= maxScopedMoves) break;
             if (syntheticReliefBlacklist.contains(relief.goalPos)) continue;
@@ -4515,7 +4516,30 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             if (blockerType == null || blockerType != relief.boxType) {
                 continue;
             }
-            Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
+
+            State reliefBase = current;
+            Set<Position> taskCritical = taskAccessCells(blockedSubgoal, reliefBase, level, allSubgoals);
+            if (!hasReachableNeighbor(blockerPos,
+                    strictAgentReachable(reliefBase.getAgentPosition(relief.agentId), reliefBase, level),
+                    level)) {
+                State helperReady = tryClearHelperAccessForBlocker(
+                        blockedSubgoal, blockerPos, relief.boxType, relief.agentId,
+                        reliefBase, level, fullPlan, numAgents, taskCritical, scopedTemps);
+                if (helperReady != null) {
+                    reliefBase = helperReady;
+                    logVerbose("[PP][SCOPED-RELIEF] prepared helper access for "
+                            + subgoalLabel(relief) + " toward " + subgoalLabel(blockedSubgoal));
+                }
+            }
+            blockerType = reliefBase.getBoxes().get(blockerPos);
+            if (blockerType == null || blockerType != relief.boxType) {
+                rollbackPlanTo(fullPlan, planSizeBefore);
+                globalTimeStep = timeBefore;
+                planMerger.clearAllPlans();
+                storedPlanSubgoals.clear();
+                continue;
+            }
+            taskCritical = taskAccessCells(blockedSubgoal, reliefBase, level, allSubgoals);
             Set<Position> releaseForbidden = new HashSet<>(taskCritical);
             releaseForbidden.addAll(allGoalCells(level));
             releaseForbidden.add(blockerPos);
@@ -4524,11 +4548,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
                     Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
                             computeDynamicBspBudget(blockerPos, blockedSubgoal.goalPos) * 2));
-            List<Action> reliefPath = planSubgoal(relief, current, level, allSubgoals);
+            List<Action> reliefPath = planSubgoal(relief, reliefBase, level, allSubgoals);
             boolean usedFixedTargetFallback = reliefPath != null && !reliefPath.isEmpty();
             if (reliefPath == null || reliefPath.isEmpty()) {
                 reliefPath = boxSearchPlanner.planBoxReleaseFromForbidden(
-                        relief.agentId, blockerPos, relief.boxType, current, level,
+                        relief.agentId, blockerPos, relief.boxType, reliefBase, level,
                         releaseForbidden, unfreeze, reliefBudget, taskCritical);
                 usedFixedTargetFallback = false;
             }
@@ -4536,12 +4560,16 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 logVerbose("[PP][SCOPED-RELIEF] failed to plan " + subgoalLabel(relief)
                         + " for " + subgoalLabel(blockedSubgoal)
                         + " cert=" + reliefCertificateLabel(relief));
+                rollbackPlanTo(fullPlan, planSizeBefore);
+                globalTimeStep = timeBefore;
+                planMerger.clearAllPlans();
+                storedPlanSubgoals.clear();
                 continue;
             }
 
-            State beforeRelease = current;
+            State beforeRelease = reliefBase;
             State trial = appendReliefPath("SCOPED-RELIEF", relief, reliefPath, relief.agentId,
-                    current, level, fullPlan, numAgents);
+                    reliefBase, level, fullPlan, numAgents);
             if (!acceptReachedSubgoal("SCOPED-RELIEF", relief, beforeEval, trial, level,
                     planSizeBefore, fullPlan.size(), allSubgoals)) {
                 rollbackPlanTo(fullPlan, planSizeBefore);
