@@ -3595,7 +3595,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 supportCritical.addAll(findStaticPathCellsToAccessCell(
                         targetAgentPos, accessCell, working, level));
                 List<Position> cellBlockers = findAgentPathBlockersToAccessCell(
-                        targetAgentPos, accessCell, working, level, targetAgentColor, targetBoxPos);
+                        targetAgentPos, accessCell, working, level, targetAgentColor,
+                        targetBoxPos, false);
                 accessBlockers.addAll(cellBlockers);
             }
             accessBlockers.remove(targetBoxPos);
@@ -3705,7 +3706,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         LinkedHashSet<Position> accessBlockers = new LinkedHashSet<>();
         for (Position accessCell : operationCells(targetBoxPos, level)) {
             List<Position> cellBlockers = findAgentPathBlockersToAccessCell(
-                    targetAgentPos, accessCell, state, level, targetAgentColor, targetBoxPos);
+                    targetAgentPos, accessCell, state, level, targetAgentColor,
+                    targetBoxPos, false);
             accessBlockers.addAll(cellBlockers);
         }
         accessBlockers.remove(targetBoxPos);
@@ -4100,7 +4102,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 } else {
                     blockers.addAll(findAgentPathBlockersToAccessCell(
                             state.getAgentPosition(subgoal.agentId), adj, state, level,
-                            agentColor, boxPos));
+                            agentColor, boxPos, true));
                     List<Integer> agentBlockers = findAgentPathAgentBlockersToAccessCell(
                             state.getAgentPosition(subgoal.agentId), adj, state, level, subgoal.agentId);
                     Collections.reverse(agentBlockers);
@@ -4164,7 +4166,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * boxes as passable only to identify which ones explain the failed access.
      */
     private List<Position> findAgentPathBlockersToAccessCell(Position start, Position target,
-            State state, Level level, Color taskAgentColor, Position targetBoxPos) {
+            State state, Level level, Color taskAgentColor, Position targetBoxPos,
+            boolean includeSameColor) {
         if (start == null || target == null || level.isWall(target)) return Collections.emptyList();
 
         Queue<Position> queue = new LinkedList<>();
@@ -4207,7 +4210,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             Character box = state.getBoxes().get(current);
             if (box != null) {
                 Color boxColor = level.getBoxColor(box);
-                if (boxColor != null) {
+                if (boxColor != null && (includeSameColor || !boxColor.equals(taskAgentColor))) {
                     blockers.add(current);
                 }
             }
