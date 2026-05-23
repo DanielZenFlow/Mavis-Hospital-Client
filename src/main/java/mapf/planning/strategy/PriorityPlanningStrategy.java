@@ -3400,6 +3400,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 boolean sourceStackRelief = taskAgentColor != null
                         && sameColorAccessClusterSize(taskBlockerPos, current, level,
                         taskAgentColor, blockedSubgoal.boxType) >= 3;
+                Position sourceStackEntry = sourceStackRelief
+                        ? reachableEntryForBlocker(blockerPos, current, level, blockedSubgoal.agentId)
+                        : null;
 
                 int helper = findHelperAgentForBox(blockerType, current, level, blockerPos);
                 if (helper < 0) continue;
@@ -3477,7 +3480,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
                 List<Position> parkingCandidates = findTaskReliefParkingCandidates(
                         blockerPos, current, level, taskCritical, usedTemps,
-                        sourceStackRelief, current.getAgentPosition(blockedSubgoal.agentId));
+                        sourceStackRelief, sourceStackEntry);
                 for (Position pTemp : parkingCandidates) {
                     String nogoodKey = taskReliefNogoodKey(blockedSubgoal, blockerPos, pTemp);
                     if (taskReliefNogoods.contains(nogoodKey)) {
@@ -4292,6 +4295,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         return visited.size();
     }
 
+    private Position reachableEntryForBlocker(Position blockerPos, State state, Level level, int agentId) {
+        Position agentPos = state.getAgentPosition(agentId);
+        if (agentPos == null || blockerPos == null) return agentPos;
+        Set<Position> reachable = strictAgentReachable(agentPos, state, level);
+        Position best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (Direction dir : Direction.values()) {
+            Position adj = blockerPos.move(dir);
+            if (level.isWall(adj) || !reachable.contains(adj)) continue;
+            int d = staticDistance(agentPos, adj, level);
+            if (d < bestDist) {
+                bestDist = d;
+                best = adj;
+            }
+        }
+        return best != null ? best : agentPos;
+    }
+
     private String taskReliefNogoodKey(Subgoal task, Position blockerPos, Position pTemp) {
         return taskSupportKey(task)
                 + "|blocker=" + blockerPos + "|park=" + pTemp;
@@ -4669,6 +4690,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return distance;
+    }
+
+    private int staticDistance(Position start, Position target, Level level) {
+        if (start == null || target == null) return Integer.MAX_VALUE / 4;
+        return staticDistancesFrom(start, level).getOrDefault(target, Integer.MAX_VALUE / 4);
     }
 
     private int countFreeNeighborsForTaskRelief(Position p, State state, Level level) {
