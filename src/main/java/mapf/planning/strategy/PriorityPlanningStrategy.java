@@ -3327,6 +3327,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         Set<Position> taskCritical = taskAccessCells(blockedSubgoal, current, level, allSubgoals);
         List<Position> initialBlockers = findAccessBlockersForTask(
                 blockedSubgoal, current, level, allSubgoals);
+        boolean madeIntermediateAccessProgress = false;
 
         for (int round = 0; round < MAX_TASK_RELIEF_MOVES; round++) {
             List<Position> blockers = findAccessBlockersForTask(blockedSubgoal, current, level, allSubgoals);
@@ -3378,6 +3379,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     continue;
                 }
 
+                Position taskBlockerPos = blockerPos;
+                Character taskBlockerType = blockerType;
+                int accessDepthBefore = sameColorAccessDepthToBlocker(
+                        blockedSubgoal, taskBlockerPos, current, level);
+                Position reachableBlocker = findReachableSameColorAccessBlocker(
+                        blockedSubgoal, taskBlockerPos, current, level);
+                if (!reachableBlocker.equals(taskBlockerPos)) {
+                    Character reachableType = current.getBoxes().get(reachableBlocker);
+                    if (reachableType != null) {
+                        logVerbose("[PP][TASK-RELIEF] " + subgoalLabel(blockedSubgoal)
+                                + " blocker " + taskBlockerType + " at " + taskBlockerPos
+                                + " is buried; first clearing reachable same-color blocker "
+                                + reachableType + " at " + reachableBlocker);
+                        blockerPos = reachableBlocker;
+                        blockerType = reachableType;
+                    }
+                }
+
                 int helper = findHelperAgentForBox(blockerType, current, level, blockerPos);
                 if (helper < 0) continue;
 
@@ -3413,18 +3432,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             && !trial.getBoxes().containsKey(blockerPos);
                     boolean madeTaskProgress = blockerCountAfter < blockerCountBefore
                             || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
+                    boolean madeAccessProgress = !blockerPos.equals(taskBlockerPos)
+                            && sameColorAccessDepthToBlocker(
+                            blockedSubgoal, taskBlockerPos, trial, level) < accessDepthBefore;
 
-                    if (movedBlocker && madeTaskProgress) {
+                    if (movedBlocker && (madeTaskProgress || madeAccessProgress)) {
                         current = trial;
                         usedTemps.add(releasedPos);
                         usedTemps.add(blockerPos);
                         moved++;
                         movedThisBlocker = true;
                         movedThisRound = true;
+                        madeIntermediateAccessProgress |= madeAccessProgress && !madeTaskProgress;
                         logVerbose("[PP][TASK-RELIEF] released blocker "
                                 + blockerType + " " + blockerPos + " -> " + releasedPos
                                 + " for " + subgoalLabel(blockedSubgoal)
-                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter);
+                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter
+                                + (madeAccessProgress && !madeTaskProgress
+                                ? " accessDepth=" + accessDepthBefore + "->"
+                                + sameColorAccessDepthToBlocker(
+                                blockedSubgoal, taskBlockerPos, trial, level)
+                                : ""));
                     } else {
                         rollbackPlanTo(fullPlan, planSizeBeforeRelease);
                         globalTimeStep = timeBeforeRelease;
@@ -3471,18 +3499,27 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             && !trial.getBoxes().containsKey(blockerPos);
                     boolean madeTaskProgress = blockerCountAfter < blockerCountBefore
                             || hasTaskAccess(blockedSubgoal, trial, level, allSubgoals);
+                    boolean madeAccessProgress = !blockerPos.equals(taskBlockerPos)
+                            && sameColorAccessDepthToBlocker(
+                            blockedSubgoal, taskBlockerPos, trial, level) < accessDepthBefore;
 
-                    if (movedBlocker && madeTaskProgress) {
+                    if (movedBlocker && (madeTaskProgress || madeAccessProgress)) {
                         current = trial;
                         usedTemps.add(pTemp);
                         usedTemps.add(blockerPos);
                         moved++;
                         movedThisBlocker = true;
                         movedThisRound = true;
+                        madeIntermediateAccessProgress |= madeAccessProgress && !madeTaskProgress;
                         logVerbose("[PP][TASK-RELIEF] moved blocker "
                                 + blockerType + " " + blockerPos + " -> " + pTemp
                                 + " for " + subgoalLabel(blockedSubgoal)
-                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter);
+                                + " blockers=" + blockerCountBefore + "->" + blockerCountAfter
+                                + (madeAccessProgress && !madeTaskProgress
+                                ? " accessDepth=" + accessDepthBefore + "->"
+                                + sameColorAccessDepthToBlocker(
+                                blockedSubgoal, taskBlockerPos, trial, level)
+                                : ""));
                         break;
                     }
 
@@ -3534,7 +3571,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         if (!remainingBlockers.isEmpty()) {
             boolean reducedBlockers = remainingBlockers.size() < initialBlockers.size();
             boolean accessOpened = hasTaskAccess(blockedSubgoal, current, level, allSubgoals);
-            if (!reducedBlockers && !accessOpened) {
+            if (!reducedBlockers && !accessOpened && !madeIntermediateAccessProgress) {
                 rollbackPlanTo(fullPlan, initialPlanSize);
                 globalTimeStep = initialTime;
                 planMerger.clearAllPlans();
@@ -4147,6 +4184,85 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return false;
+    }
+
+    private Position findReachableSameColorAccessBlocker(Subgoal subgoal, Position blockerPos,
+                                                         State state, Level level) {
+        if (subgoal.isAgentGoal || blockerPos == null) return blockerPos;
+        Color taskColor = level.getAgentColor(subgoal.agentId);
+        if (taskColor == null || !isSameColorAccessClusterBox(
+                blockerPos, state, level, taskColor, subgoal.boxType)) {
+            return blockerPos;
+        }
+
+        Position agentPos = state.getAgentPosition(subgoal.agentId);
+        if (agentPos == null) return blockerPos;
+        Set<Position> reachable = strictAgentReachable(agentPos, state, level);
+        if (hasReachableNeighbor(blockerPos, reachable, level)) {
+            return blockerPos;
+        }
+
+        Queue<Position> queue = new LinkedList<>();
+        Set<Position> visited = new HashSet<>();
+        queue.add(blockerPos);
+        visited.add(blockerPos);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            if (!current.equals(blockerPos) && hasReachableNeighbor(current, reachable, level)) {
+                return current;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (visited.contains(next)) continue;
+                if (!isSameColorAccessClusterBox(next, state, level, taskColor, subgoal.boxType)) continue;
+                visited.add(next);
+                queue.add(next);
+            }
+        }
+        return blockerPos;
+    }
+
+    private int sameColorAccessDepthToBlocker(Subgoal subgoal, Position blockerPos,
+                                              State state, Level level) {
+        if (subgoal.isAgentGoal || blockerPos == null) return Integer.MAX_VALUE / 4;
+        Color taskColor = level.getAgentColor(subgoal.agentId);
+        if (taskColor == null || !isSameColorAccessClusterBox(
+                blockerPos, state, level, taskColor, subgoal.boxType)) {
+            return Integer.MAX_VALUE / 4;
+        }
+
+        Position agentPos = state.getAgentPosition(subgoal.agentId);
+        if (agentPos == null) return Integer.MAX_VALUE / 4;
+        Set<Position> reachable = strictAgentReachable(agentPos, state, level);
+
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Integer> distance = new HashMap<>();
+        queue.add(blockerPos);
+        distance.put(blockerPos, 0);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            int d = distance.get(current);
+            if (hasReachableNeighbor(current, reachable, level)) {
+                return d;
+            }
+            for (Direction dir : Direction.values()) {
+                Position next = current.move(dir);
+                if (distance.containsKey(next)) continue;
+                if (!isSameColorAccessClusterBox(next, state, level, taskColor, subgoal.boxType)) continue;
+                distance.put(next, d + 1);
+                queue.add(next);
+            }
+        }
+        return Integer.MAX_VALUE / 4;
+    }
+
+    private boolean isSameColorAccessClusterBox(Position pos, State state, Level level,
+                                                Color taskColor, char taskBoxType) {
+        if (pos == null || immovableBoxes.contains(pos) || completedBoxGoals.contains(pos)) return false;
+        Character type = state.getBoxes().get(pos);
+        if (type == null || type == taskBoxType) return false;
+        Color boxColor = level.getBoxColor(type);
+        return taskColor.equals(boxColor);
     }
 
     private String taskReliefNogoodKey(Subgoal task, Position blockerPos, Position pTemp) {
