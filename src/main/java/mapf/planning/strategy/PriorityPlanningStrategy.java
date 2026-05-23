@@ -3595,8 +3595,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 supportCritical.addAll(findStaticPathCellsToAccessCell(
                         targetAgentPos, accessCell, working, level));
                 List<Position> cellBlockers = findAgentPathBlockersToAccessCell(
-                        targetAgentPos, accessCell, working, level, targetAgentColor);
-                Collections.reverse(cellBlockers); // clear from helper side outward
+                        targetAgentPos, accessCell, working, level, targetAgentColor, targetBoxPos);
                 accessBlockers.addAll(cellBlockers);
             }
             accessBlockers.remove(targetBoxPos);
@@ -3706,8 +3705,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         LinkedHashSet<Position> accessBlockers = new LinkedHashSet<>();
         for (Position accessCell : operationCells(targetBoxPos, level)) {
             List<Position> cellBlockers = findAgentPathBlockersToAccessCell(
-                    targetAgentPos, accessCell, state, level, targetAgentColor);
-            Collections.reverse(cellBlockers);
+                    targetAgentPos, accessCell, state, level, targetAgentColor, targetBoxPos);
             accessBlockers.addAll(cellBlockers);
         }
         accessBlockers.remove(targetBoxPos);
@@ -4095,13 +4093,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 Character adjBox = state.getBoxes().get(adj);
                 if (adjBox != null) {
                     Color adjColor = level.getBoxColor(adjBox);
-                    if (adjColor != null && !adjColor.equals(agentColor)
-                            && !immovableBoxes.contains(adj)) {
+                    if (adjColor != null && !immovableBoxes.contains(adj)
+                            && (!adjColor.equals(agentColor) || adjBox != subgoal.boxType)) {
                         blockers.add(adj);
                     }
                 } else {
                     blockers.addAll(findAgentPathBlockersToAccessCell(
-                            state.getAgentPosition(subgoal.agentId), adj, state, level, agentColor));
+                            state.getAgentPosition(subgoal.agentId), adj, state, level,
+                            agentColor, boxPos));
                     List<Integer> agentBlockers = findAgentPathAgentBlockersToAccessCell(
                             state.getAgentPosition(subgoal.agentId), adj, state, level, subgoal.agentId);
                     Collections.reverse(agentBlockers);
@@ -4165,7 +4164,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * boxes as passable only to identify which ones explain the failed access.
      */
     private List<Position> findAgentPathBlockersToAccessCell(Position start, Position target,
-            State state, Level level, Color taskAgentColor) {
+            State state, Level level, Color taskAgentColor, Position targetBoxPos) {
         if (start == null || target == null || level.isWall(target)) return Collections.emptyList();
 
         Queue<Position> queue = new LinkedList<>();
@@ -4193,17 +4192,25 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
         if (!found) return Collections.emptyList();
 
+        List<Position> path = new ArrayList<>();
+        Position pathCell = target;
+        while (pathCell != null) {
+            path.add(pathCell);
+            if (pathCell.equals(start)) break;
+            pathCell = parent.get(pathCell);
+        }
+        Collections.reverse(path);
+
         LinkedHashSet<Position> blockers = new LinkedHashSet<>();
-        Position current = target;
-        while (current != null && !current.equals(start)) {
+        for (Position current : path) {
+            if (current.equals(start) || current.equals(targetBoxPos)) continue;
             Character box = state.getBoxes().get(current);
             if (box != null) {
                 Color boxColor = level.getBoxColor(box);
-                if (boxColor != null && !boxColor.equals(taskAgentColor)) {
+                if (boxColor != null) {
                     blockers.add(current);
                 }
             }
-            current = parent.get(current);
         }
         return new ArrayList<>(blockers);
     }
