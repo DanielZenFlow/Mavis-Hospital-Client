@@ -3538,6 +3538,24 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         ordinaryBlockersAfter = findOrdinaryPathBlockersForTask(
                                 blockedSubgoal, trial, level, allSubgoals);
                         leavesTaskPathBlocked = !ordinaryBlockersAfter.isEmpty();
+                        if (leavesTaskPathBlocked) {
+                            Set<Position> fixedTemps = new HashSet<>(usedTemps);
+                            fixedTemps.add(pTemp);
+                            State clearedTrial = tryClearOrdinaryPathBlockersAfterRelief(
+                                    blockedSubgoal, trial, level, fullPlan, numAgents,
+                                    allSubgoals, fixedTemps, usedTemps);
+                            if (clearedTrial != trial) {
+                                trial = clearedTrial;
+                                atTemp = trial.getBoxes().get(pTemp);
+                                blockerCountAfter = findAccessBlockersForTask(
+                                        blockedSubgoal, trial, level, allSubgoals).size();
+                                movedBlocker = atTemp != null && atTemp == blockerType
+                                        && !trial.getBoxes().containsKey(blockerPos);
+                                ordinaryBlockersAfter = findOrdinaryPathBlockersForTask(
+                                        blockedSubgoal, trial, level, allSubgoals);
+                                leavesTaskPathBlocked = !ordinaryBlockersAfter.isEmpty();
+                            }
+                        }
                     }
 
                     if (movedBlocker && (madeTaskProgress || madeAccessProgress)
@@ -4823,6 +4841,117 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         return best;
+    }
+
+    private State tryClearOrdinaryPathBlockersAfterRelief(Subgoal subgoal, State state, Level level,
+                                                          List<Action[]> fullPlan, int numAgents,
+                                                          List<Subgoal> allSubgoals,
+                                                          Set<Position> fixedTemps,
+                                                          Set<Position> usedTemps) {
+        State current = state;
+        for (int pass = 0; pass < 3; pass++) {
+            Set<Position> dangerZone = taskPathDangerZoneForTask(subgoal, current, level, allSubgoals);
+            if (dangerZone.isEmpty()) return current;
+
+            List<Position> blockers = findOrdinaryPathBlockersForTask(subgoal, current, level, allSubgoals);
+            if (blockers.isEmpty()) return current;
+
+            boolean clearedOne = false;
+            for (Position blockerPos : blockers) {
+                if (fixedTemps.contains(blockerPos)) continue;
+
+                Character blockerType = current.getBoxes().get(blockerPos);
+                if (blockerType == null) continue;
+
+                int helper = findHelperAgentForBox(blockerType, current, level, blockerPos);
+                if (helper < 0) continue;
+
+                List<Position> parkingCandidates = findTaskReliefParkingCandidates(
+                        blockerPos, current, level, dangerZone, usedTemps);
+                int reliefBudget = Math.min(effectiveMaxBspBudget * 2,
+                        Math.max(SearchConfig.MIN_BSP_BUDGET * 4,
+                                computeDynamicBspBudget(blockerPos, subgoal.goalPos) * 2));
+                Set<Position> unfreeze = new HashSet<>();
+                unfreeze.add(blockerPos);
+
+                for (Position pTemp : parkingCandidates) {
+                    if (fixedTemps.contains(pTemp)) continue;
+
+                    int planSizeBefore = fullPlan.size();
+                    int timeBefore = globalTimeStep;
+                    Set<Position> protectedPositions = new HashSet<>(dangerZone);
+                    protectedPositions.addAll(fixedTemps);
+
+                    List<Action> clearPath = boxSearchPlanner.planBoxDisplacementWithUnfreeze(
+                            helper, blockerPos, pTemp, blockerType, current, level,
+                            unfreeze, reliefBudget, protectedPositions);
+                    if (clearPath == null || clearPath.isEmpty()) {
+                        continue;
+                    }
+
+                    State trial = appendReliefPath(clearPath, helper, current, level, fullPlan, numAgents);
+                    List<Position> afterBlockers = findOrdinaryPathBlockersForTask(
+                            subgoal, trial, level, allSubgoals);
+                    if (afterBlockers.size() < blockers.size()) {
+                        logVerbose("[PP][TASK-RELIEF] cleared ordinary blocker "
+                                + blockerType + " " + blockerPos + " -> " + pTemp
+                                + " for " + subgoalLabel(subgoal));
+                        usedTemps.add(blockerPos);
+                        usedTemps.add(pTemp);
+                        current = trial;
+                        clearedOne = true;
+                        break;
+                    }
+
+                    rollbackPlanTo(fullPlan, planSizeBefore);
+                    globalTimeStep = timeBefore;
+                    planMerger.clearAllPlans();
+                    storedPlanSubgoals.clear();
+                }
+
+                if (clearedOne) break;
+            }
+
+            if (!clearedOne) return current;
+        }
+        return current;
+    }
+
+    private Set<Position> taskPathDangerZoneForTask(Subgoal subgoal, State state, Level level,
+                                                    List<Subgoal> allSubgoals) {
+        if (subgoal == null || subgoal.isAgentGoal || subgoal.boxType == '\0') {
+            return Collections.emptySet();
+        }
+
+        Position boxPos = subgoalManager.findBestBoxForGoal(
+                subgoal, state, level, allSubgoals, completedBoxGoals);
+        if (boxPos == null) {
+            boxPos = nearestStaticBoxForSubgoal(subgoal, state, level);
+        }
+        if (boxPos == null) return Collections.emptySet();
+
+        Set<Position> protectedGoals = new HashSet<>(completedBoxGoals);
+        protectedGoals.remove(boxPos);
+        protectedGoals.remove(subgoal.goalPos);
+        List<Position> idealPath = pathAnalyzer.findPathIgnoringDynamicObstacles(
+                boxPos, subgoal.goalPos, level, protectedGoals);
+        if (idealPath == null) {
+            idealPath = pathAnalyzer.findPathIgnoringDynamicObstacles(boxPos, subgoal.goalPos, level);
+        }
+        if (idealPath == null || idealPath.isEmpty()) return Collections.emptySet();
+
+        Set<Position> dangerZone = new HashSet<>(idealPath);
+        for (int i = 0; i < idealPath.size() - 1; i++) {
+            Position from = idealPath.get(i);
+            Position to = idealPath.get(i + 1);
+            int dr = to.row - from.row;
+            int dc = to.col - from.col;
+            Position agentPush = new Position(from.row - dr, from.col - dc);
+            if (!level.isWall(agentPush)) {
+                dangerZone.add(agentPush);
+            }
+        }
+        return dangerZone;
     }
 
     private Map<Position, Integer> staticDistancesFrom(Position start, Level level) {
