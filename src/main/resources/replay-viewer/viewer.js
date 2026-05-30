@@ -2775,6 +2775,29 @@ function packTimelineLanes(items) {
   return { placed, laneCount: Math.max(1, laneRight.length) };
 }
 
+function alignFinalTimelineEdges(taskPack, stagePack, maxStep) {
+  const finalRight = Math.max(
+    0,
+    ...taskPack.placed
+      .filter(item => item.band?.end >= maxStep)
+      .map(item => item.left + item.width),
+    ...stagePack.placed
+      .filter(item => item.segment?.end >= maxStep)
+      .map(item => item.left + item.width)
+  );
+  if (!finalRight) return;
+  for (const item of taskPack.placed) {
+    if (item.band?.end >= maxStep) {
+      item.width = Math.max(item.width, finalRight - item.left);
+    }
+  }
+  for (const item of stagePack.placed) {
+    if (item.segment?.end >= maxStep) {
+      item.width = Math.max(item.width, finalRight - item.left);
+    }
+  }
+}
+
 // Pick a "nice" tick interval (1/2/5 x 10^n) so the ruler shows ~one label per 90px.
 function niceTimelineTick(maxStep, canvasWidth) {
   const targetTicks = Math.max(2, Math.min(14, Math.floor(canvasWidth / 90)));
@@ -2912,7 +2935,7 @@ function renderTimelineMap(segments, options = {}) {
   header.innerHTML = `
     <div class="timelineMapTitle">
       <strong>Primary task: ${escapeHtml(currentTask ? currentTask.displayLabel : 'none')}</strong>
-      <span>drag to pan | click a bar for details</span>
+      <span>upper lane: primary tasks | lower lane: lifecycle stages | drag to pan</span>
     </div>
   `;
   if (includeHeader && !compact) {
@@ -2941,13 +2964,14 @@ function renderTimelineMap(segments, options = {}) {
   // Time-proportional horizontal scale with a readable minimum bar width.
   // Bars are sized by real duration; the canvas grows wider than the viewport so
   // it scrolls instead of cramming every stage into one fixed width.
-  const MIN_BAR_PX = compact ? 36 : 56;
-  const TASK_LANE_H = compact ? 17 : 21;
-  const STAGE_LANE_H = compact ? 22 : 26;
+  const MIN_BAR_PX = compact ? 34 : 50;
+  const MIN_TASK_BAR_PX = compact ? 120 : 180;
+  const TASK_LANE_H = compact ? 24 : 32;
+  const STAGE_LANE_H = compact ? 16 : 20;
   const RULER_H = compact ? 18 : 22;
   const viewportW = Math.max(compact ? 220 : 280, ((compact ? els.miniTimelineBody : els.agentTimeline)?.clientWidth || 440) - 18);
   const avgDur = Math.max(1, (maxStep + 1) / segments.length);
-  const basePxPerStep = clamp(MIN_BAR_PX / avgDur, 0.5, 16);
+  const basePxPerStep = clamp((compact ? MIN_BAR_PX : MIN_BAR_PX * 1.35) / avgDur, compact ? 0.5 : 0.85, 16);
   const timeWidth = Math.max(viewportW, Math.round((maxStep + 1) * basePxPerStep));
   const pxPerStep = timeWidth / (maxStep + 1);
   const leftOf = start => start * pxPerStep;
@@ -2958,15 +2982,22 @@ function renderTimelineMap(segments, options = {}) {
   const widthOf = (start, end, minWidth = MIN_BAR_PX) =>
     Math.max((end - start + 1) * pxPerStep, minWidth);
   const taskBands = primaryTaskBandsForTimeline(segments);
-  const minWidthForTaskLabel = label => Math.max(
-    compact ? 58 : 80,
-    Math.ceil((compact ? 24 : 34) + String(label || '').length * (compact ? 4.6 : 6.1))
+  const minWidthForTaskLabel = (label, txText = '') => Math.max(
+    MIN_TASK_BAR_PX,
+    Math.ceil((compact ? 28 : 44) + String(label || '').length * (compact ? 5.8 : 7.4) + String(txText || '').length * (compact ? 5.2 : 6.3))
   );
   const taskPack = packTimelineLanes(taskBands.map((band, index) => ({
     band,
     index,
     left: leftOf(band.start),
-    width: widthOf(band.start, band.end, minWidthForTaskLabel(band.displayLabel)),
+    width: widthOf(
+      band.start,
+      band.end,
+      minWidthForTaskLabel(
+        band.displayLabel,
+        band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : ''
+      )
+    ),
   })));
   const stagePack = packTimelineLanes(segments.map((segment, index) => ({
     segment,
@@ -2974,6 +3005,7 @@ function renderTimelineMap(segments, options = {}) {
     left: leftOf(segment.start),
     width: widthOf(segment.start, segment.end, minWidthForLabel(segment.label, index + 1)),
   })));
+  alignFinalTimelineEdges(taskPack, stagePack, maxStep);
 
   const taskFieldH = taskBands.length ? taskPack.laneCount * TASK_LANE_H + 5 : 0;
   const fieldH = stagePack.laneCount * STAGE_LANE_H + 6;
@@ -3028,15 +3060,6 @@ function renderTimelineMap(segments, options = {}) {
       <span class="taskLabel">${escapeHtml(band.displayLabel)}</span>
       <span class="taskTxList">${escapeHtml(txText)}</span>
     `;
-    const duration = Math.max(1, band.end - band.start + 1);
-    for (const tx of band.transactions) {
-      const marker = document.createElement('span');
-      marker.className = `timelineTaskTxMarker ${transactionStatusClass(tx)}`;
-      const markerStep = clamp(tx.planEndStep ?? tx.step ?? band.end, band.start, band.end);
-      marker.style.left = `${clamp(((markerStep - band.start + 0.5) / duration) * 100, 0, 100)}%`;
-      marker.title = `${tx.transactionId} ${tx.commitStatus} at step ${markerStep}${tx.reason ? ` | ${tx.reason}` : ''}`;
-      bar.appendChild(marker);
-    }
     taskField.appendChild(bar);
   }
 
@@ -3068,8 +3091,9 @@ function renderTimelineMap(segments, options = {}) {
 
   const now = document.createElement('span');
   now.className = 'timelineGanttNow';
+  const shouldAlignCurrentEnd = alignCurrentEnd || step >= maxStep;
   let nowLeft = leftOf(clamp(step, 0, maxStep));
-  if (alignCurrentEnd) {
+  if (shouldAlignCurrentEnd) {
     const currentStage = [...stagePack.placed]
       .reverse()
       .find(item => step >= item.segment.start && step <= item.segment.end)
@@ -3096,7 +3120,7 @@ function renderTimelineMap(segments, options = {}) {
     mini: compact,
     followCurrent,
     lockCurrent,
-    alignCurrentEnd,
+    alignCurrentEnd: shouldAlignCurrentEnd,
     restoreLeft: compact ? miniTimelineScrollLeft : timelineScrollLeft,
   });
   if (includeHeader) gantt.appendChild(header);
