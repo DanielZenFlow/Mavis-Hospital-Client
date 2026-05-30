@@ -2636,12 +2636,6 @@ h2 {
   outline: none;
   border-color: #b59a4a;
 }
-.fontSettingHint {
-  grid-column: 1 / -1;
-  color: var(--text-muted);
-  font-size: var(--ui-font-size-sm);
-  line-height: 1.25;
-}
 .helpContent {
   display: flex;
   flex-direction: column;
@@ -2848,7 +2842,6 @@ h2 {
 .versionText,
 .metaRunHint,
 .miniInfo,
-.fontSettingHint,
 .searchExamples button,
 .timelineSegment span,
 .timelineSegment small,
@@ -2874,18 +2867,24 @@ h2 {
   font-size: var(--ui-font-size-md);
 }
 
-.metaHoverCard strong,
 .timelineDialog .timelineDebugIssueHeader strong {
   font-size: var(--ui-font-size-sm);
 }
 
-.metaHoverCard dt,
-.metaHoverCard dd,
 .timelineDialog .timelineDebugIssueHeader span,
 .timelineDialog .timelineDebugIssue dt,
 .timelineDialog .timelineDebugIssue dd,
 .timelineDialog .timelineDebugHealth > strong {
   font-size: var(--ui-font-size-xs);
+}
+
+.meta,
+.metaRunHint,
+.metaHoverCard,
+.metaHoverCard strong,
+.metaHoverCard dt,
+.metaHoverCard dd {
+  font-size: var(--ui-font-size);
 }
 
 .timelineDialog .timelineDebugHealth p {
