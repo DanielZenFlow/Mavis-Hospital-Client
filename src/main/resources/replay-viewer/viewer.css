@@ -744,12 +744,12 @@ button:disabled {
   gap: 10px;
 }
 .timelineDebugIssueHeader strong {
-  font-size: max(8px, calc(var(--log-font-size) - 2px));
+  font-size: var(--ui-font-size-sm);
 }
 .timelineDebugIssueHeader span {
   min-width: 0;
   color: var(--text-muted);
-  font-size: max(7px, calc(var(--log-font-size) - 3px));
+  font-size: var(--ui-font-size-xs);
   font-weight: 800;
   overflow-wrap: anywhere;
   text-align: right;
@@ -762,29 +762,29 @@ button:disabled {
 }
 .timelineDebugIssue dt {
   color: var(--text-soft);
-  font-size: max(7px, calc(var(--log-font-size) - 3px));
+  font-size: var(--ui-font-size-xs);
   font-weight: 800;
 }
 .timelineDebugIssue dd {
   margin: 0;
   min-width: 0;
   color: var(--text);
-  font-size: max(7px, calc(var(--log-font-size) - 3px));
+  font-size: var(--ui-font-size-xs);
   overflow-wrap: anywhere;
 }
 .timelineDebugHealth p {
   margin: 0;
   color: var(--text-muted);
-  font-size: max(7px, calc(var(--log-font-size) - 4px));
+  font-size: var(--ui-font-size-xxs);
   line-height: 1.3;
 }
 .timelineDialog .timelineDebugHealth p {
   margin: 0;
-  font-size: max(7px, calc(var(--log-font-size) - 4px));
+  font-size: var(--ui-font-size-xxs);
 }
 .timelineDebugHealth > strong {
   color: var(--text-soft);
-  font-size: max(7px, calc(var(--log-font-size) - 3px));
+  font-size: var(--ui-font-size-xs);
 }
 .timelinePortfolioCard {
   align-content: start;
@@ -2636,6 +2636,12 @@ h2 {
   outline: none;
   border-color: #b59a4a;
 }
+.fontSettingHint {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: var(--ui-font-size-sm);
+  line-height: 1.25;
+}
 .helpContent {
   display: flex;
   flex-direction: column;
@@ -2842,6 +2848,7 @@ h2 {
 .versionText,
 .metaRunHint,
 .miniInfo,
+.fontSettingHint,
 .searchExamples button,
 .timelineSegment span,
 .timelineSegment small,
@@ -2865,6 +2872,24 @@ h2 {
 .portfolioRow strong,
 .timelineRulerTick {
   font-size: var(--ui-font-size-md);
+}
+
+.metaHoverCard strong,
+.timelineDialog .timelineDebugIssueHeader strong {
+  font-size: var(--ui-font-size-sm);
+}
+
+.metaHoverCard dt,
+.metaHoverCard dd,
+.timelineDialog .timelineDebugIssueHeader span,
+.timelineDialog .timelineDebugIssue dt,
+.timelineDialog .timelineDebugIssue dd,
+.timelineDialog .timelineDebugHealth > strong {
+  font-size: var(--ui-font-size-xs);
+}
+
+.timelineDialog .timelineDebugHealth p {
+  font-size: var(--ui-font-size-xxs);
 }
 
 body :where(button, label, a, strong, small, span, p, dt, dd, h1, h2, h3, h4, li) {

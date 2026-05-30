@@ -55,8 +55,8 @@ const MARKERS_STORAGE_PREFIX = 'aims-replay-viewer:markers:';
 const SUPPORTED_REPLAY_SCHEMA = 'mavis-hospital-replay-v1';
 const DEFAULT_UI_FONT_SIZE = 12;
 const DEFAULT_LOG_FONT_SIZE = 11;
-const MIN_UI_FONT_SIZE = 9;
-const MAX_UI_FONT_SIZE = 24;
+const MIN_UI_FONT_SIZE = 8;
+const MAX_UI_FONT_SIZE = 20;
 const MIN_LOG_FONT_SIZE = 8;
 const MAX_LOG_FONT_SIZE = 24;
 const DEFAULT_AGENT_PANEL_HEIGHT = 260;
@@ -677,8 +677,8 @@ function initNotifications() {
 }
 
 function initFontSettings() {
-  const savedUi = localStorageAvailable() ? Number(localStorage.getItem(FONT_SIZE_STORAGE_KEY)) : NaN;
-  const savedLog = localStorageAvailable() ? Number(localStorage.getItem(LOG_FONT_SIZE_STORAGE_KEY)) : NaN;
+  const savedUi = storedFontSize(FONT_SIZE_STORAGE_KEY);
+  const savedLog = storedFontSize(LOG_FONT_SIZE_STORAGE_KEY);
   const uiSize = clampUIFontSize(Number.isFinite(savedUi) ? savedUi : DEFAULT_UI_FONT_SIZE);
   const logSize = clampLogFontSize(Number.isFinite(savedLog) ? savedLog : DEFAULT_LOG_FONT_SIZE);
   applyUIFontSize(uiSize);
@@ -703,6 +703,13 @@ function initFontSettings() {
     els.logFontSizeInput.value = String(next);
     applyLogFontSize(next);
   });
+}
+
+function storedFontSize(key) {
+  if (!localStorageAvailable()) return NaN;
+  const raw = localStorage.getItem(key);
+  if (raw == null || raw === '') return NaN;
+  return Number(raw);
 }
 
 function showFontSettingsDialog() {
@@ -3071,6 +3078,10 @@ function renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, 
   if (selectedSegment) {
     const primaryAgentId = lifecyclePrimaryAgentId(selectedSegment);
     const selectionLabel = timelineSelectionKind === 'stage' ? 'Selected Stage' : 'Current Stage';
+    const supportSummary = timelineSupportSummaryText(timelineSupportRollup(selectedSegment));
+    const supportRow = supportSummary
+      ? `<dt>Support</dt><dd>${escapeHtml(supportSummary)}</dd>`
+      : '';
     section.innerHTML = `
       <div class="timelineSelectionHeader">
         <div>
@@ -3084,6 +3095,7 @@ function renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, 
         <dt>Subgoal</dt><dd>${escapeHtml(selectedSegment.subgoal || 'none')}</dd>
         <dt>Actions</dt><dd>${escapeHtml(joinSet(selectedSegment.actionFamilies) || 'NoOp')}</dd>
         <dt>Signals</dt><dd>${escapeHtml(selectedSegment.debugReasons.join(', ') || 'ordinary execution')}</dd>
+        ${supportRow}
       </dl>
       ${timelineSelectionEventsHtml(selectedSegment)}
     `;
@@ -3515,6 +3527,7 @@ function lifecycleDetailCard(segment, ordinal) {
   const primaryAgentId = lifecyclePrimaryAgentId(segment);
   const nativeTransaction = timelineNativeTransaction(segment);
   const candidateSummary = timelineMetaCandidateSummary(segment);
+  const supportSummary = timelineSupportSummaryText(timelineSupportRollup(segment));
   card.innerHTML = `
     <div class="timelineDetailHeader">
       <strong>Stage ${ordinal}</strong>
@@ -3534,6 +3547,7 @@ function lifecycleDetailCard(segment, ordinal) {
       <dt>Reasons</dt><dd>${escapeHtml(joinSet(segment.reasons || new Set()) || 'none')}</dd>
       <dt>Transaction</dt><dd>${escapeHtml(timelineTransactionSummaryText(nativeTransaction))}</dd>
       <dt>Candidates</dt><dd>${escapeHtml(timelineCandidateSummaryText(candidateSummary))}</dd>
+      <dt>Support</dt><dd>${escapeHtml(supportSummary || 'none')}</dd>
       <dt>Rejected</dt><dd>${segment.rejectedCount}</dd>
       <dt>Children</dt><dd>${segment.eventCount || 0} decision / ${segment.intentCount || 0} intent</dd>
     </dl>
@@ -3564,6 +3578,27 @@ function timelineCandidateSummaryText(candidates) {
   const selected = candidates.find(item => item.selectedBox || item.hungarianAssignedBox);
   const selectedText = selected ? ` | box ${selected.selectedBox || selected.hungarianAssignedBox}` : '';
   return `${candidates.length} summary${candidates.length === 1 ? '' : 'ies'} | ${verdictText}${selectedText}`;
+}
+
+function timelineSupportSummaryText(rollup) {
+  if (!rollup) return '';
+  const range = rollup.firstStep != null && rollup.lastStep != null
+    ? `steps ${rollup.firstStep}-${rollup.lastStep}`
+    : '';
+  const supportKinds = (rollup.supportKinds || [])
+    .map(item => `${item.key}${item.count > 1 ? `:${item.count}` : ''}`)
+    .join(', ');
+  const owners = (rollup.ownerAgents || []).join(', ');
+  const executors = (rollup.executorAgents || []).join(', ');
+  const parts = [
+    `${rollup.stepCount} support step${rollup.stepCount === 1 ? '' : 's'}`,
+    range,
+    owners ? `owner ${owners}` : '',
+    executors ? `executor ${executors}` : '',
+    supportKinds,
+    rollup.movedBoxSteps ? `${rollup.movedBoxSteps} box-moving step${rollup.movedBoxSteps === 1 ? '' : 's'}` : '',
+  ].filter(Boolean);
+  return parts.join(' | ');
 }
 
 function lifecycleSegmentColor(segment) {
