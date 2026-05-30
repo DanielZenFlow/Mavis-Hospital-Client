@@ -987,8 +987,10 @@ button:disabled {
   height: 24px;
   gap: 7px;
   padding: 0 8px;
-  background: #d9ded0;
-  color: #253021;
+  overflow: visible;
+  background: #d3d8e8;
+  color: #1f2a3a;
+  box-shadow: inset 0 0 0 1px rgba(49, 62, 92, 0.2);
 }
 .timelineStageBar {
   height: 18px;
@@ -1010,6 +1012,16 @@ button:disabled {
 .timelinePrimaryTaskBar.danger,
 .timelineStageBar.danger {
   background: #d8a19a;
+}
+.timelinePrimaryTaskBar.success {
+  background: #c8d8ea;
+}
+.timelinePrimaryTaskBar.warning,
+.timelinePrimaryTaskBar.note {
+  background: #d9d1ec;
+}
+.timelinePrimaryTaskBar.danger {
+  background: #ddb0aa;
 }
 .timelineStageBar.hotspot {
   box-shadow: inset 0 0 0 2px rgba(209, 164, 75, 0.7);
@@ -1065,9 +1077,9 @@ button:disabled {
 .timelinePrimaryTaskBar .taskLabel {
   position: relative;
   z-index: 1;
-  flex: 1 0 auto;
+  flex: 0 0 auto;
   min-width: max-content;
-  color: #1f281d;
+  color: #1f2a3a;
   font-size: 11px;
   font-weight: 800;
   line-height: 1;
@@ -1080,7 +1092,7 @@ button:disabled {
   z-index: 1;
   flex: 0 0 auto;
   margin-left: auto;
-  color: rgba(31, 40, 29, 0.72);
+  color: rgba(31, 42, 58, 0.74);
   font-size: 8px;
   font-weight: 800;
   line-height: 1;

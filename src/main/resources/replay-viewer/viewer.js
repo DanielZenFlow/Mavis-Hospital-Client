@@ -2767,9 +2767,10 @@ function packTimelineLanes(items) {
     .map((item, i) => ({ ...item, _order: i }))
     .sort((a, b) => a.left - b.left || a._order - b._order)
     .map(item => {
+      const packWidth = Number.isFinite(item.packWidth) ? item.packWidth : item.width;
       let lane = laneRight.findIndex(right => right <= item.left - 2);
       if (lane === -1) { lane = laneRight.length; laneRight.push(0); }
-      laneRight[lane] = item.left + item.width + 4;
+      laneRight[lane] = item.left + packWidth + 4;
       return { ...item, lane };
     });
   return { placed, laneCount: Math.max(1, laneRight.length) };
@@ -2971,7 +2972,22 @@ function renderTimelineMap(segments, options = {}) {
   const RULER_H = compact ? 18 : 22;
   const viewportW = Math.max(compact ? 220 : 280, ((compact ? els.miniTimelineBody : els.agentTimeline)?.clientWidth || 440) - 18);
   const avgDur = Math.max(1, (maxStep + 1) / segments.length);
-  const basePxPerStep = clamp((compact ? MIN_BAR_PX : MIN_BAR_PX * 1.35) / avgDur, compact ? 0.5 : 0.85, 16);
+  const taskBands = primaryTaskBandsForTimeline(segments);
+  const taskLabelWidth = (label, txText = '') => Math.ceil(
+    compact
+      ? 28 + String(label || '').length * 5.8 + String(txText || '').length * 5.2
+      : 44 + String(label || '').length * 7.4 + String(txText || '').length * 6.3
+  );
+  const taskScalePxPerStep = taskBands.reduce((best, band) => {
+    const duration = Math.max(1, band.end - band.start + 1);
+    if (duration < (compact ? 14 : 8)) return best;
+    const txText = band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : '';
+    return Math.max(best, taskLabelWidth(band.displayLabel, txText) / duration);
+  }, 0);
+  const basePxPerStep = Math.max(
+    clamp((compact ? MIN_BAR_PX : MIN_BAR_PX * 1.35) / avgDur, compact ? 0.5 : 0.85, 16),
+    clamp(taskScalePxPerStep, 0, compact ? 8 : 14)
+  );
   const timeWidth = Math.max(viewportW, Math.round((maxStep + 1) * basePxPerStep));
   const pxPerStep = timeWidth / (maxStep + 1);
   const leftOf = start => start * pxPerStep;
@@ -2981,22 +2997,18 @@ function renderTimelineMap(segments, options = {}) {
   );
   const widthOf = (start, end, minWidth = MIN_BAR_PX) =>
     Math.max((end - start + 1) * pxPerStep, minWidth);
-  const taskBands = primaryTaskBandsForTimeline(segments);
-  const minWidthForTaskLabel = (label, txText = '') => Math.max(
-    MIN_TASK_BAR_PX,
-    Math.ceil((compact ? 28 : 44) + String(label || '').length * (compact ? 5.8 : 7.4) + String(txText || '').length * (compact ? 5.2 : 6.3))
-  );
   const taskPack = packTimelineLanes(taskBands.map((band, index) => ({
     band,
     index,
     left: leftOf(band.start),
-    width: widthOf(
-      band.start,
-      band.end,
-      minWidthForTaskLabel(
+    width: (band.end - band.start + 1) * pxPerStep,
+    packWidth: Math.max(
+      (band.end - band.start + 1) * pxPerStep,
+      taskLabelWidth(
         band.displayLabel,
         band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : ''
-      )
+      ),
+      MIN_TASK_BAR_PX
     ),
   })));
   const stagePack = packTimelineLanes(segments.map((segment, index) => ({
@@ -3011,7 +3023,7 @@ function renderTimelineMap(segments, options = {}) {
   const fieldH = stagePack.laneCount * STAGE_LANE_H + 6;
   const canvasWidth = Math.ceil(Math.max(
     timeWidth,
-    ...taskPack.placed.map(item => item.left + item.width),
+    ...taskPack.placed.map(item => item.left + Math.max(item.width, item.packWidth || 0)),
     ...stagePack.placed.map(item => item.left + item.width),
   ));
   const canvasHeight = RULER_H + taskFieldH + fieldH;
