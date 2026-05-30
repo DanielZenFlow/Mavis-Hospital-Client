@@ -24,6 +24,7 @@ let tutorialStepIndex = 0;
 let indexedReplayEvents = new Map();
 let indexedReplayEventTotal = 0;
 let indexedDerivedActionEventTotal = 0;
+let primaryTaskContextCache = null;
 let focusedAgentId = null;
 let lockViewEnabled = true;
 let agentPanelHeight = 260;
@@ -1114,6 +1115,7 @@ function loadReplayData(data, options = {}) {
   stopPlay();
   replay = data;
   indexReplayEvents();
+  primaryTaskContextCache = null;
   step = 0;
   timelineMode = 'overview';
   timelineScrollLeft = 0;
@@ -1811,6 +1813,7 @@ function exportTimelineMetaJson() {
     portfolio,
     lifecycle: {
       spanCount: spans.length,
+      primaryTasks: primaryTaskBandsForTimeline(spans).map(timelineMetaPrimaryTaskBand),
       spans: spans.map((span, index) => timelineMetaSpan(span, index, spans)),
     },
   };
@@ -2902,11 +2905,13 @@ function renderTimelineMap(segments, options = {}) {
     return gantt;
   }
   const maxStep = Math.max(1, replay.frames.length - 1);
+  const currentTask = primaryTaskForStep(step);
 
   const header = document.createElement('div');
   header.className = 'timelineMapHeader';
   header.innerHTML = `
     <div class="timelineMapTitle">
+      <strong>Primary task: ${escapeHtml(currentTask ? currentTask.displayLabel : 'none')}</strong>
       <span>drag to pan | click a bar for details</span>
     </div>
   `;
@@ -2937,6 +2942,7 @@ function renderTimelineMap(segments, options = {}) {
   // Bars are sized by real duration; the canvas grows wider than the viewport so
   // it scrolls instead of cramming every stage into one fixed width.
   const MIN_BAR_PX = compact ? 36 : 56;
+  const TASK_LANE_H = compact ? 17 : 21;
   const STAGE_LANE_H = compact ? 22 : 26;
   const RULER_H = compact ? 18 : 22;
   const viewportW = Math.max(compact ? 220 : 280, ((compact ? els.miniTimelineBody : els.agentTimeline)?.clientWidth || 440) - 18);
@@ -2951,6 +2957,17 @@ function renderTimelineMap(segments, options = {}) {
   );
   const widthOf = (start, end, minWidth = MIN_BAR_PX) =>
     Math.max((end - start + 1) * pxPerStep, minWidth);
+  const taskBands = primaryTaskBandsForTimeline(segments);
+  const minWidthForTaskLabel = label => Math.max(
+    compact ? 58 : 80,
+    Math.ceil((compact ? 24 : 34) + String(label || '').length * (compact ? 4.6 : 6.1))
+  );
+  const taskPack = packTimelineLanes(taskBands.map((band, index) => ({
+    band,
+    index,
+    left: leftOf(band.start),
+    width: widthOf(band.start, band.end, minWidthForTaskLabel(band.displayLabel)),
+  })));
   const stagePack = packTimelineLanes(segments.map((segment, index) => ({
     segment,
     index,
@@ -2958,12 +2975,14 @@ function renderTimelineMap(segments, options = {}) {
     width: widthOf(segment.start, segment.end, minWidthForLabel(segment.label, index + 1)),
   })));
 
+  const taskFieldH = taskBands.length ? taskPack.laneCount * TASK_LANE_H + 5 : 0;
   const fieldH = stagePack.laneCount * STAGE_LANE_H + 6;
   const canvasWidth = Math.ceil(Math.max(
     timeWidth,
+    ...taskPack.placed.map(item => item.left + item.width),
     ...stagePack.placed.map(item => item.left + item.width),
   ));
-  const canvasHeight = RULER_H + fieldH;
+  const canvasHeight = RULER_H + taskFieldH + fieldH;
 
   const scroll = document.createElement('div');
   scroll.className = 'timelineScroll';
@@ -2984,6 +3003,43 @@ function renderTimelineMap(segments, options = {}) {
     ruler.appendChild(tick);
   }
 
+  const taskField = document.createElement('div');
+  taskField.className = 'timelinePrimaryTaskField';
+  taskField.style.height = `${taskFieldH}px`;
+  taskField.setAttribute('aria-label', 'Primary tasks');
+  for (const item of taskPack.placed) {
+    const band = item.band;
+    const bar = document.createElement('button');
+    bar.type = 'button';
+    bar.className = `timelinePrimaryTaskBar ${band.statusClass || 'note'}`;
+    if (step >= band.start && step <= band.end) bar.classList.add('active');
+    bar.dataset.step = String(band.start);
+    bar.dataset.segmentStart = String(band.start);
+    bar.dataset.segmentEnd = String(band.end);
+    const txText = band.transactions.length
+      ? band.transactions.map(tx => tx.transactionId).join('/')
+      : 'no tx';
+    bar.title = `${band.displayLabel} (${band.start}-${band.end}) | ${txText}`;
+    bar.setAttribute('aria-label', bar.title);
+    bar.style.left = `${item.left}px`;
+    bar.style.width = `${item.width}px`;
+    bar.style.top = `${item.lane * TASK_LANE_H + 2}px`;
+    bar.innerHTML = `
+      <span class="taskLabel">${escapeHtml(band.displayLabel)}</span>
+      <span class="taskTxList">${escapeHtml(txText)}</span>
+    `;
+    const duration = Math.max(1, band.end - band.start + 1);
+    for (const tx of band.transactions) {
+      const marker = document.createElement('span');
+      marker.className = `timelineTaskTxMarker ${transactionStatusClass(tx)}`;
+      const markerStep = clamp(tx.planEndStep ?? tx.step ?? band.end, band.start, band.end);
+      marker.style.left = `${clamp(((markerStep - band.start + 0.5) / duration) * 100, 0, 100)}%`;
+      marker.title = `${tx.transactionId} ${tx.commitStatus} at step ${markerStep}${tx.reason ? ` | ${tx.reason}` : ''}`;
+      bar.appendChild(marker);
+    }
+    taskField.appendChild(bar);
+  }
+
   const field = document.createElement('div');
   field.className = 'timelineStageField';
   field.style.height = `${fieldH}px`;
@@ -2997,7 +3053,7 @@ function renderTimelineMap(segments, options = {}) {
     if (item.index === lifecycleSelection) bar.classList.add('active');
     if (markersInRange(segment.start, segment.end).length > 0) bar.classList.add('marked');
     bar.dataset.lifecycleIndex = String(item.index);
-    bar.title = `Stage ${item.index + 1}: ${segment.label} (${segmentRangeText(segment)})`;
+    bar.title = `Stage ${item.index + 1}: ${segment.label} (${segmentRangeText(segment)})${segment.primaryTask ? ` | Primary ${segment.primaryTask.displayLabel}` : ''}`;
     bar.setAttribute('aria-label', bar.title);
     bar.style.left = `${item.left}px`;
     bar.style.width = `${item.width}px`;
@@ -3023,14 +3079,16 @@ function renderTimelineMap(segments, options = {}) {
   now.style.left = `${Math.min(nowLeft, canvasWidth)}px`;
   now.title = `current step ${step}`;
 
-  canvas.append(ruler, field, now);
+  canvas.append(ruler);
+  if (taskBands.length) canvas.appendChild(taskField);
+  canvas.append(field, now);
   scroll.appendChild(canvas);
 
   const footer = document.createElement('div');
   footer.className = 'timelineGanttFooter';
   footer.innerHTML = `
     <span>step 0</span>
-    <strong>${escapeHtml(String(segments.length))} lifecycle stages</strong>
+    <strong>${escapeHtml(String(taskBands.length))} primary task${taskBands.length === 1 ? '' : 's'} | ${escapeHtml(String(segments.length))} lifecycle stages</strong>
     <span>step ${escapeHtml(String(maxStep))}</span>
   `;
 
@@ -3078,19 +3136,30 @@ function renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, 
   if (selectedSegment) {
     const primaryAgentId = lifecyclePrimaryAgentId(selectedSegment);
     const selectionLabel = timelineSelectionKind === 'stage' ? 'Selected Stage' : 'Current Stage';
+    const primaryTask = selectedSegment.primaryTask;
     const supportSummary = timelineSupportSummaryText(timelineSupportRollup(selectedSegment));
     const supportRow = supportSummary
       ? `<dt>Support</dt><dd>${escapeHtml(supportSummary)}</dd>`
       : '';
+    const primaryTaskRows = primaryTask ? `
+        <dt>Primary Task</dt><dd>${escapeHtml(primaryTask.displayLabel)}</dd>
+        <dt>Transaction</dt><dd>${escapeHtml(primaryTaskTransactionText(primaryTask))}</dd>
+      ` : `
+        <dt>Primary Task</dt><dd>none recorded</dd>
+        <dt>Transaction</dt><dd>not recorded</dd>
+      `;
     section.innerHTML = `
       <div class="timelineSelectionHeader">
         <div>
           <strong>${selectionLabel} ${selectedSegment.ordinal ?? selectedSegment.segmentIndex + 1}: ${escapeHtml(selectedSegment.label)}</strong>
-          <small>${escapeHtml(segmentRangeText(selectedSegment))} | ${escapeHtml(Number.isInteger(primaryAgentId) ? `agent${primaryAgentId}` : 'mixed agents')}</small>
+          <small>${escapeHtml(segmentRangeText(selectedSegment))} | ${escapeHtml(primaryTask ? primaryTask.displayLabel : (Number.isInteger(primaryAgentId) ? `agent${primaryAgentId}` : 'mixed agents'))}</small>
         </div>
         <span>${escapeHtml(selectedSegment.statusLabel || 'active')}</span>
       </div>
       <dl>
+        ${primaryTaskRows}
+        <dt>Current Stage</dt><dd>${escapeHtml(selectedSegment.label)}</dd>
+        <dt>Executor</dt><dd>${escapeHtml(timelineSegmentExecutorText(selectedSegment))}</dd>
         <dt>Phase</dt><dd>${escapeHtml(joinSet(selectedSegment.phases) || 'execution')}</dd>
         <dt>Subgoal</dt><dd>${escapeHtml(selectedSegment.subgoal || 'none')}</dd>
         <dt>Actions</dt><dd>${escapeHtml(joinSet(selectedSegment.actionFamilies) || 'NoOp')}</dd>
@@ -3136,6 +3205,7 @@ function annotateDebugSegments(segments) {
   const totalFrames = Math.max(1, replay?.frames?.length || 1);
   return segments.map((segment, index) => {
     const annotated = { ...segment, ordinal: index + 1, segmentIndex: index };
+    annotated.primaryTask = primaryTaskForSegment(annotated);
     const score = segmentDebugScore(annotated, index, segments.length, totalFrames);
     annotated.debugScore = score;
     annotated.debugReasons = segmentDebugReasons(annotated, score, totalFrames);
@@ -3343,6 +3413,8 @@ function renderChapterStageNode(segment) {
   const ordinal = segment.ordinal ?? segment.segmentIndex + 1;
   const primaryAgentId = lifecyclePrimaryAgentId(segment);
   const primaryAgentLabel = Number.isInteger(primaryAgentId) ? `A${primaryAgentId}` : 'A-';
+  const taskText = segment.primaryTask ? `Primary ${segment.primaryTask.displayLabel}` : '';
+  const detailText = [taskText, segment.debugReasons.join(' | ') || macroSpanSubtitle(segment)].filter(Boolean).join(' | ');
   const segmentColor = lifecycleSegmentColor(segment);
   const segmentSoftColor = hexToRgba(segmentColor, 0.08);
   const node = document.createElement('div');
@@ -3367,7 +3439,7 @@ function renderChapterStageNode(segment) {
     <span class="timelineEventMeta">Stage ${ordinal}<br>${escapeHtml(segmentRangeText(segment))}</span>
     <span class="timelineEventMain">
       <strong>${escapeHtml(segment.label)}</strong>
-      <small>${escapeHtml(segment.debugReasons.join(' | ') || macroSpanSubtitle(segment))}</small>
+      <small>${escapeHtml(detailText)}</small>
     </span>
     <span class="timelineEventSide">
       <span class="timelineAgentBadge">${escapeHtml(primaryAgentLabel)}</span>
@@ -3525,6 +3597,7 @@ function lifecycleDetailCard(segment, ordinal) {
   const card = document.createElement('article');
   card.className = 'timelineEventDropdown';
   const primaryAgentId = lifecyclePrimaryAgentId(segment);
+  const primaryTask = segment.primaryTask;
   const nativeTransaction = timelineNativeTransaction(segment);
   const candidateSummary = timelineMetaCandidateSummary(segment);
   const supportSummary = timelineSupportSummaryText(timelineSupportRollup(segment));
@@ -3536,6 +3609,9 @@ function lifecycleDetailCard(segment, ordinal) {
     <dl>
       <dt>Macro</dt><dd>${escapeHtml(segment.label)}</dd>
       <dt>Status</dt><dd>${escapeHtml(segment.statusLabel || 'active')}</dd>
+      <dt>Primary Task</dt><dd>${escapeHtml(primaryTask ? primaryTask.displayLabel : 'none recorded')}</dd>
+      <dt>Task Tx</dt><dd>${escapeHtml(primaryTaskTransactionText(primaryTask))}</dd>
+      <dt>Executor</dt><dd>${escapeHtml(timelineSegmentExecutorText(segment))}</dd>
       <dt>Phase</dt><dd>${escapeHtml(joinSet(segment.phases) || 'execution')}</dd>
       <dt>Subgoal</dt><dd>${escapeHtml(segment.subgoal || 'none')}</dd>
       <dt>Subgoal Type</dt><dd>${escapeHtml(joinSet(segment.subgoalTypes) || 'none')}</dd>
@@ -3599,6 +3675,290 @@ function timelineSupportSummaryText(rollup) {
     rollup.movedBoxSteps ? `${rollup.movedBoxSteps} box-moving step${rollup.movedBoxSteps === 1 ? '' : 's'}` : '',
   ].filter(Boolean);
   return parts.join(' | ');
+}
+
+function timelineSegmentExecutorText(segment) {
+  const rollup = timelineSupportRollup(segment);
+  if (rollup?.executorAgents?.length) return rollup.executorAgents.join(', ');
+  const primaryAgentId = lifecyclePrimaryAgentId(segment);
+  if (Number.isInteger(primaryAgentId)) return `agent${primaryAgentId}`;
+  return joinAgents(segment?.agentIds || []) || 'mixed/none';
+}
+
+function primaryTaskContext() {
+  if (primaryTaskContextCache) return primaryTaskContextCache;
+  const transactions = replayPlannerTransactions();
+  const byLabel = new Map();
+  for (const transaction of transactions) {
+    if (!transaction.taskLabel) continue;
+    const bucket = byLabel.get(transaction.taskLabel) || [];
+    bucket.push(transaction);
+    byLabel.set(transaction.taskLabel, bucket);
+  }
+  primaryTaskContextCache = { transactions, byLabel };
+  return primaryTaskContextCache;
+}
+
+function replayPlannerTransactions() {
+  if (!replay?.frames) return [];
+  const transactions = [];
+  for (let i = 0; i < replay.frames.length; i++) {
+    for (const event of stepEvents(replay.frames[i], i)) {
+      const kind = String(event?.kind || event?.type || '').toLowerCase();
+      if (!kind.includes('planner-transaction')) continue;
+      const taskLabel = primaryTaskLabelFromEvent(event, { allowSubgoalFallback: true });
+      const start = numberOrNull(event.planStart) ?? i;
+      const end = numberOrNull(event.planEnd) ?? i;
+      const rawStatus = formatEventValue(event.commitStatus || event.verdict || '');
+      const status = rawStatus ? rawStatus.toLowerCase() : 'transaction';
+      transactions.push({
+        step: i,
+        transactionId: formatEventValue(event.transactionId) || `tx-${transactions.length + 1}`,
+        taskLabel,
+        agentId: eventAgentId(event),
+        ownerAgentId: numberOrNull(event.ownerAgentId),
+        ownerAgent: formatEventValue(event.ownerAgent),
+        boxType: formatEventValue(event.boxType),
+        goal: event.goal ?? null,
+        phase: formatEventValue(event.phase),
+        subgoal: formatEventValue(event.subgoal),
+        planStartStep: Math.min(start, end),
+        planEndStep: Math.max(start, end),
+        planDelta: numberOrNull(event.planDelta),
+        plannedPathSteps: numberOrNull(event.plannedPathSteps),
+        supportKind: formatEventValue(event.supportKind),
+        supportPlanStart: numberOrNull(event.supportPlanStart),
+        supportPlanEnd: numberOrNull(event.supportPlanEnd),
+        satisfiedBoxGoalsAfter: numberOrNull(event.satisfiedBoxGoalsAfter),
+        commitStatus: status,
+        reason: formatEventValue(event.reason || event.rollbackReason),
+        statusClass: lifecycleStatusClass(event),
+        rawEvent: compactMetaEvent(event),
+      });
+    }
+  }
+  return transactions.sort((a, b) =>
+    a.planStartStep - b.planStartStep || a.planEndStep - b.planEndStep || a.transactionId.localeCompare(b.transactionId));
+}
+
+function primaryTaskLabelFromEvent(event, options = {}) {
+  if (!event || typeof event !== 'object') return '';
+  const owner = cleanPrimaryTaskLabel(event.ownerSubgoal || event.primaryTask || event.parentSubgoal);
+  if (owner) return owner;
+  const subgoal = formatEventValue(event.subgoal);
+  const kind = String(event.kind || event.type || '').toLowerCase();
+  const phase = String(event.phase || '').toUpperCase();
+  const reason = String(event.reason || '').toLowerCase();
+  const staged = cleanPrimaryTaskLabel(subgoal.replace(/^stage-for\s+/i, ''));
+  if (/^stage-for\s+/i.test(subgoal) && staged) return staged;
+  if (kind === 'support-blocker-step' && cleanPrimaryTaskLabel(subgoal)) return cleanPrimaryTaskLabel(subgoal);
+  if (kind.includes('planner-transaction') && cleanPrimaryTaskLabel(subgoal)) return cleanPrimaryTaskLabel(subgoal);
+  if ((phase === 'NORMAL' || phase === 'CLEARED' || reason === 'primary-subgoal' || reason === 'after-support-clearing')
+      && cleanPrimaryTaskLabel(subgoal)) return cleanPrimaryTaskLabel(subgoal);
+  if (options.allowSubgoalFallback && cleanPrimaryTaskLabel(subgoal)) return cleanPrimaryTaskLabel(subgoal);
+  return '';
+}
+
+function primaryTaskLabelFromSegment(segment) {
+  if (!segment) return '';
+  for (const item of segment.children || []) {
+    if (!isPrimaryTaskExecutionEvent(item.event)) continue;
+    const label = primaryTaskLabelFromEvent(item.event);
+    if (label) return label;
+  }
+  const subgoal = formatEventValue(segment.subgoal);
+  if (/^stage-for\s+/i.test(subgoal)) return cleanPrimaryTaskLabel(subgoal.replace(/^stage-for\s+/i, ''));
+  if (cleanPrimaryTaskLabel(subgoal) && !/^relief\s+agent\d+$/i.test(subgoal) && !/^park\s+agent\d+$/i.test(subgoal)) {
+    return cleanPrimaryTaskLabel(subgoal);
+  }
+  return '';
+}
+
+function isPrimaryTaskExecutionEvent(event) {
+  if (!event || typeof event !== 'object') return false;
+  const kind = String(event.kind || event.type || '').toLowerCase();
+  if (kind.includes('candidate-summary') || kind.includes('bsp') || kind.includes('scan')) return false;
+  if (kind.includes('planner-transaction') || kind === 'support-blocker-step') return true;
+  if (kind.includes('commit') || kind.includes('validation') || kind.includes('support')) return true;
+  return false;
+}
+
+function cleanPrimaryTaskLabel(value) {
+  const text = formatEventValue(value).trim();
+  if (!text) return '';
+  if (/^relief\s+agent\d+$/i.test(text) || /^park\s+agent\d+$/i.test(text)) return '';
+  const match = text.match(/agent\d+\s*->\s*[^|\s]+/i);
+  return match ? match[0].replace(/\s+/g, '') : '';
+}
+
+function formatPrimaryTaskLabel(label) {
+  const raw = cleanPrimaryTaskLabel(label) || formatEventValue(label);
+  const match = raw.match(/^agent(\d+)->(.+)$/i);
+  if (!match) return raw || 'none';
+  return `agent${match[1]} -> ${match[2]}`;
+}
+
+function primaryTaskOwnerAgentLabel(label, transaction = null) {
+  if (transaction?.ownerAgent) return transaction.ownerAgent;
+  if (Number.isInteger(transaction?.ownerAgentId)) return `agent${transaction.ownerAgentId}`;
+  if (Number.isInteger(transaction?.agentId)) return `agent${transaction.agentId}`;
+  const match = String(label || '').match(/^agent(\d+)->/i);
+  return match ? `agent${match[1]}` : '';
+}
+
+function primaryTaskGoalLabel(label, transaction = null) {
+  const goal = formatEventValue(transaction?.goal);
+  if (goal) return goal;
+  const match = String(label || '').match(/@\(([^)]+)\)/);
+  return match ? `(${match[1]})` : '';
+}
+
+function transactionStatusClass(transaction) {
+  if (!transaction) return 'note';
+  if (transaction.statusClass) return transaction.statusClass;
+  const status = String(transaction.commitStatus || '').toLowerCase();
+  if (/roll|fail|reject/.test(status)) return 'danger';
+  if (/retry|warn/.test(status)) return 'warning';
+  if (/commit|success|accept/.test(status)) return 'success';
+  return 'note';
+}
+
+function primaryTaskBandStatusClass(band) {
+  const transactions = band?.transactions || [];
+  if (transactions.length > 0) {
+    const committed = transactions.some(tx => /commit|success|accept/.test(String(tx.commitStatus || '').toLowerCase()));
+    const rolledBack = transactions.some(tx => /roll|fail|reject/.test(String(tx.commitStatus || '').toLowerCase()));
+    if (rolledBack && committed) return 'warning';
+    if (rolledBack) return 'danger';
+    if (committed) return 'success';
+  }
+  return band?.statusClass || 'note';
+}
+
+function bestTransactionForRange(start, end, label = '') {
+  const { transactions, byLabel } = primaryTaskContext();
+  const candidates = label && byLabel.has(label) ? byLabel.get(label) : transactions;
+  let best = null;
+  let bestScore = -Infinity;
+  const duration = Math.max(1, end - start + 1);
+  for (const tx of candidates) {
+    const overlap = Math.max(0, Math.min(end, tx.planEndStep) - Math.max(start, tx.planStartStep) + 1);
+    const gap = overlap > 0 ? 0 : Math.min(Math.abs(tx.planStartStep - end), Math.abs(start - tx.planEndStep));
+    if (overlap === 0 && (!label || gap > 40)) continue;
+    const coverage = overlap / duration;
+    if (!label && coverage < 0.5 && duration > 2) continue;
+    let score = overlap * 100 - gap + (label && tx.taskLabel === label ? 50 : 0);
+    if (!label && start === end) {
+      if (tx.planStartStep === start && tx.planEndStep > start) score += 30;
+      if (tx.planEndStep === start && tx.planStartStep < start) score -= 20;
+    }
+    if (score > bestScore) {
+      best = tx;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function primaryTaskForSegment(segment) {
+  const directLabel = primaryTaskLabelFromSegment(segment);
+  const tx = bestTransactionForRange(segment.start, segment.end, directLabel);
+  const label = directLabel || tx?.taskLabel || '';
+  if (!label) return null;
+  return {
+    label,
+    displayLabel: formatPrimaryTaskLabel(label),
+    ownerAgent: primaryTaskOwnerAgentLabel(label, tx),
+    goal: primaryTaskGoalLabel(label, tx),
+    transaction: tx || null,
+    inferred: !directLabel && Boolean(tx),
+  };
+}
+
+function primaryTaskForStep(stepIndex, event = null) {
+  const directLabel = primaryTaskLabelFromEvent(event);
+  const tx = bestTransactionForRange(stepIndex, stepIndex, directLabel);
+  const label = directLabel || tx?.taskLabel || '';
+  if (!label) return null;
+  return {
+    label,
+    displayLabel: formatPrimaryTaskLabel(label),
+    ownerAgent: primaryTaskOwnerAgentLabel(label, tx),
+    goal: primaryTaskGoalLabel(label, tx),
+    transaction: tx || null,
+    inferred: !directLabel && Boolean(tx),
+  };
+}
+
+function primaryTaskTransactionText(task) {
+  const tx = task?.transaction;
+  if (!tx) return task?.inferred ? 'inferred from lifecycle span' : 'not recorded';
+  const span = tx.planStartStep != null && tx.planEndStep != null
+    ? `${tx.planStartStep}-${tx.planEndStep}`
+    : '';
+  return [
+    tx.transactionId,
+    tx.commitStatus,
+    span ? `span ${span}` : '',
+    tx.reason,
+  ].filter(Boolean).join(' | ');
+}
+
+function primaryTaskBandsForTimeline(segments) {
+  const sources = [];
+  for (const tx of primaryTaskContext().transactions) {
+    if (!tx.taskLabel) continue;
+    sources.push({
+      label: tx.taskLabel,
+      start: tx.planStartStep,
+      end: tx.planEndStep,
+      statusClass: transactionStatusClass(tx),
+      transactions: [tx],
+      stageCount: 0,
+    });
+  }
+  for (const segment of segments) {
+    const task = segment.primaryTask || primaryTaskForSegment(segment);
+    if (!task?.label) continue;
+    sources.push({
+      label: task.label,
+      start: segment.start,
+      end: segment.end,
+      statusClass: segment.statusClass || 'note',
+      transactions: task.transaction ? [task.transaction] : [],
+      stageCount: 1,
+    });
+  }
+  sources.sort((a, b) => a.start - b.start || a.end - b.end || a.label.localeCompare(b.label));
+  const bands = [];
+  for (const source of sources) {
+    const existing = bands.find(band =>
+      band.label === source.label && source.start <= band.end + 1 && source.end >= band.start - 1);
+    if (existing) {
+      existing.start = Math.min(existing.start, source.start);
+      existing.end = Math.max(existing.end, source.end);
+      existing.statusClass = strongerStatus(existing.statusClass, source.statusClass);
+      existing.stageCount += source.stageCount || 0;
+      for (const tx of source.transactions || []) {
+        if (!existing.transactions.some(item => item.transactionId === tx.transactionId)) existing.transactions.push(tx);
+      }
+    } else {
+      bands.push({
+        ...source,
+        displayLabel: formatPrimaryTaskLabel(source.label),
+        ownerAgent: primaryTaskOwnerAgentLabel(source.label, source.transactions?.[0]),
+      });
+    }
+  }
+  return bands
+    .sort((a, b) => a.start - b.start || a.end - b.end || a.label.localeCompare(b.label))
+    .map((band, index) => ({
+      ...band,
+      index,
+      statusClass: primaryTaskBandStatusClass(band),
+      transactions: [...(band.transactions || [])].sort((a, b) =>
+        a.planStartStep - b.planStartStep || a.planEndStep - b.planEndStep || a.transactionId.localeCompare(b.transactionId)),
+    }));
 }
 
 function lifecycleSegmentColor(segment) {
@@ -3970,6 +4330,7 @@ function timelineMetaSpan(segment, index, allSegments = []) {
   const primaryAgentId = lifecyclePrimaryAgentId(segment);
   const decisionChildren = segment.children || [];
   const stateDiff = timelineSpanStateDiff(segment);
+  const primaryTask = segment.primaryTask || primaryTaskForSegment(segment);
   return {
     ordinal: index + 1,
     label: segment.label,
@@ -3979,6 +4340,20 @@ function timelineMetaSpan(segment, index, allSegments = []) {
     endStep: segment.end,
     frameCount: segment.end - segment.start + 1,
     primaryAgentId: Number.isInteger(primaryAgentId) ? primaryAgentId : null,
+    primaryTask: primaryTask ? {
+      label: primaryTask.label,
+      displayLabel: primaryTask.displayLabel,
+      ownerAgent: primaryTask.ownerAgent,
+      goal: primaryTask.goal,
+      inferred: Boolean(primaryTask.inferred),
+      transaction: primaryTask.transaction ? {
+        transactionId: primaryTask.transaction.transactionId,
+        commitStatus: primaryTask.transaction.commitStatus,
+        reason: primaryTask.transaction.reason,
+        planStartStep: primaryTask.transaction.planStartStep,
+        planEndStep: primaryTask.transaction.planEndStep,
+      } : null,
+    } : null,
     agentIds: sortedArray(segment.agentIds),
     phases: sortedArray(segment.phases),
     subgoal: segment.subgoal || '',
@@ -4069,6 +4444,29 @@ function compactPortfolioAttempt(attempt) {
     finalTotalBoxGoals: Number.isFinite(Number(attempt.finalTotalBoxGoals)) ? Number(attempt.finalTotalBoxGoals) : null,
     finalUnsatisfiedGoalsSample: formatEventValue(attempt.finalUnsatisfiedGoalsSample),
     finalStateHash: formatEventValue(attempt.finalStateHash),
+  };
+}
+
+function timelineMetaPrimaryTaskBand(band) {
+  return {
+    ordinal: band.index + 1,
+    label: band.label,
+    displayLabel: band.displayLabel,
+    ownerAgent: band.ownerAgent,
+    statusClass: band.statusClass || 'note',
+    startStep: band.start,
+    endStep: band.end,
+    frameCount: band.end - band.start + 1,
+    stageCount: band.stageCount || 0,
+    transactions: (band.transactions || []).map(tx => ({
+      transactionId: tx.transactionId,
+      commitStatus: tx.commitStatus,
+      reason: tx.reason,
+      planStartStep: tx.planStartStep,
+      planEndStep: tx.planEndStep,
+      supportKind: tx.supportKind,
+      satisfiedBoxGoalsAfter: tx.satisfiedBoxGoalsAfter,
+    })),
   };
 }
 
@@ -5136,11 +5534,13 @@ function renderAgentHoverTip(agentId, r, c) {
   const events = agentStepEvents(agentId);
   const intent = events.find(isAgentIntentEvent) || events.find(isAgentExecutionContextEvent);
   const action = events.find(isAgentActionEvent);
+  const activeTask = primaryTaskForStep(step, intent || action);
   const html = [
     `<div class="hoverTipTitle"><strong>agent${agentId}</strong><span>(${r}, ${c})</span></div>`
   ];
   if (!intent && !action) {
     html.push('<div class="hoverTipMuted">No intent event on this step</div>');
+    if (activeTask) html.push(renderPrimaryTaskHoverEvent(activeTask));
     return html.join('');
   }
 
@@ -5179,9 +5579,13 @@ function renderAgentIntentHoverEvent(event) {
   const progress = event.stepInSegment && event.segmentSteps
     ? `${event.stepInSegment}/${event.segmentSteps}`
     : '';
+  const task = primaryTaskForStep(step, event);
   const rows = [
     '<div class="hoverTipEvent success">',
     `<div class="hoverTipSection"><strong>${heading}</strong><span>${escapeHtml(progress || phase)}</span></div>`,
+    hoverField('Primary task', task?.displayLabel),
+    hoverField('Transaction', task ? primaryTaskTransactionText(task) : ''),
+    hoverField('Current stage', lifecycleMacroLabel(event)),
     hoverField('Phase', phase),
     hoverField('Subgoal', subgoal),
     hoverField('Subgoal type', event.subgoalType),
@@ -5209,10 +5613,13 @@ function renderAgentActionHoverEvent(event) {
   const boxType = event && typeof event === 'object' ? event.boxType : null;
   const boxFrom = event && typeof event === 'object' ? formatEventValue(event.boxFrom) : '';
   const boxTo = event && typeof event === 'object' ? formatEventValue(event.boxTo) : '';
+  const task = primaryTaskForStep(step, event);
 
   const rows = [
     `<div class="hoverTipEvent ${eventKindClass(accepted)}">`,
     `<div class="hoverTipSection"><strong>Server action</strong><span>${escapeHtml(accepted)}</span></div>`,
+    hoverField('Primary task', task?.displayLabel),
+    hoverField('Transaction', task ? primaryTaskTransactionText(task) : ''),
     hoverField('Action', action),
     hoverField('Result', accepted === 'rejected' ? 'rejected by server' : 'accepted by server'),
     hoverField('From', from),
@@ -5222,6 +5629,19 @@ function renderAgentActionHoverEvent(event) {
     hoverField('Box from', boxFrom),
     hoverField('Box to', boxTo),
     hoverField('Message', event.message)
+  ].filter(Boolean);
+  rows.push('</div>');
+  return rows.join('');
+}
+
+function renderPrimaryTaskHoverEvent(task) {
+  const rows = [
+    '<div class="hoverTipEvent note">',
+    '<div class="hoverTipSection"><strong>Primary task</strong><span>context</span></div>',
+    hoverField('Primary task', task?.displayLabel),
+    hoverField('Transaction', primaryTaskTransactionText(task)),
+    hoverField('Owner', task?.ownerAgent),
+    hoverField('Goal', task?.goal),
   ].filter(Boolean);
   rows.push('</div>');
   return rows.join('');

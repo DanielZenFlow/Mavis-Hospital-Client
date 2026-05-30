@@ -938,7 +938,12 @@ button:disabled {
 .timelineStageField {
   position: relative;
 }
+.timelinePrimaryTaskField {
+  position: relative;
+  border-bottom: 1px solid rgba(181, 154, 74, 0.24);
+}
 .timelineChapterBlock,
+.timelinePrimaryTaskBar,
 .timelineStageBar {
   position: absolute;
   display: flex;
@@ -978,20 +983,30 @@ button:disabled {
   height: 22px;
   background: #e7dcb8;
 }
+.timelinePrimaryTaskBar {
+  height: 16px;
+  padding-right: 5px;
+  background: #d9ded0;
+  color: #253021;
+}
 .timelineStageBar {
   height: 20px;
 }
 .timelineChapterBlock.success,
+.timelinePrimaryTaskBar.success,
 .timelineStageBar.success {
   background: #cddfbd;
 }
 .timelineChapterBlock.warning,
 .timelineChapterBlock.note,
+.timelinePrimaryTaskBar.warning,
+.timelinePrimaryTaskBar.note,
 .timelineStageBar.warning,
 .timelineStageBar.note {
   background: #e4cf91;
 }
 .timelineChapterBlock.danger,
+.timelinePrimaryTaskBar.danger,
 .timelineStageBar.danger {
   background: #d8a19a;
 }
@@ -1004,6 +1019,8 @@ button:disabled {
 }
 .timelineChapterBlock:hover,
 .timelineChapterBlock.active,
+.timelinePrimaryTaskBar:hover,
+.timelinePrimaryTaskBar.active,
 .timelineStageBar:hover,
 .timelineStageBar.active {
   outline: 2px solid #394335;
@@ -1043,6 +1060,49 @@ button:disabled {
   white-space: nowrap;
   overflow: visible;
   text-overflow: clip;
+}
+.timelinePrimaryTaskBar .taskLabel {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  color: #1f281d;
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+.timelinePrimaryTaskBar .taskTxList {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: rgba(31, 40, 29, 0.72);
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+.timelineTaskTxMarker {
+  position: absolute;
+  z-index: 2;
+  top: 1px;
+  bottom: 1px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 999px;
+  background: rgba(31, 40, 29, 0.72);
+  pointer-events: auto;
+}
+.timelineTaskTxMarker.danger {
+  background: #8f1d1d;
+}
+.timelineTaskTxMarker.warning {
+  background: #8a5a00;
+}
+.timelineTaskTxMarker.success {
+  background: #315b2c;
 }
 .timelineGanttNow {
   position: absolute;
@@ -2055,6 +2115,16 @@ button:hover { background: #2a2a2a; }
   height: 18px;
   padding: 0 6px;
 }
+.timelineGantt.compact .timelinePrimaryTaskBar {
+  height: 14px;
+  padding: 0 5px;
+}
+.timelineGantt.compact .timelinePrimaryTaskBar .taskLabel {
+  font-size: 8px;
+}
+.timelineGantt.compact .timelinePrimaryTaskBar .taskTxList {
+  font-size: 8px;
+}
 .timelineGantt.compact .timelineStageBar .barIdx {
   min-width: 13px;
   height: 12px;
@@ -2863,7 +2933,8 @@ h2 {
 .actionRow .act,
 .portfolioRow span,
 .portfolioRow strong,
-.timelineRulerTick {
+.timelineRulerTick,
+.timelinePrimaryTaskBar .taskLabel {
   font-size: var(--ui-font-size-md);
 }
 
@@ -2875,6 +2946,7 @@ h2 {
 
 .timelineSummaryCard dt,
 .timelineSummaryCard dd,
+.timelinePrimaryTaskBar .taskTxList,
 .timelineDialog .timelineDebugIssueHeader span,
 .timelineDialog .timelineDebugIssue dt,
 .timelineDialog .timelineDebugIssue dd,
