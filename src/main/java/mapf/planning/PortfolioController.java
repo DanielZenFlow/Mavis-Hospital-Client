@@ -13,6 +13,8 @@ import mapf.planning.strategy.PriorityPlanningStrategy;
 import mapf.planning.strategy.PriorityPlanningStrategy.OrderingMode;
 import mapf.planning.strategy.SingleAgentStrategy;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 
 /**
@@ -54,7 +56,9 @@ public class PortfolioController implements SearchStrategy {
 
     @Override
     public PlanTrace getLastPlanTrace() {
-        return lastPlanTrace.copy();
+        PlanTrace copy = lastPlanTrace.copy();
+        copy.replacePortfolioAttempts(portfolioAttemptSummaries());
+        return copy;
     }
     
     @Override
@@ -500,8 +504,9 @@ public class PortfolioController implements SearchStrategy {
             // SUMMARY: success = full goal-state reached. Partial plans (PP returns
             // last reachable state via fallback) are NOT successes for the table.
             boolean isFullSuccess = false;
+            State checkFinal = null;
             if (result != null && !result.isEmpty()) {
-                State checkFinal = replayPlan(result, initialState, level);
+                checkFinal = replayPlan(result, initialState, level);
                 isFullSuccess = (checkFinal != null && checkFinal.isGoalState(level));
             }
             if (isFullSuccess) summaryFailureKind = "SUCCESS";
@@ -509,7 +514,8 @@ public class PortfolioController implements SearchStrategy {
                     strategyConfig.randomSeed, attemptDuration,
                     isFullSuccess, planSteps,
                     summaryUnsat, summaryFailedSubgoal, summaryFailureKind,
-                    summaryReliefs, suspendedBoxGoals.size()));
+                    summaryReliefs, suspendedBoxGoals.size(),
+                    summarizeAttemptState(checkFinal, level)));
             
             if (result != null && !result.isEmpty()) {
                 // Verify this is a full solution (goal state reached)
@@ -690,8 +696,9 @@ public class PortfolioController implements SearchStrategy {
                         }
                     }
                     boolean cbsrFull = false;
+                    State cbsrFinal = null;
                     if (cbsrResult != null && !cbsrResult.isEmpty()) {
-                        State cbsrFinal = replayPlan(cbsrResult, initialState, level);
+                        cbsrFinal = replayPlan(cbsrResult, initialState, level);
                         cbsrFull = (cbsrFinal != null && cbsrFinal.isGoalState(level));
                     }
                     if (cbsrFull) cbsrKind = "SUCCESS";
@@ -699,7 +706,8 @@ public class PortfolioController implements SearchStrategy {
                             -(cbsrIter), iterDuration, cbsrFull,
                             (cbsrResult != null ? cbsrResult.size() : 0),
                             cbsrUnsat, cbsrFailedSg, "[CBSR#" + cbsrIter + "]" + cbsrKind,
-                            0, suspendedBoxGoals.size()));
+                            0, suspendedBoxGoals.size(),
+                            summarizeAttemptState(cbsrFinal, level)));
 
                     if (cbsrFull) {
                         if (SearchConfig.isNormal()) {
@@ -846,10 +854,11 @@ public class PortfolioController implements SearchStrategy {
                                             ? ((PriorityPlanningStrategy) residualRepairStrategy).getLastFailureReport()
                                             : null;
                             boolean residualRepairFull = false;
+                            State residualRepairFinal = null;
                             if (residualRepairResult != null && !residualRepairResult.isEmpty()) {
                                 traceByPlan.put(residualRepairResult,
                                         residualRepairStrategy.getLastPlanTrace().copyUpTo(residualRepairResult.size()));
-                                State residualRepairFinal = replayPlan(residualRepairResult, initialState, level);
+                                residualRepairFinal = replayPlan(residualRepairResult, initialState, level);
                                 residualRepairFull = residualRepairFinal != null && residualRepairFinal.isGoalState(level);
                                 if (residualRepairFull) {
                                     if (SearchConfig.isNormal()) {
@@ -861,7 +870,8 @@ public class PortfolioController implements SearchStrategy {
                                             residualRepairSeed,
                                             PHASE_RESIDUAL_ORDER_REPAIR + "#" + (residualRepairSeed == 0 ? "topo" : residualRepairSeed),
                                             residualRepairAttemptMs, true, residualRepairResult.size(), 0,
-                                            null, "SUCCESS", 0, suspendedBoxGoals.size()));
+                                            null, "SUCCESS", 0, suspendedBoxGoals.size(),
+                                            summarizeAttemptState(residualRepairFinal, level)));
                                     printAttemptSummary();
                                     lastPlanTrace = traceByPlan.getOrDefault(residualRepairResult, new PlanTrace())
                                             .copyUpTo(residualRepairResult.size());
@@ -899,7 +909,8 @@ public class PortfolioController implements SearchStrategy {
                                     unsatCountOf(residualRepairReport),
                                     failedSubgoalOf(residualRepairReport),
                                     failureKindOf(residualRepairReport, residualRepairFull),
-                                    0, suspendedBoxGoals.size()));
+                                    0, suspendedBoxGoals.size(),
+                                    summarizeAttemptState(residualRepairFinal, level)));
                         }
                     }
                 }
@@ -997,7 +1008,8 @@ public class PortfolioController implements SearchStrategy {
                         attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                                 seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
                                 warmMs, true, tail.size(), 0, null, "SUCCESS",
-                                0, suspendedBoxGoals.size()));
+                                0, suspendedBoxGoals.size(),
+                                summarizeAttemptState(combinedFinal, level)));
                         printAttemptSummary();
                         lastPlanTrace = traceByPlan.getOrDefault(combined, new PlanTrace()).copyUpTo(combined.size());
                         return combined;
@@ -1049,7 +1061,8 @@ public class PortfolioController implements SearchStrategy {
                             seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
                             warmMs, false, tail.size(),
                             unsatCountOf(warmReport), failedSubgoalOf(warmReport),
-                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size()));
+                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size(),
+                            summarizeAttemptState(combinedFinal, level)));
                 } else {
                     continuationConsecutiveNoImprovement++;
                     if (SearchConfig.isVerbose()) {
@@ -1063,7 +1076,8 @@ public class PortfolioController implements SearchStrategy {
                             seed, PHASE_PARTIAL_PLAN_CONTINUATION + "#" + continuationIter,
                             warmMs, false, 0,
                             unsatCountOf(warmReport), failedSubgoalOf(warmReport),
-                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size()));
+                            failureKindOf(warmReport, false), 0, suspendedBoxGoals.size(),
+                            summarizeAttemptState(replayed, level)));
                 }
 
                 // Stop if 3+ consecutive non-improvements (budget conservation)
@@ -1169,7 +1183,8 @@ public class PortfolioController implements SearchStrategy {
                         attempts.add(new AttemptRecord(StrategyType.STRICT_ORDER, OrderingMode.RANDOM,
                                 cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
                                 cbsrBaseMs, true, cbsrBaseTail.size(), 0, null, "SUCCESS",
-                                0, suspendedBoxGoals.size()));
+                                0, suspendedBoxGoals.size(),
+                                summarizeAttemptState(cbsrBaseFinal, level)));
                         printAttemptSummary();
                         lastPlanTrace = traceByPlan.getOrDefault(cbsrBaseCombined, new PlanTrace()).copyUpTo(cbsrBaseCombined.size());
                         return cbsrBaseCombined;
@@ -1193,7 +1208,8 @@ public class PortfolioController implements SearchStrategy {
                             cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
                             cbsrBaseMs, false, cbsrBaseTail.size(),
                             unsatCountOf(cbsrBaseReport), failedSubgoalOf(cbsrBaseReport),
-                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size()));
+                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size(),
+                            summarizeAttemptState(cbsrBaseFinal, level)));
                 } else {
                     if (SearchConfig.isNormal()) {
                         System.err.println("[Portfolio] " + PHASE_CBSR_BASE_CONTINUATION + "." + cbsrBaseIter + " no result");
@@ -1202,7 +1218,8 @@ public class PortfolioController implements SearchStrategy {
                             cbsrBaseSeed, PHASE_CBSR_BASE_CONTINUATION + "#" + cbsrBaseIter,
                             cbsrBaseMs, false, 0,
                             unsatCountOf(cbsrBaseReport), failedSubgoalOf(cbsrBaseReport),
-                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size()));
+                            failureKindOf(cbsrBaseReport, false), 0, suspendedBoxGoals.size(),
+                            summarizeAttemptState(cbsrFinal, level)));
                 }
             }
         }
@@ -1310,7 +1327,89 @@ public class PortfolioController implements SearchStrategy {
         }
         return count;
     }
-    
+
+    private AttemptFinalSummary summarizeAttemptState(State state, Level level) {
+        if (state == null || level == null) return AttemptFinalSummary.unknown();
+        int satisfiedGoals = 0;
+        int totalGoals = 0;
+        int satisfiedBoxGoals = 0;
+        int totalBoxGoals = 0;
+        List<String> unsatisfied = new ArrayList<>();
+        for (int row = 0; row < level.getRows(); row++) {
+            for (int col = 0; col < level.getCols(); col++) {
+                Position pos = Position.of(row, col);
+                char goalType = level.getBoxGoal(row, col);
+                if (goalType != '\0') {
+                    totalGoals++;
+                    totalBoxGoals++;
+                    if (state.getBoxAt(pos) == goalType) {
+                        satisfiedGoals++;
+                        satisfiedBoxGoals++;
+                    } else {
+                        addUnsatisfiedGoalSample(unsatisfied,
+                                goalType + "@" + pos + " has " + boxAtLabel(state, pos));
+                    }
+                }
+                int agentGoal = level.getAgentGoal(row, col);
+                if (agentGoal != -1) {
+                    totalGoals++;
+                    Position agentPos = state.getAgentPosition(agentGoal);
+                    if (agentPos != null && agentPos.equals(pos)) {
+                        satisfiedGoals++;
+                    } else {
+                        addUnsatisfiedGoalSample(unsatisfied,
+                                "agent" + agentGoal + "@" + pos + " at " + agentPos);
+                    }
+                }
+            }
+        }
+        return new AttemptFinalSummary(satisfiedGoals, totalGoals, satisfiedBoxGoals,
+                totalBoxGoals, String.join("; ", unsatisfied), stateHash(state));
+    }
+
+    private String boxAtLabel(State state, Position pos) {
+        char box = state.getBoxAt(pos);
+        return box == '\0' ? "empty" : String.valueOf(box);
+    }
+
+    private void addUnsatisfiedGoalSample(List<String> sample, String value) {
+        if (sample == null || value == null || sample.size() >= 12) return;
+        sample.add(value);
+    }
+
+    private String stateHash(State state) {
+        if (state == null) return "";
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (int id = 0; id < state.getNumAgents(); id++) {
+                digestLine(digest, "agent:" + id + "=" + state.getAgentPosition(id));
+            }
+            List<Map.Entry<Position, Character>> boxes = new ArrayList<>(state.getBoxes().entrySet());
+            boxes.sort(Comparator.<Map.Entry<Position, Character>>comparingInt(e -> e.getKey().row)
+                    .thenComparingInt(e -> e.getKey().col)
+                    .thenComparing(e -> e.getValue()));
+            for (Map.Entry<Position, Character> entry : boxes) {
+                digestLine(digest, "box:" + entry.getValue() + "=" + entry.getKey());
+            }
+            return hex(digest.digest());
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void digestLine(MessageDigest digest, String value) {
+        digest.update(String.valueOf(value).getBytes(StandardCharsets.UTF_8));
+        digest.update((byte) '\n');
+    }
+
+    private String hex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+
     /**
      * Builds strategy sequence based on level features.
      * 
@@ -1640,6 +1739,50 @@ public class PortfolioController implements SearchStrategy {
                     + (includeSeed ? "#" + r.randomSeed : "") + ")";
         }
         return r.strategy.name() + "(" + r.orderingMode.name() + ")";
+    }
+
+    private List<PlanTrace.PortfolioAttempt> portfolioAttemptSummaries() {
+        List<PlanTrace.PortfolioAttempt> summaries = new ArrayList<>(attempts.size());
+        for (int i = 0; i < attempts.size(); i++) {
+            AttemptRecord r = attempts.get(i);
+            String label = r.displayLabel != null ? r.displayLabel : formatAttemptMode(r, true);
+            summaries.add(new PlanTrace.PortfolioAttempt(
+                    i + 1,
+                    phaseOfAttempt(label, r.failureKind),
+                    label,
+                    r.strategy != null ? r.strategy.name() : "",
+                    r.orderingMode != null ? r.orderingMode.name() : "",
+                    r.randomSeed,
+                    r.durationMs,
+                    r.success,
+                    r.planSteps,
+                    r.unsatCount,
+                    r.failedSubgoal,
+                    r.failureKind,
+                    r.reliefCount,
+                    r.suspendedCount,
+                    r.finalSummary.satisfiedGoals,
+                    r.finalSummary.totalGoals,
+                    r.finalSummary.satisfiedBoxGoals,
+                    r.finalSummary.totalBoxGoals,
+                    r.finalSummary.unsatisfiedGoalsSample,
+                    r.finalSummary.stateHash));
+        }
+        return summaries;
+    }
+
+    private String phaseOfAttempt(String label, String failureKind) {
+        String l = label == null ? "" : label;
+        String k = failureKind == null ? "" : failureKind;
+        if (l.startsWith(PHASE_RESIDUAL_ORDER_REPAIR)) return "L3 residual-order repair";
+        if (l.startsWith(PHASE_PARTIAL_PLAN_CONTINUATION)) return "L3 partial-plan continuation";
+        if (l.startsWith(PHASE_CBSR_BASE_CONTINUATION)) return "L3 CBSR-base continuation";
+        if (k.contains("[CBSR#") || l.contains("[CBSR#")) return "L3 CBSR ordering repair";
+        if (l.contains("DISTANCE") || l.contains("TOPOLOGICAL")
+                || l.contains("SINGLE_AGENT") || l.contains("STRICT_ORDER")) {
+            return "initial ordering probe";
+        }
+        return "other";
     }
 
     private String failureKindOf(mapf.planning.signal.FailureReport report, boolean success) {
@@ -2692,19 +2835,38 @@ public class PortfolioController implements SearchStrategy {
         final String failureKind;          // SUCCESS / PARTIAL_PLAN / STUCK_NO_PROGRESS / EXCEPTION / NONE
         final int reliefCount;             // NAMO reliefs synthesized THIS round
         final int suspendedCount;          // suspended box-goals after THIS round
-        
+        final AttemptFinalSummary finalSummary;
+
         AttemptRecord(StrategyType strategy, OrderingMode orderingMode, int randomSeed,
                       long durationMs, boolean success, int planSteps, int unsatCount,
                       String failedSubgoal, String failureKind,
                       int reliefCount, int suspendedCount) {
             this(strategy, orderingMode, randomSeed, null, durationMs, success, planSteps,
-                    unsatCount, failedSubgoal, failureKind, reliefCount, suspendedCount);
+                    unsatCount, failedSubgoal, failureKind, reliefCount, suspendedCount,
+                    AttemptFinalSummary.unknown());
         }
 
         AttemptRecord(StrategyType strategy, OrderingMode orderingMode, int randomSeed,
                       String displayLabel, long durationMs, boolean success,
                       int planSteps, int unsatCount, String failedSubgoal, String failureKind,
                       int reliefCount, int suspendedCount) {
+            this(strategy, orderingMode, randomSeed, displayLabel, durationMs, success, planSteps,
+                    unsatCount, failedSubgoal, failureKind, reliefCount, suspendedCount,
+                    AttemptFinalSummary.unknown());
+        }
+
+        AttemptRecord(StrategyType strategy, OrderingMode orderingMode, int randomSeed,
+                      long durationMs, boolean success, int planSteps, int unsatCount,
+                      String failedSubgoal, String failureKind,
+                      int reliefCount, int suspendedCount, AttemptFinalSummary finalSummary) {
+            this(strategy, orderingMode, randomSeed, null, durationMs, success, planSteps,
+                    unsatCount, failedSubgoal, failureKind, reliefCount, suspendedCount, finalSummary);
+        }
+
+        AttemptRecord(StrategyType strategy, OrderingMode orderingMode, int randomSeed,
+                      String displayLabel, long durationMs, boolean success,
+                      int planSteps, int unsatCount, String failedSubgoal, String failureKind,
+                      int reliefCount, int suspendedCount, AttemptFinalSummary finalSummary) {
             this.strategy = strategy;
             this.orderingMode = orderingMode;
             this.randomSeed = randomSeed;
@@ -2717,6 +2879,18 @@ public class PortfolioController implements SearchStrategy {
             this.failureKind = failureKind;
             this.reliefCount = reliefCount;
             this.suspendedCount = suspendedCount;
+            this.finalSummary = finalSummary != null ? finalSummary : AttemptFinalSummary.unknown();
+        }
+    }
+
+    private record AttemptFinalSummary(int satisfiedGoals,
+                                       int totalGoals,
+                                       int satisfiedBoxGoals,
+                                       int totalBoxGoals,
+                                       String unsatisfiedGoalsSample,
+                                       String stateHash) {
+        static AttemptFinalSummary unknown() {
+            return new AttemptFinalSummary(-1, -1, -1, -1, "", "");
         }
     }
 

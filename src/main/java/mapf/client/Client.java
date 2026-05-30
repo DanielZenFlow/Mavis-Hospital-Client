@@ -52,6 +52,10 @@ public class Client {
     /** Intent diagnostics for the last plan returned by the portfolio. */
     private PlanTrace lastPlanTrace = new PlanTrace();
 
+    /** Effective wall-clock budgets used by the last portfolio search. */
+    private long lastEffectiveServerTimeoutMs = -1;
+    private long lastPlanningTimeoutMs = -1;
+
     /**
      * Creates a new Client with standard I/O streams.
      */
@@ -122,8 +126,10 @@ public class Client {
         planAndExecute();
 
         if (currentState.isGoalState(level)) {
-            debugOut.println("Goal reached!");
-        } else {
+            if (SearchConfig.isMinimal()) {
+                debugOut.println("Goal reached!");
+            }
+        } else if (SearchConfig.isMinimal()) {
             debugOut.println("Partial plan executed - goal NOT reached. Check agent/box positions for debugging.");
             if (SearchConfig.isNormal()) {
                 debugOut.println("Final state:");
@@ -160,11 +166,12 @@ public class Client {
      * @throws IOException if communication fails
      */
     private void planAndExecute() throws IOException {
-        ReplayRecorder replayRecorder = ReplayRecorder.start(level, currentState);
+        ReplayRecorder replayRecorder = ReplayRecorder.start(level, currentState, config);
 
         // Search with fallback mechanism
         List<Action[]> plan = searchWithFallback();
         replayRecorder.setPlanTrace(lastPlanTrace);
+        replayRecorder.setTimingBudget(lastEffectiveServerTimeoutMs, lastPlanningTimeoutMs);
 
         if (plan == null || plan.isEmpty()) {
             debugOut.println("ERROR: No plan found with any strategy!");
@@ -174,7 +181,7 @@ public class Client {
         }
 
         // Check action limit
-        if (plan.size() > SearchConfig.MAX_ACTIONS) {
+        if (plan.size() > SearchConfig.MAX_ACTIONS && SearchConfig.isMinimal()) {
             debugOut.println("WARNING: Plan exceeds action limit (" + plan.size() +
                     " > " + SearchConfig.MAX_ACTIONS + ")");
         }
@@ -198,7 +205,9 @@ public class Client {
             // Check total action limit
             totalActions++;
             if (totalActions > SearchConfig.MAX_ACTIONS) {
-                debugOut.println("WARNING: Exceeded maximum actions limit");
+                if (SearchConfig.isMinimal()) {
+                    debugOut.println("WARNING: Exceeded maximum actions limit");
+                }
                 break;
             }
 
@@ -222,7 +231,7 @@ public class Client {
 
     private void writeReplay(ReplayRecorder replayRecorder) {
         java.nio.file.Path file = replayRecorder.writeDefault();
-        if (file != null) {
+        if (file != null && SearchConfig.isMinimal()) {
             debugOut.println("[REPLAY] wrote " + file);
             for (java.nio.file.Path diagnostic : replayRecorder.getLastDiagnosticFiles()) {
                 debugOut.println("[REPLAY] diagnostic " + diagnostic);
@@ -254,6 +263,8 @@ public class Client {
             } catch (NumberFormatException ignored) {}
         }
         long planningTimeout = Math.max(effectiveServerTimeoutMs - 10_000, effectiveServerTimeoutMs / 2);
+        lastEffectiveServerTimeoutMs = effectiveServerTimeoutMs;
+        lastPlanningTimeoutMs = planningTimeout;
         portfolio.setTimeout(planningTimeout);
         if (SearchConfig.isNormal()) {
             debugOut.println("[Client] Planning budget: " + planningTimeout + "ms (server=" + effectiveServerTimeoutMs + "ms)");

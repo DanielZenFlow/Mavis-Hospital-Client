@@ -19,9 +19,11 @@ import java.util.Objects;
  */
 public final class PlanTrace {
     private final Map<Integer, List<Event>> eventsByFrame = new LinkedHashMap<>();
+    private final List<PortfolioAttempt> portfolioAttempts = new ArrayList<>();
 
     public void clear() {
         eventsByFrame.clear();
+        portfolioAttempts.clear();
     }
 
     public void truncate(int actionCount) {
@@ -35,6 +37,18 @@ public final class PlanTrace {
             count += events.size();
         }
         return count;
+    }
+
+    public List<PortfolioAttempt> portfolioAttempts() {
+        return Collections.unmodifiableList(portfolioAttempts);
+    }
+
+    public void replacePortfolioAttempts(Collection<PortfolioAttempt> attempts) {
+        portfolioAttempts.clear();
+        if (attempts == null) return;
+        for (PortfolioAttempt attempt : attempts) {
+            if (attempt != null) portfolioAttempts.add(attempt);
+        }
     }
 
     public List<Event> eventsForFrame(int frame) {
@@ -187,6 +201,7 @@ public final class PlanTrace {
                 copy.add(event);
             }
         }
+        copy.replacePortfolioAttempts(portfolioAttempts);
         return copy;
     }
 
@@ -203,6 +218,7 @@ public final class PlanTrace {
                 shifted.add(event.withFrame(event.frame() + actionOffset));
             }
         }
+        shifted.replacePortfolioAttempts(portfolioAttempts);
         return shifted;
     }
 
@@ -213,6 +229,7 @@ public final class PlanTrace {
                 remapped.add(event.remapAgents(originalIds));
             }
         }
+        remapped.replacePortfolioAttempts(portfolioAttempts);
         return remapped;
     }
 
@@ -243,6 +260,27 @@ public final class PlanTrace {
         }
         return combined;
     }
+
+    public record PortfolioAttempt(int ordinal,
+                                   String phase,
+                                   String label,
+                                   String strategy,
+                                   String orderingMode,
+                                   int randomSeed,
+                                   long durationMs,
+                                   boolean success,
+                                   int planSteps,
+                                   int unsatCount,
+                                   String failedSubgoal,
+                                   String failureKind,
+                                   int reliefCount,
+                                   int suspendedCount,
+                                   int finalSatisfiedGoals,
+                                   int finalTotalGoals,
+                                   int finalSatisfiedBoxGoals,
+                                   int finalTotalBoxGoals,
+                                   String finalUnsatisfiedGoalsSample,
+                                   String finalStateHash) {}
 
     public record Event(int frame,
                         String kind,

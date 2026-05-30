@@ -54,7 +54,7 @@
             </div>
             <div>
               <strong>Debugging Tools</strong>
-              <p>Track an object with values like agent0 or boxA, highlight coordinates with row,column, hover an agent for detailed intent/action fields, pin one agent from the lower-right Agent menu, use Lock View to follow it, adjust interface and log text with the px control, and open Highlights for high-signal current-step events.</p>
+              <p>Track objects, search and jump with examples, play a selected range, open the left-side Lifecycle mini timeline or the lower-right Timeline full stage view, bookmark suspicious steps or ranges, export range JSON, show a compact digest, pin one agent from the lower-right Agent menu, and open Highlights for high-signal current-step events.</p>
             </div>
           </div>
           <div class="dialogFooter">
@@ -72,7 +72,7 @@
           <ol id="onboardingSteps" class="onboardingSteps" aria-label="Tutorial progress"></ol>
 
           <section class="onboardingBody">
-            <p id="onboardingStepCount" class="onboardingStepCount">Step 1 of 8</p>
+            <p id="onboardingStepCount" class="onboardingStepCount">Step 1 of 11</p>
             <h4 id="onboardingStepTitle">Load a replay</h4>
             <p id="onboardingStepBody">The newest generated replay loads automatically when available. You can also use Load replay JSON or drag a JSON file onto the drop zone.</p>
           </section>
@@ -112,7 +112,7 @@
       </label>
       <div id="dropZone" class="dropZone">Drop replay JSON here</div>
 
-      <div class="meta" id="meta">No replay loaded</div>
+      <div class="meta" id="meta" tabindex="0">No replay loaded</div>
 
       <div class="controls">
         <button id="prevBtn" title="Previous step">&lt;</button>
@@ -128,6 +128,49 @@
         <input id="stepInput" type="number" min="0" value="0">
         <span id="stepText">/ 0</span>
       </div>
+      <section class="lifecycleMiniControl">
+        <div class="sectionTitleRow">
+          <h2>Lifecycle</h2>
+          <button id="miniTimelineBtn" class="miniButton miniTimelineBtn" type="button" title="Show lifecycle mini timeline" aria-label="Show lifecycle mini timeline" aria-haspopup="true" aria-expanded="false" hidden>Mini Timeline</button>
+        </div>
+        <div class="miniInfo">Open a compact lifecycle-stage strip over the board.</div>
+      </section>
+      <section class="segmentPanel playbackRangePanel">
+        <div class="sectionTitleRow">
+          <h2>Playback Range</h2>
+          <label class="miniCheck"><input id="segmentEnabledInput" type="checkbox"> Limit</label>
+        </div>
+        <div class="segmentInputs">
+          <label>Start
+            <div class="rangeInputRow">
+              <input id="segmentStartInput" type="number" min="0" value="0">
+              <button id="segmentSetStartBtn" type="button">Current</button>
+            </div>
+          </label>
+          <label>End
+            <div class="rangeInputRow">
+              <input id="segmentEndInput" type="number" min="0" value="0">
+              <button id="segmentSetEndBtn" type="button">Current</button>
+            </div>
+          </label>
+        </div>
+        <div class="rangeActionRow">
+          <button id="segmentPlayBtn" type="button">Play Range</button>
+          <label class="compactCheck"><input id="segmentLoopInput" type="checkbox"> Loop</label>
+          <button id="segmentClearBtn" type="button">Clear</button>
+        </div>
+        <div id="segmentInfo" class="miniInfo">Choose a start and end step, then Play Range.</div>
+        <details class="rangeTools">
+          <summary>Range Tools</summary>
+          <div class="buttonGrid segmentUtilityGrid">
+            <button id="segmentMarkBtn" type="button">Bookmark Range</button>
+            <button id="segmentExportBtn" type="button">Export JSON</button>
+            <button id="segmentDigestBtn" type="button">Show Digest</button>
+            <button id="segmentCopyDigestBtn" type="button">Copy Digest</button>
+          </div>
+        </details>
+        <textarea id="segmentDigestOutput" class="segmentDigestOutput" readonly hidden></textarea>
+      </section>
       <label class="searchLabel">Track object
         <input id="trackInput" placeholder="agent7 or boxG">
       </label>
@@ -137,6 +180,36 @@
         <button id="coordGoBtn">Go</button>
         <button id="coordClearBtn">Clear</button>
       </div>
+      <section class="searchJumpPanel">
+        <h2>Search / Jump</h2>
+        <div class="miniInfo searchHint">Search actions, agents, boxes, coordinates, step numbers, and event fields such as phase or subgoal.</div>
+        <div class="inputRow">
+          <input id="jumpSearchInput" placeholder="Try: rejected, agent0, Push, 28,3, step 120">
+          <button id="jumpPrevBtn" title="Previous match">&lt;</button>
+          <button id="jumpNextBtn" title="Next match">&gt;</button>
+        </div>
+        <div class="searchExamples" aria-label="Search examples">
+          <button type="button" data-search-example="rejected">rejected</button>
+          <button type="button" data-search-example="agent0">agent0</button>
+          <button type="button" data-search-example="Push">Push</button>
+          <button type="button" data-search-example="step 120">step 120</button>
+        </div>
+        <div class="filterChips" aria-label="Search filters">
+          <label><input id="searchRejectedFilter" type="checkbox"> Rejected</label>
+          <label><input id="searchIntentFilter" type="checkbox"> Intent</label>
+          <label><input id="searchEventsFilter" type="checkbox"> Events</label>
+          <label><input id="searchAgentFilter" type="checkbox"> Selected agent</label>
+        </div>
+        <div id="jumpSearchInfo" class="miniInfo">No search</div>
+      </section>
+      <section class="markersPanel">
+        <div class="sectionTitleRow">
+          <h2>Bookmarks</h2>
+          <button id="markerToggleBtn" class="miniButton" type="button">Bookmark Step</button>
+        </div>
+        <div class="miniInfo">Click a bookmark to jump. Use x to delete it.</div>
+        <div id="markerList" class="markerList"></div>
+      </section>
       <section>
         <h2>Actions</h2>
         <div id="actions" class="actions"></div>
@@ -160,11 +233,49 @@
         <span id="statusInfo" class="statusInfo"></span>
         <span class="statusSpacer"></span>
         <span id="zoomInfo" class="statusInfo">100%</span>
+        <button id="timelineBtn" class="toolbarBtn timelineBtn" type="button" title="Inspect replay timeline" aria-label="Inspect replay timeline" aria-expanded="false" hidden>Timeline</button>
         <button id="stepEventsBtn" class="toolbarBtn stepEventsBtn" type="button" title="Inspect current step highlights" aria-label="Inspect current step highlights" hidden>Highlights 0</button>
         <button id="agentMenuBtn" class="toolbarBtn agentMenuBtn" type="button" title="Monitor agent actions" aria-label="Monitor agent actions" aria-haspopup="true" aria-expanded="false" hidden>Agent</button>
         <button id="fontSettingsBtn" class="toolbarBtn fontSettingsBtn" type="button" title="Text size" aria-label="Text size">12px</button>
         <button id="resetView" class="toolbarBtn" title="Reset view" aria-label="Reset view">&#8857;</button>
       </div>
+      <div id="timelinePanel" class="dialogOverlay timelineOverlay" role="dialog" aria-modal="true" aria-labelledby="timelineTitle" hidden>
+        <div class="dialogBox timelineDialog">
+          <div class="timelineHeader">
+            <div>
+              <p id="timelineKicker" class="stepInspectorKicker">Replay Timeline</p>
+              <h2 id="timelineTitle">Timeline</h2>
+            </div>
+            <button id="timelineClose" class="toolbarBtn" type="button" title="Close timeline" aria-label="Close timeline">x</button>
+          </div>
+          <div class="timelineControls">
+            <button id="timelineOverviewBtn" class="miniButton timelineOverviewBtn" type="button">Overview</button>
+            <button id="timelineExportMetaBtn" class="miniButton" type="button">Export Meta</button>
+            <label class="timelineAgentControl">Agent
+              <select id="timelineAgentSelect" class="miniSelect" aria-label="Timeline agent"></select>
+            </label>
+          </div>
+          <div id="agentTimeline" class="agentTimeline"></div>
+        </div>
+      </div>
+      <aside id="miniTimelinePanel" class="miniTimelinePanel" aria-label="Lifecycle mini timeline" hidden>
+        <div class="miniTimelineHeader">
+          <div>
+            <p class="stepInspectorKicker">Lifecycle</p>
+            <h2>Stages</h2>
+          </div>
+          <button id="miniTimelinePlayBtn" class="miniTimelinePlayBtn" type="button" title="Play replay" aria-label="Play replay" aria-pressed="false">
+            <span class="miniTimelinePlayIcon" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div id="miniTimelineBody" class="miniTimelineBody"></div>
+        <div class="miniTimelineProgress">
+          <button id="miniTimelineProgressTrack" class="miniTimelineProgressTrack" type="button" aria-label="Jump by replay progress">
+            <span id="miniTimelineProgressFill" class="miniTimelineProgressFill"></span>
+          </button>
+          <span id="miniTimelineProgressText" class="miniTimelineProgressText">step 0 / 0</span>
+        </div>
+      </aside>
       <aside id="agentMenuPanel" class="agentMenuPanel" aria-label="Choose agent to monitor" hidden>
         <p class="stepInspectorKicker">Agent Monitor</p>
         <ol id="agentMenuList" class="agentMenuList"></ol>

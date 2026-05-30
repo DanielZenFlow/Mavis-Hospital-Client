@@ -156,6 +156,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private int diagIw1Succeeded = 0;
     private int diagPlanSubgoalNull = 0;
     private int diagPathClearingRescued = 0;
+    private long diagTransactionSeq = 0;
     private static final int REPEATED_LOG_PRINT_LIMIT = 2;
     private final Map<String, Integer> repeatedLogCounts = new LinkedHashMap<>();
 
@@ -713,6 +714,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         diagIw1Succeeded = 0;
         diagPlanSubgoalNull = 0;
         diagPathClearingRescued = 0;
+        diagTransactionSeq = 0;
         repeatedLogCounts.clear();
         boxPositionHistory.clear();
         subgoalLabelHistory.clear();
@@ -2693,6 +2695,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 
                 // Snapshot plan size for potential rollback (agent-trap detection)
                 int planSizeBefore = fullPlan.size();
+                int transactionPathSize = path.size();
                 SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                 
                 // Plan parallel subgoals for agents in independent components
@@ -2797,6 +2800,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             // Invalidate stored plans — state rolled back
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
+                            recordPlannerTransaction("NORMAL", subgoal,
+                                    planSizeBefore, fullPlan.size(),
+                                    "ROLLED_BACK", "regression",
+                                    detailMap("plannedPathSteps", transactionPathSize,
+                                            "regressedGoals", regressedGoals));
                             continue; // try next subgoal in priority order
                         }
                     }
@@ -2828,6 +2836,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         // Invalidate stored plans — state rolled back
                         planMerger.clearAllPlans();
                         storedPlanSubgoals.clear();
+                        recordPlannerTransaction("NORMAL", subgoal,
+                                planSizeBefore, fullPlan.size(),
+                                "ROLLED_BACK", "agent-trap",
+                                detailMap("plannedPathSteps", transactionPathSize));
                         continue; // try next subgoal in priority order
                     }
                     SealRisk sealRisk = findSealRisk(subgoal, currentState, tempState, level, subgoals);
@@ -2843,6 +2855,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             lastProgressWasPhantom = false;
                             return true;
                         }
+                        recordPlannerTransaction("NORMAL", subgoal,
+                                planSizeBefore, fullPlan.size(),
+                                "ROLLED_BACK", "seal-risk",
+                                detailMap("plannedPathSteps", transactionPathSize,
+                                        "futureSubgoal", subgoalLabel(sealRisk.future)));
                         continue;
                     }
                     if (!acceptReachedSubgoal("NORMAL", subgoal, beforeEval, tempState, level,
@@ -2850,6 +2867,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         rollbackPlanTo(fullPlan, planSizeBefore);
                         planMerger.clearAllPlans();
                         storedPlanSubgoals.clear();
+                        recordPlannerTransaction("NORMAL", subgoal,
+                                planSizeBefore, fullPlan.size(),
+                                "ROLLED_BACK", "validation-rejected",
+                                detailMap("plannedPathSteps", transactionPathSize));
                         continue;
                     }
                     logAcceptedSubgoalEval("NORMAL", subgoal, beforeEval, tempState, level,
@@ -2919,6 +2940,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) +
                             " -> " + subgoal.goalPos + " (" + path.size() + " steps)");
                     }
+                    recordPlannerTransaction("NORMAL", subgoal,
+                            planSizeBefore, fullPlan.size(),
+                            "COMMITTED", "goal-reached",
+                            detailMap("plannedPathSteps", transactionPathSize,
+                                    "satisfiedBoxGoalsAfter", countSatisfiedBoxGoals(tempState, level)));
                     return true;
                 }
                 logNormal(getName() + ": [EXEC-MISMATCH] "
@@ -2932,6 +2958,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 planTrace.truncate(fullPlan.size());
                 planMerger.clearAllPlans();
                 storedPlanSubgoals.clear();
+                recordPlannerTransaction("NORMAL", subgoal,
+                        planSizeBefore, fullPlan.size(),
+                        "ROLLED_BACK", "exec-mismatch",
+                        detailMap("plannedPathSteps", transactionPathSize));
                 continue;
             } else {
                 diagPlanSubgoalNull++;
@@ -2968,6 +2998,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             // iteration, but rolling this back loses real monotonic progress.
                             recordSupportValidation("NORMAL", subgoal, support,
                                     "support-progress-committed", "ACCEPTED", false);
+                            recordPlannerTransaction("SUPPORT", subgoal,
+                                    support.planSizeBefore, fullPlan.size(),
+                                    "COMMITTED", "support-progress-committed",
+                                    detailMap("supportKind", support.supportKind,
+                                            "supportPlanEnd", support.planSizeAfter));
                             lastProgressWasPhantom = false;
                             return true;
                         } else {
@@ -2983,6 +3018,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 // Execute path if clearing succeeded
                 if (path != null && !path.isEmpty()) {
                     int planSizeBefore = fullPlan.size();
+                    int transactionPathSize = path.size();
                     int transactionPlanSizeBefore = supportPlanSizeBefore >= 0
                             ? supportPlanSizeBefore : planSizeBefore;
                     State transactionStateBefore = supportStateBefore != null
@@ -3026,6 +3062,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
+                            recordPlannerTransaction("CLEARED", subgoal,
+                                    transactionPlanSizeBefore, fullPlan.size(),
+                                    "ROLLED_BACK", "regression",
+                                    detailMap("plannedPathSteps", transactionPathSize,
+                                            "regressedGoals", regressedGoals));
                             continue;
                         }
                     }
@@ -3048,6 +3089,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 lastProgressWasPhantom = false;
                                 return true;
                             }
+                            recordPlannerTransaction("CLEARED", subgoal,
+                                    transactionPlanSizeBefore, fullPlan.size(),
+                                    "ROLLED_BACK", "seal-risk",
+                                    detailMap("plannedPathSteps", transactionPathSize,
+                                            "futureSubgoal", subgoalLabel(sealRisk.future)));
                             continue;
                         }
                         if (!acceptReachedSubgoal("CLEARED", subgoal, beforeEval, tempState, level,
@@ -3058,6 +3104,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             currentState = transactionStateBefore;
                             planMerger.clearAllPlans();
                             storedPlanSubgoals.clear();
+                            recordPlannerTransaction("CLEARED", subgoal,
+                                    transactionPlanSizeBefore, fullPlan.size(),
+                                    "ROLLED_BACK", "validation-rejected",
+                                    detailMap("plannedPathSteps", transactionPathSize));
                             continue;
                         }
                         logAcceptedSubgoalEval("CLEARED", subgoal, beforeEval, tempState, level,
@@ -3088,6 +3138,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                 currentState = transactionStateBefore;
                                 planMerger.clearAllPlans();
                                 storedPlanSubgoals.clear();
+                                recordPlannerTransaction("CLEARED", subgoal,
+                                        transactionPlanSizeBefore, fullPlan.size(),
+                                        "ROLLED_BACK", "borrow-return-failed",
+                                        detailMap("plannedPathSteps", transactionPathSize,
+                                                "borrowedGoals", borrowedGoalsToRestore));
                                 continue;
                             }
                         }
@@ -3103,6 +3158,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         else lastProgressWasPhantom = false;
                         logVerbose(getName() + ": [OK] " + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) 
                                 + " -> " + subgoal.goalPos + " (" + path.size() + " steps) [CLEARED]");
+                        recordPlannerTransaction("CLEARED", subgoal,
+                                transactionPlanSizeBefore, fullPlan.size(),
+                                "COMMITTED", "goal-reached-after-support",
+                                detailMap("plannedPathSteps", transactionPathSize,
+                                        "supportPlanStart", supportPlanSizeBefore,
+                                        "satisfiedBoxGoalsAfter", countSatisfiedBoxGoals(tempState, level)));
                         return true;
                     }
                     logNormal(getName() + ": [EXEC-MISMATCH] Cleared path for "
@@ -3115,6 +3176,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     currentState = transactionStateBefore;
                     planMerger.clearAllPlans();
                     storedPlanSubgoals.clear();
+                    recordPlannerTransaction("CLEARED", subgoal,
+                            transactionPlanSizeBefore, fullPlan.size(),
+                            "ROLLED_BACK", "exec-mismatch",
+                            detailMap("plannedPathSteps", transactionPathSize));
                     continue;
                 }
 
@@ -3157,6 +3222,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
                 if (path != null && !path.isEmpty()) {
                     int planSizeBefore = fullPlan.size();
+                    int transactionPathSize = path.size();
                     SubgoalEval beforeEval = captureSubgoalEval(subgoal, currentState, level);
                     planIndependentAgents(subgoal, subgoals, currentState, level);
                     List<Position> agentPath = extractAgentPath(subgoal.agentId, currentState, path, level);
@@ -3291,6 +3357,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         else lastProgressWasPhantom = false;
                         logVerbose(getName() + ": [OK] " + (subgoal.isAgentGoal ? "Agent " + subgoal.agentId : "Box " + subgoal.boxType) 
                                 + " -> " + subgoal.goalPos + " (" + path.size() + " steps) [CYCLE-BREAK]");
+                        recordPlannerTransaction("CYCLE-BREAK", subgoal,
+                                planSizeBefore, fullPlan.size(),
+                                "COMMITTED", "cycle-break-goal-reached",
+                                detailMap("plannedPathSteps", transactionPathSize,
+                                        "satisfiedBoxGoalsAfter", countSatisfiedBoxGoals(tempState, level)));
                         return true;
                     }
                     logNormal(getName() + ": [CYCLE-BREAK][EXEC-MISMATCH] "
@@ -3304,6 +3375,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                     planTrace.truncate(fullPlan.size());
                     planMerger.clearAllPlans();
                     storedPlanSubgoals.clear();
+                    recordPlannerTransaction("CYCLE-BREAK", subgoal,
+                            planSizeBefore, fullPlan.size(),
+                            "ROLLED_BACK", "exec-mismatch",
+                            detailMap("plannedPathSteps", transactionPathSize));
                     continue;
                 }
             }
@@ -3470,8 +3545,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 "supportPhase", phase,
                 "supportKind", supportKind != null ? supportKind : phase.toLowerCase(Locale.ROOT),
                 "helperAgent", "agent" + helper,
+                "ownerAgentId", parentSubgoal != null ? parentSubgoal.agentId : null,
+                "ownerAgent", parentSubgoal != null ? "agent" + parentSubgoal.agentId : null,
+                "executorAgentId", helper,
+                "executorAgent", "agent" + helper,
+                "ownerExecutorMismatch", parentSubgoal != null && parentSubgoal.agentId != helper,
                 "stepInSegment", stepInSegment,
                 "segmentSteps", segmentSteps,
+                "action", plannedAction != null ? plannedAction.toServerString() : "NoOp",
                 "supportAction", plannedAction != null ? plannedAction.toServerString() : "NoOp",
                 "actualAction", actualAction != null ? actualAction.toServerString() : "NoOp",
                 "blocker", blocker,
@@ -6706,6 +6787,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             Position boxPos = fixedReliefBox
                     ? subgoal.reliefCertificate.blockerStart
                     : subgoalManager.findBestBoxForGoal(subgoal, state, level, allSubgoals, completedBoxGoals);
+            recordCandidateSummary(subgoal, state, usedHungarian, fixedReliefBox, boxPos, -1,
+                    boxPos != null ? "initial-selection" : "no-initial-candidate",
+                    boxPos != null ? "SELECTED" : "FAILED",
+                    detailMap("agentPosition", state.getAgentPosition(subgoal.agentId),
+                            "goal", subgoal.goalPos,
+                            "frozenGoals", frozen.size()));
             if (fixedReliefBox && state.getBoxAt(boxPos) != subgoal.boxType) {
                 String cert = reliefCertificateLabel(subgoal);
                 logNormalRepeated("synthetic.skip.blocker-moved " + cert,
@@ -6733,10 +6820,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                             "agentPosition", state.getAgentPosition(subgoal.agentId),
                             "goal", subgoal.goalPos);
                     details.putAll(diagnosis.details());
-                    recordDecisionEvent("box-selection-failed", "warning",
-                            "Box selection failed",
-                            "No usable box candidate could be selected for this subgoal.",
-                            subgoal, diagnosis.reason(),
+                    recordCandidateSummary(subgoal, state, usedHungarian, fixedReliefBox, null, attempt,
+                            diagnosis.reason(),
                             attempt == 0 && usedHungarian ? "RETRY_WITHOUT_HUNGARIAN" : "FAILED",
                             details);
                     if (attempt == 0 && usedHungarian) {
@@ -6755,6 +6840,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 logVerbose("[PP] Box " + subgoal.boxType + " at " + boxPos + " -> goal " + subgoal.goalPos
                         + " (agent " + subgoal.agentId + " at " + state.getAgentPosition(subgoal.agentId) 
                         + ", frozen=" + frozen + ", attempt=" + attempt + ")");
+                recordCandidateSummary(subgoal, state, usedHungarian, fixedReliefBox, boxPos, attempt,
+                        attempt == 0 ? "bsp-attempt-selected-box" : "bsp-retry-selected-box",
+                        "SELECTED",
+                        detailMap("agentPosition", state.getAgentPosition(subgoal.agentId),
+                                "goal", subgoal.goalPos,
+                                "frozenGoals", frozen.size()));
 
                 
                 // Dynamic BSP budget: scale search budget based on box-to-goal distance
@@ -7853,6 +7944,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private void recordDecisionEvent(String kind, String severity, String title,
                                      String message, Subgoal subgoal, String reason,
                                      String verdict, Map<String, String> details) {
+        details = normalizePlannerDetails(subgoal, details);
         planTrace.recordDecisionEvent(traceFrame(), kind, severity, title, message,
                 subgoal != null ? subgoal.agentId : null,
                 subgoal != null ? "L3/L4" : null,
@@ -7872,6 +7964,91 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         planTrace.recordDecisionEvent(traceFrame(), kind, severity, title, message,
                 agentId >= 0 ? agentId : null, phase, subgoal, subgoalType, goal,
                 boxType, reason, verdict, details);
+    }
+
+    private Map<String, String> normalizePlannerDetails(Subgoal ownerSubgoal, Map<String, String> details) {
+        Map<String, String> normalized = details == null
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(details);
+        if (ownerSubgoal != null) {
+            normalized.putIfAbsent("ownerAgentId", String.valueOf(ownerSubgoal.agentId));
+            normalized.putIfAbsent("ownerAgent", "agent" + ownerSubgoal.agentId);
+            normalized.putIfAbsent("ownerSubgoal", subgoalLabel(ownerSubgoal));
+        }
+        Integer executor = parseAgentId(normalized.get("executorAgentId"));
+        if (executor == null) executor = parseAgentId(normalized.get("executorAgent"));
+        if (executor == null) executor = parseAgentId(normalized.get("helperAgent"));
+        if (executor != null) {
+            normalized.put("executorAgentId", String.valueOf(executor));
+            normalized.put("executorAgent", "agent" + executor);
+            normalized.put("helperAgent", "agent" + executor);
+            if (ownerSubgoal != null) {
+                normalized.put("ownerExecutorMismatch", String.valueOf(ownerSubgoal.agentId != executor));
+            }
+        }
+        return normalized;
+    }
+
+    private Integer parseAgentId(String value) {
+        if (value == null || value.isBlank()) return null;
+        String text = value.trim().toLowerCase(Locale.ROOT);
+        if (text.startsWith("agent")) text = text.substring("agent".length()).trim();
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private void recordPlannerTransaction(String phase, Subgoal subgoal,
+                                          int planStart, int planEnd,
+                                          String status, String reason,
+                                          Map<String, String> details) {
+        Map<String, String> txDetails = detailMap(
+                "transactionId", "tx-" + (++diagTransactionSeq),
+                "planStart", planStart,
+                "planEnd", planEnd,
+                "planDelta", Math.max(0, planEnd - planStart),
+                "commitStatus", status);
+        if (details != null) txDetails.putAll(details);
+        recordDecisionEvent("planner-transaction", statusSeverity(status),
+                "Planner transaction " + status,
+                "The planner finished a native subgoal transaction.",
+                subgoal, reason, status, txDetails);
+    }
+
+    private String statusSeverity(String status) {
+        String normalized = status == null ? "" : status.toUpperCase(Locale.ROOT);
+        if (normalized.contains("ROLLBACK") || normalized.contains("FAILED")
+                || normalized.contains("REJECT")) return "warning";
+        return "info";
+    }
+
+    private void recordCandidateSummary(Subgoal subgoal, State state,
+                                        boolean usedHungarian, boolean fixedReliefBox,
+                                        Position selectedBox, int attempt,
+                                        String reason, String verdict,
+                                        Map<String, String> extraDetails) {
+        int rawBoxesOfType = 0;
+        if (state != null && subgoal != null) {
+            for (char type : state.getBoxes().values()) {
+                if (type == subgoal.boxType) rawBoxesOfType++;
+            }
+        }
+        Map<String, String> details = detailMap(
+                "attempt", attempt,
+                "usedHungarian", usedHungarian,
+                "fixedReliefBox", fixedReliefBox,
+                "selectedBox", selectedBox,
+                "rawBoxesOfType", rawBoxesOfType,
+                "completedBoxGoals", completedBoxGoals.size(),
+                "suspendedTransitGoals", suspendedTransitGoals.size());
+        if (extraDetails != null) details.putAll(extraDetails);
+        recordDecisionEvent("candidate-summary",
+                "FAILED".equalsIgnoreCase(verdict) ? "warning" : "info",
+                "Candidate summary",
+                "Compressed box-candidate selection state for this subgoal.",
+                subgoal, reason, verdict, details);
     }
 
     private int traceFrame() {
