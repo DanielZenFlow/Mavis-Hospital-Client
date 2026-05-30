@@ -25,7 +25,9 @@ public class LevelAnalyzer {
         
         // Goal dependency analysis
         public final Map<Position, Set<Position>> goalDependsOn;  // goal -> goals it depends on
+        public final List<GoalDependencyEdge> dependencyEdges;    // explained goal dependency edges
         public final List<Position> executionOrder;  // topologically sorted goals
+        public final Map<Position, GoalOrderingMetric> orderingMetrics;
         public final int maxDependencyDepth;
         public final boolean hasCircularDependency;
         
@@ -52,7 +54,10 @@ public class LevelAnalyzer {
         public LevelFeatures(int numAgents, int numBoxes, int numGoals, int freeSpaces,
                             TaskFilter.FilterResult taskFilter,
                             Map<Position, Set<Position>> goalDependsOn,
-                            List<Position> executionOrder, int maxDepth, boolean hasCycle,
+                            List<GoalDependencyEdge> dependencyEdges,
+                            List<Position> executionOrder,
+                            Map<Position, GoalOrderingMetric> orderingMetrics,
+                            int maxDepth, boolean hasCycle,
                             Set<Position> bottlenecks, Map<Position, Integer> bottleneckScores,
                             double couplingDegree,
                             Map<Position, Integer> pathConflictScores, Map<Position, Double> goalPathNarrowness,
@@ -65,7 +70,13 @@ public class LevelAnalyzer {
             this.density = (double)(numAgents + numBoxes) / Math.max(1, freeSpaces);
             this.taskFilter = taskFilter;
             this.goalDependsOn = goalDependsOn;
+            this.dependencyEdges = dependencyEdges != null
+                    ? Collections.unmodifiableList(new ArrayList<>(dependencyEdges))
+                    : Collections.emptyList();
             this.executionOrder = executionOrder;
+            this.orderingMetrics = orderingMetrics != null
+                    ? Collections.unmodifiableMap(new LinkedHashMap<>(orderingMetrics))
+                    : Collections.emptyMap();
             this.maxDependencyDepth = maxDepth;
             this.hasCircularDependency = hasCycle;
             this.bottleneckPositions = bottlenecks;
@@ -78,6 +89,50 @@ public class LevelAnalyzer {
             this.corridorRatio = (double) corridorCells / Math.max(1, freeSpaces);
             this.recommendedStrategy = recommended;
             this.analysisReport = report;
+        }
+    }
+
+    public static class GoalDependencyEdge {
+        public final Position dependentGoal;
+        public final Position prerequisiteGoal;
+        public final String source;
+        public final String reason;
+        public final String evidence;
+
+        public GoalDependencyEdge(Position dependentGoal, Position prerequisiteGoal,
+                                  String source, String reason, String evidence) {
+            this.dependentGoal = dependentGoal;
+            this.prerequisiteGoal = prerequisiteGoal;
+            this.source = source;
+            this.reason = reason;
+            this.evidence = evidence;
+        }
+    }
+
+    public static class GoalOrderingMetric {
+        public final Position goal;
+        public final int topologicalIndex;
+        public final int importance;
+        public final int pathConflictScore;
+        public final double pathNarrowness;
+        public final int agentGoalBoxTasks;
+        public final int distanceFromComponentRoot;
+        public final int dependencyCount;
+        public final int dependentCount;
+
+        public GoalOrderingMetric(Position goal, int topologicalIndex, int importance,
+                                  int pathConflictScore, double pathNarrowness,
+                                  int agentGoalBoxTasks, int distanceFromComponentRoot,
+                                  int dependencyCount, int dependentCount) {
+            this.goal = goal;
+            this.topologicalIndex = topologicalIndex;
+            this.importance = importance;
+            this.pathConflictScore = pathConflictScore;
+            this.pathNarrowness = pathNarrowness;
+            this.agentGoalBoxTasks = agentGoalBoxTasks;
+            this.distanceFromComponentRoot = distanceFromComponentRoot;
+            this.dependencyCount = dependencyCount;
+            this.dependentCount = dependentCount;
         }
     }
     
@@ -111,7 +166,9 @@ public class LevelAnalyzer {
         
         // 4. Goal dependency analysis - includes Box-on-Goal dependencies
         // CRITICAL FIX: Pass immovable boxes so they are treated as walls, not movable obstacles
-        Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(activeGoals, level, state, taskFilter.immovableBoxes);
+        List<GoalDependencyEdge> dependencyEdges = new ArrayList<>();
+        Map<Position, Set<Position>> goalDependsOn = computeGoalDependencies(
+                activeGoals, level, state, taskFilter.immovableBoxes, dependencyEdges);
         boolean hasCycle = detectCycle(goalDependsOn, activeGoals);
         
         // 5. MAPF FIX: Bottleneck detection (path intersection analysis)
@@ -162,6 +219,9 @@ public class LevelAnalyzer {
         List<Position> executionOrder = topologicalSort(goalDependsOn, activeGoals,
                 distances, agentGoalBoxTasks,
                 pathConflicts.conflictScores, pathConflicts.narrowness);
+        Map<Position, GoalOrderingMetric> orderingMetrics = buildOrderingMetrics(
+                activeGoals, executionOrder, goalDependsOn, distances, agentGoalBoxTasks,
+                pathConflicts.conflictScores, pathConflicts.narrowness);
         int maxDepth = computeMaxDependencyDepth(goalDependsOn, activeGoals);
         
         // 8. Strategy recommendation (now uses coupling degree)
@@ -191,7 +251,8 @@ public class LevelAnalyzer {
         GoalTransitAnalyzer.printDiagnostic(transitProfiles, "level");
 
         return new LevelFeatures(numAgents, numBoxes, numGoals, freeSpaces, taskFilter,
-                                goalDependsOn, executionOrder, maxDepth, hasCycle,
+                                goalDependsOn, dependencyEdges, executionOrder, orderingMetrics,
+                                maxDepth, hasCycle,
                                 bottlenecks, bottleneckScores, couplingDegree,
                                 pathConflicts.conflictScores, pathConflicts.narrowness,
                                 corridorCells, junctionCells, recommended, report);
@@ -217,7 +278,8 @@ public class LevelAnalyzer {
      * - 适用于任何地图结构（死胡同、桥梁、机关门等）
      */
     private static Map<Position, Set<Position>> computeGoalDependencies(
-            List<Position> goals, Level level, State state, Set<Position> immovableBoxes) {
+            List<Position> goals, Level level, State state, Set<Position> immovableBoxes,
+            List<GoalDependencyEdge> dependencyEdges) {
         Map<Position, Set<Position>> dependsOn = new HashMap<>();
         
         // Initialize dependency map
@@ -285,8 +347,14 @@ public class LevelAnalyzer {
                 if (!canReachGoalJ) {
                     // Filled Goal I blocks Goal J.
                     // Goal I must wait for Goal J.
-                    dependsOn.get(goalI).add(goalJ);
-                    dependencyCount++;
+                    if (addGoalDependency(dependsOn, dependencyEdges, goalI, goalJ,
+                            "hard-goal-block",
+                            "Filling the dependent goal as a frozen occupied goal makes the prerequisite goal unserviceable.",
+                            "filledGoal=" + goalI + " serviceGoal=" + goalJ
+                                    + " serviceRoots=" + serviceRoots.size()
+                                    + " servicingColor=" + servicingColor)) {
+                        dependencyCount++;
+                    }
                 } else {
                     // AGENT-BODY DEPENDENCY CHECK (Pull awareness):
                     // When an agent Pulls a box to goalI, the agent's body occupies an
@@ -335,8 +403,14 @@ public class LevelAnalyzer {
                         }
                     }
                     if (allBodyPositionsBlock && validBodyPositions > 0) {
-                        dependsOn.get(goalI).add(goalJ);
-                        dependencyCount++;
+                        if (addGoalDependency(dependsOn, dependencyEdges, goalI, goalJ,
+                                "agent-body-footprint",
+                                "Every valid pull/body position after filling the dependent goal blocks the prerequisite goal.",
+                                "filledGoal=" + goalI + " serviceGoal=" + goalJ
+                                        + " validBodyPositions=" + validBodyPositions
+                                        + " serviceRoots=" + serviceRoots.size())) {
+                            dependencyCount++;
+                        }
                         if (SearchConfig.isVerbose()) {
                             System.err.println("[LevelAnalyzer] Agent-body dep: filling " + goalI
                                 + " + agent body blocks " + goalJ + " (all " + validBodyPositions + " dirs)");
@@ -350,7 +424,7 @@ public class LevelAnalyzer {
         }
 
         int structuralDepCount = addStructuralGoalDominanceDependencies(
-                dependsOn, goals, level, state, immovableBoxes);
+                dependsOn, goals, level, state, immovableBoxes, dependencyEdges);
         dependencyCount += structuralDepCount;
 
         // =========================================================================================
@@ -439,8 +513,15 @@ public class LevelAnalyzer {
                      // So we respect Hard dependencies and ignore Soft ones if they conflict.
                      
                      if (!hasDependency(goalI, goalJ, dependsOn)) {
-                         dependsOn.get(goalJ).add(goalI);
-                         startDepCount++;
+                         if (addGoalDependency(dependsOn, dependencyEdges, goalJ, goalI,
+                                 "start-box-block",
+                                 "All current boxes that can serve the prerequisite goal type block the dependent goal from being serviced.",
+                                 "dependentGoal=" + goalJ + " prerequisiteGoal=" + goalI
+                                         + " worstBlocker=" + worstBlocker
+                                         + " candidateBlockers=" + blockerPositions.size()
+                                         + " serviceRoots=" + serviceRoots.size())) {
+                             startDepCount++;
+                         }
                      }
                  }
              }
@@ -483,7 +564,8 @@ public class LevelAnalyzer {
             List<Position> goals,
             Level level,
             State state,
-            Set<Position> immovableBoxes) {
+            Set<Position> immovableBoxes,
+            List<GoalDependencyEdge> dependencyEdges) {
 
         int added = 0;
         Set<Position> emptyBlocks = Collections.emptySet();
@@ -509,8 +591,11 @@ public class LevelAnalyzer {
                         serviceRoots, target, level, blocked, movableIgnored, immovableBoxes);
                 if (reachableWithBlock) continue;
 
-                Set<Position> deps = dependsOn.get(blocker);
-                if (deps != null && deps.add(target)) {
+                if (addGoalDependency(dependsOn, dependencyEdges, blocker, target,
+                        "structural-single-entry",
+                        "Blocking the dependent goal disconnects the prerequisite goal from every same-color service root.",
+                        "blockerGoal=" + blocker + " targetGoal=" + target
+                                + " serviceRoots=" + serviceRoots.size())) {
                     added++;
                     if (SearchConfig.isVerbose()) {
                         System.err.println("[LevelAnalyzer] Structural dep: filling "
@@ -525,6 +610,22 @@ public class LevelAnalyzer {
                     + " structural single-entry goal dependencies");
         }
         return added;
+    }
+
+    private static boolean addGoalDependency(Map<Position, Set<Position>> dependsOn,
+                                             List<GoalDependencyEdge> dependencyEdges,
+                                             Position dependent,
+                                             Position prerequisite,
+                                             String source,
+                                             String reason,
+                                             String evidence) {
+        Set<Position> deps = dependsOn.get(dependent);
+        if (deps == null || prerequisite == null) return false;
+        if (!deps.add(prerequisite)) return false;
+        if (dependencyEdges != null) {
+            dependencyEdges.add(new GoalDependencyEdge(dependent, prerequisite, source, reason, evidence));
+        }
+        return true;
     }
 
     /**
@@ -1518,6 +1619,53 @@ public class LevelAnalyzer {
         }
         
         return result;
+    }
+
+    private static Map<Position, GoalOrderingMetric> buildOrderingMetrics(
+            List<Position> goals,
+            List<Position> executionOrder,
+            Map<Position, Set<Position>> dependsOn,
+            Map<Position, Integer> distances,
+            Map<Position, Integer> agentGoalBoxTasks,
+            Map<Position, Integer> pathConflictScores,
+            Map<Position, Double> pathNarrowness) {
+
+        Map<Position, Set<Position>> dependedBy = new HashMap<>();
+        for (Position goal : goals) {
+            dependedBy.put(goal, new HashSet<>());
+        }
+        for (Map.Entry<Position, Set<Position>> entry : dependsOn.entrySet()) {
+            for (Position dep : entry.getValue()) {
+                if (dependedBy.containsKey(dep)) {
+                    dependedBy.get(dep).add(entry.getKey());
+                }
+            }
+        }
+
+        Map<Position, Integer> importance = new HashMap<>();
+        for (Position goal : goals) {
+            computeImportance(goal, dependedBy, importance, new HashSet<>());
+        }
+
+        Map<Position, Integer> orderIndex = new HashMap<>();
+        for (int i = 0; i < executionOrder.size(); i++) {
+            orderIndex.put(executionOrder.get(i), i + 1);
+        }
+
+        Map<Position, GoalOrderingMetric> metrics = new LinkedHashMap<>();
+        for (Position goal : goals) {
+            metrics.put(goal, new GoalOrderingMetric(
+                    goal,
+                    orderIndex.getOrDefault(goal, -1),
+                    importance.getOrDefault(goal, 0),
+                    pathConflictScores.getOrDefault(goal, 0),
+                    pathNarrowness.getOrDefault(goal, 0.0),
+                    agentGoalBoxTasks.getOrDefault(goal, Integer.MAX_VALUE),
+                    distances.getOrDefault(goal, -1),
+                    dependsOn.getOrDefault(goal, Collections.emptySet()).size(),
+                    dependedBy.getOrDefault(goal, Collections.emptySet()).size()));
+        }
+        return metrics;
     }
 
     /**

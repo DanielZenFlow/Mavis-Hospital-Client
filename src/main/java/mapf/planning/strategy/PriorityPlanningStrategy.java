@@ -81,6 +81,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     
     /** Goal dependency graph from LevelAnalyzer: goal → set of goals it depends on. */
     private Map<Position, Set<Position>> goalDependsOn = Collections.emptyMap();
+
+    /** Explained LevelAnalyzer dependency edges and topological tie-break metrics. */
+    private List<LevelAnalyzer.GoalDependencyEdge> goalDependencyEdges = Collections.emptyList();
+    private Map<Position, LevelAnalyzer.GoalOrderingMetric> goalOrderingMetrics = Collections.emptyMap();
     
     /** Immovable boxes (treated as walls in pathfinding). */
     private Set<Position> immovableBoxes = Collections.emptySet();
@@ -157,6 +161,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     private int diagPlanSubgoalNull = 0;
     private int diagPathClearingRescued = 0;
     private long diagTransactionSeq = 0;
+    private long diagSubgoalOrderSeq = 0;
+    private long diagSubgoalSelectionSeq = 0;
+    private int currentRandomSeed = SearchConfig.RANDOM_SEED;
+    private static final int DIAG_SUBGOAL_SAMPLE_LIMIT = 12;
     private static final int REPEATED_LOG_PRINT_LIMIT = 2;
     private final Map<String, Integer> repeatedLogCounts = new LinkedHashMap<>();
 
@@ -583,6 +591,13 @@ public class PriorityPlanningStrategy implements SearchStrategy {
     public void setGoalDependencies(Map<Position, Set<Position>> deps) {
         this.goalDependsOn = deps != null ? deps : Collections.emptyMap();
     }
+
+    /** Sets dependency-edge explanations and topo tie-break metrics from LevelAnalyzer. */
+    public void setGoalOrderingDiagnostics(List<LevelAnalyzer.GoalDependencyEdge> edges,
+                                           Map<Position, LevelAnalyzer.GoalOrderingMetric> metrics) {
+        this.goalDependencyEdges = edges != null ? edges : Collections.emptyList();
+        this.goalOrderingMetrics = metrics != null ? metrics : Collections.emptyMap();
+    }
     
     /** Sets immovable goal positions (treated as walls in pathfinding). */
     public void setImmovableBoxes(Set<Position> immovable) {
@@ -641,6 +656,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
     /** Sets the random seed for RANDOM ordering mode. Allows portfolio to try different shuffles. */
     public void setRandomSeed(int seed) {
+        this.currentRandomSeed = seed;
         this.random = new Random(seed);
     }
 
@@ -655,6 +671,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
              LevelAnalyzer.LevelFeatures features = LevelAnalyzer.analyze(level, initialState);
              setGoalExecutionOrder(features.executionOrder);
              setGoalDependencies(features.goalDependsOn);
+             setGoalOrderingDiagnostics(features.dependencyEdges, features.orderingMetrics);
              if (features.taskFilter != null && (immovableBoxes == null || immovableBoxes.isEmpty())) {
                  setImmovableBoxes(features.taskFilter.immovableBoxes);
              }
@@ -715,6 +732,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         diagPlanSubgoalNull = 0;
         diagPathClearingRescued = 0;
         diagTransactionSeq = 0;
+        diagSubgoalOrderSeq = 0;
+        diagSubgoalSelectionSeq = 0;
         repeatedLogCounts.clear();
         boxPositionHistory.clear();
         subgoalLabelHistory.clear();
@@ -2198,7 +2217,18 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         subgoalManager.computeHungarianAssignment(state, level, completedBoxGoals);
         
         cachedSubgoalOrder = subgoalManager.getUnsatisfiedSubgoals(state, level, completedBoxGoals);
+        int rawSubgoalCount = cachedSubgoalOrder.size();
+        int suspendedRemoved = 0;
+        int physicalPromotions = 0;
+        int deprioritizedMoved = 0;
+        int prioritizedMoved = 0;
+        int escapePrepended = 0;
+        int transitDeferred = 0;
+        List<String> orderStages = new ArrayList<>();
+        List<String> physicalPromotionDetails = new ArrayList<>();
+        addOrderStageSample(orderStages, "raw", cachedSubgoalOrder);
         sortSubgoals(cachedSubgoalOrder, state, level);
+        addOrderStageSample(orderStages, "base-sort", cachedSubgoalOrder);
 
         // F2: filter out suspended box-goals (NAMO blocker-relief co-suspension).
         // These are the original goals of boxes being relocated to P_temp; pushing
@@ -2216,14 +2246,19 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
             if (removed > 0) {
+                suspendedRemoved = removed;
                 cachedSubgoalOrder = kept;
+                addOrderStageSample(orderStages, "suspended-filter", cachedSubgoalOrder);
                 // Log only once per attempt (not per recompute) \u2014 noisy.
             }
         }
         
         // Physical blocking sort: reorder subgoals where filling goal A would place a box
         // on goal B's box-to-goal path. Goal B should be filled BEFORE goal A.
-        applyPhysicalBlockingSort(cachedSubgoalOrder, state, level);
+        physicalPromotions = applyPhysicalBlockingSort(cachedSubgoalOrder, state, level, physicalPromotionDetails);
+        if (physicalPromotions > 0) {
+            addOrderStageSample(orderStages, "physical-blocking-sort", cachedSubgoalOrder);
+        }
 
         // P0b: stable-partition deprioritized goals (from prior attempts' FailureReport)
         // to the end. They are still attempted, just last — giving other goals a chance
@@ -2237,8 +2272,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 else head.add(sg);
             }
             if (!tail.isEmpty()) {
+                deprioritizedMoved = tail.size();
                 cachedSubgoalOrder = head;
                 cachedSubgoalOrder.addAll(tail);
+                addOrderStageSample(orderStages, "deprioritized-tail", cachedSubgoalOrder);
                 if (mapf.planning.SearchConfig.isVerbose()) {
                     System.err.println("[PP] P0b: demoted " + tail.size() + " goal(s) to end (from prior FailureReport)");
                 }
@@ -2257,10 +2294,12 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 else rest.add(sg);
             }
             if (!front.isEmpty()) {
+                prioritizedMoved = front.size();
                 List<Subgoal> reordered = new ArrayList<>(cachedSubgoalOrder.size());
                 reordered.addAll(front);
                 reordered.addAll(rest);
                 cachedSubgoalOrder = reordered;
+                addOrderStageSample(orderStages, "prioritized-front", cachedSubgoalOrder);
                 if (mapf.planning.SearchConfig.isVerbose()) {
                     System.err.println("[PP] P4: promoted " + front.size()
                             + " blocker goal(s) to front (from prior FailureReport blockers)");
@@ -2275,6 +2314,8 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             withEscapes.addAll(escapeSubgoals);
             withEscapes.addAll(cachedSubgoalOrder);
             cachedSubgoalOrder = withEscapes;
+            escapePrepended = escapeSubgoals.size();
+            addOrderStageSample(orderStages, "escape-prepend", cachedSubgoalOrder);
             if (mapf.planning.SearchConfig.isVerbose()) {
                 System.err.println("[PP] P1: prepended " + escapeSubgoals.size()
                         + " escape subgoal(s) for cycle-breaking");
@@ -2297,6 +2338,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 }
             }
             if (!transitTail.isEmpty()) {
+                transitDeferred = transitTail.size();
                 // Among TRANSIT goals: fewer crossings first (less disruptive to fill first)
                 transitTail.sort((a, b) -> {
                     GoalTransitAnalyzer.GoalProfile pa = transitProfiles.get(a.goalPos);
@@ -2307,10 +2349,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 });
                 nonTransit.addAll(transitTail);
                 cachedSubgoalOrder = nonTransit;
+                addOrderStageSample(orderStages, "transit-tail", cachedSubgoalOrder);
                 logVerbose("[PP] Step4: deferred " + transitTail.size() + " TRANSIT goals to end");
             }
         }
 
+        recordSubgoalOrderingSnapshot(cachedSubgoalOrder, state, level, rawSubgoalCount,
+                suspendedRemoved, physicalPromotions, deprioritizedMoved, prioritizedMoved,
+                escapePrepended, transitDeferred, orderStages, physicalPromotionDetails);
         logGoalOrder(cachedSubgoalOrder);
     }
     
@@ -2551,9 +2597,10 @@ public class PriorityPlanningStrategy implements SearchStrategy {
      * swap them. Only applies to cross-color pairs (same-color handled by dependency graph).
      * Limited to O(n²) pairwise checks with max n² swaps.
      */
-    private void applyPhysicalBlockingSort(List<Subgoal> subgoals, State state, Level level) {
+    private int applyPhysicalBlockingSort(List<Subgoal> subgoals, State state, Level level,
+                                          List<String> promotionDetails) {
         int n = subgoals.size();
-        if (n < 2) return;
+        if (n < 2) return 0;
         
         // Build box→goal paths for each subgoal (lazily cached)
         Map<Integer, Set<Position>> pathCells = new HashMap<>();
@@ -2561,6 +2608,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
         boolean changed = true;
         int passes = 0;
         int maxPasses = n; // limit iterations
+        int promotions = 0;
         
         while (changed && passes < maxPasses) {
             changed = false;
@@ -2596,6 +2644,14 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                         subgoals.add(i, b);
                         pathCells.clear(); // invalidate path cache after reorder
                         changed = true;
+                        promotions++;
+                        if (promotionDetails != null && promotionDetails.size() < DIAG_SUBGOAL_SAMPLE_LIMIT) {
+                            promotionDetails.add(subgoalLabel(b) + " before " + subgoalLabel(a)
+                                    + " source=cross-color-physical-blocking"
+                                    + " evidence=" + positionText(a.goalPos)
+                                    + " lies on " + positionText(boxPosForDiagnostic(b, state, level))
+                                    + "->" + positionText(b.goalPos) + " corridor");
+                        }
                         logVerbose("[PP] [PHYS-SORT] Promoted " + b.boxType + "->" + b.goalPos 
                                 + " before " + a.boxType + "->" + a.goalPos + " (cross-color blocking)");
                         break; // restart inner loop from new i
@@ -2604,6 +2660,533 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                 if (changed) break; // restart outer loop
             }
         }
+        return promotions;
+    }
+
+    private void recordSubgoalOrderingSnapshot(List<Subgoal> ordered, State state, Level level,
+                                               int rawSubgoalCount, int suspendedRemoved,
+                                               int physicalPromotions, int deprioritizedMoved,
+                                               int prioritizedMoved, int escapePrepended,
+                                               int transitDeferred, List<String> orderStages,
+                                               List<String> physicalPromotionDetails) {
+        Map<String, String> details = detailMap(
+                "schema", "mavis-hospital-subgoal-ordering-v1",
+                "orderSnapshotId", "order-" + (++diagSubgoalOrderSeq),
+                "decisionLayer", "subgoal-ordering",
+                "orderingMode", orderingMode,
+                "orderingBasis", orderingBasisText(),
+                "topologyBasis", topologyBasisText(),
+                "heuristicBasis", heuristicBasisText(),
+                "rawSubgoalCount", rawSubgoalCount,
+                "orderedSubgoalCount", ordered != null ? ordered.size() : 0,
+                "precomputedGoalOrderSize", precomputedGoalOrder != null ? precomputedGoalOrder.size() : 0,
+                "goalDependencyEdges", countGoalDependencyEdges(),
+                "completedBoxGoals", completedBoxGoals.size(),
+                "suspendedBoxGoals", suspendedBoxGoals.size(),
+                "suspendedTransitGoals", suspendedTransitGoals.size(),
+                "displacedGoals", displacedGoals.size(),
+                "deprioritizedGoalHints", deprioritizedGoals.size(),
+                "prioritizedGoalHints", prioritizedGoals.size(),
+                "escapeSubgoalHints", escapeSubgoals.size(),
+                "transitProfiles", transitProfiles.size(),
+                "suspendedRemoved", suspendedRemoved,
+                "physicalBlockingPromotions", physicalPromotions,
+                "deprioritizedMovedToTail", deprioritizedMoved,
+                "prioritizedMovedToFront", prioritizedMoved,
+                "escapePrepended", escapePrepended,
+                "transitDeferredToTail", transitDeferred,
+                "dependencyEdges", dependencyEdgeDetailsText(level),
+                "orderingMetricSample", orderingMetricSample(ordered, level),
+                "adjacentPairRationaleSample", adjacentPairRationaleSample(ordered, level),
+                "transitProfileDetails", transitProfileDetailsText(level),
+                "orderStageSample", String.join("; ", orderStages),
+                "physicalBlockingPromotionDetails", physicalPromotionDetails == null || physicalPromotionDetails.isEmpty()
+                        ? "none" : String.join("; ", physicalPromotionDetails),
+                "orderSample", subgoalRankingSample(ordered, state, level));
+        recordDecisionEvent("subgoal-ordering-snapshot", "info",
+                "Subgoal ordering snapshot",
+                "The planner computed or refreshed the cached subgoal priority order.",
+                -1, "L3-ordering", null, null, null, null,
+                "computed-priority-order", "SNAPSHOT", details);
+    }
+
+    private void addOrderStageSample(List<String> stages, String stage, List<Subgoal> order) {
+        if (stages == null || stage == null) return;
+        stages.add(stage + "=" + subgoalOrderLabelSample(order, DIAG_SUBGOAL_SAMPLE_LIMIT));
+    }
+
+    private String subgoalOrderLabelSample(List<Subgoal> order, int limit) {
+        if (order == null || order.isEmpty()) return "none";
+        List<String> labels = new ArrayList<>();
+        int cap = Math.min(limit, order.size());
+        for (int i = 0; i < cap; i++) {
+            labels.add((i + 1) + ":" + subgoalLabel(order.get(i)));
+        }
+        if (order.size() > cap) labels.add("+" + (order.size() - cap) + " more");
+        return String.join("|", labels);
+    }
+
+    private String dependencyEdgeDetailsText(Level level) {
+        List<String> parts = new ArrayList<>();
+        if (goalDependencyEdges != null && !goalDependencyEdges.isEmpty()) {
+            int cap = Math.min(80, goalDependencyEdges.size());
+            for (int i = 0; i < cap; i++) {
+                LevelAnalyzer.GoalDependencyEdge edge = goalDependencyEdges.get(i);
+                parts.add(edgeText(edge, level));
+            }
+            if (goalDependencyEdges.size() > cap) {
+                parts.add("+" + (goalDependencyEdges.size() - cap) + " more");
+            }
+            return String.join("; ", parts);
+        }
+        for (Map.Entry<Position, Set<Position>> entry : goalDependsOn.entrySet()) {
+            for (Position dep : entry.getValue()) {
+                parts.add(goalLabel(entry.getKey(), level) + " depends-on " + goalLabel(dep, level)
+                        + " source=LevelAnalyzer.goalDependsOn reason=not-exported");
+            }
+        }
+        return parts.isEmpty() ? "none" : String.join("; ", parts);
+    }
+
+    private String edgeText(LevelAnalyzer.GoalDependencyEdge edge, Level level) {
+        return goalLabel(edge.dependentGoal, level)
+                + " depends-on " + goalLabel(edge.prerequisiteGoal, level)
+                + " source=" + edge.source
+                + " reason=" + edge.reason
+                + " evidence=" + edge.evidence;
+    }
+
+    private String orderingMetricSample(List<Subgoal> ordered, Level level) {
+        if (ordered == null || ordered.isEmpty()) return "none";
+        List<String> parts = new ArrayList<>();
+        int cap = Math.min(DIAG_SUBGOAL_SAMPLE_LIMIT, ordered.size());
+        for (int i = 0; i < cap; i++) {
+            Subgoal sg = ordered.get(i);
+            parts.add((i + 1) + ":" + goalMetricText(sg.goalPos, level));
+        }
+        if (ordered.size() > cap) parts.add("+" + (ordered.size() - cap) + " more");
+        return String.join("; ", parts);
+    }
+
+    private String adjacentPairRationaleSample(List<Subgoal> ordered, Level level) {
+        if (ordered == null || ordered.size() < 2) return "none";
+        List<String> parts = new ArrayList<>();
+        int cap = Math.min(DIAG_SUBGOAL_SAMPLE_LIMIT, ordered.size() - 1);
+        for (int i = 0; i < cap; i++) {
+            Subgoal before = ordered.get(i);
+            Subgoal after = ordered.get(i + 1);
+            parts.add((i + 1) + ":" + subgoalLabel(before) + " before " + subgoalLabel(after)
+                    + " because " + pairOrderingRationale(before.goalPos, after.goalPos, level));
+        }
+        if (ordered.size() - 1 > cap) parts.add("+" + (ordered.size() - 1 - cap) + " more");
+        return String.join("; ", parts);
+    }
+
+    private String pairOrderingRationale(Position before, Position after, Level level) {
+        LevelAnalyzer.GoalDependencyEdge direct = findDependencyEdge(after, before);
+        if (direct != null) {
+            return "direct-dependency: " + goalLabel(after, level) + " depends on "
+                    + goalLabel(before, level) + " (" + direct.source + ": "
+                    + direct.reason + "; " + direct.evidence + ")";
+        }
+        List<Position> path = dependencyPath(after, before);
+        if (!path.isEmpty()) {
+            return "transitive-dependency: " + dependencyPathText(path, level);
+        }
+        LevelAnalyzer.GoalDependencyEdge reverse = findDependencyEdge(before, after);
+        if (reverse != null) {
+            return "ordering-override-or-cycle: reverse edge exists ("
+                    + edgeText(reverse, level) + "), inspect runtime filters/order repairs";
+        }
+        String postProcessor = postOrderingRationale(before, after, level);
+        if (postProcessor != null) return postProcessor;
+        return "topological-tie-break: " + metricComparisonText(before, after, level);
+    }
+
+    private String postOrderingRationale(Position before, Position after, Level level) {
+        boolean beforeEscape = escapeGoalPositions.contains(before);
+        boolean afterEscape = escapeGoalPositions.contains(after);
+        if (beforeEscape && !afterEscape) return "escape-prepend: synthetic escape goals run before normal goals";
+
+        boolean beforePrioritized = prioritizedGoals.contains(before);
+        boolean afterPrioritized = prioritizedGoals.contains(after);
+        if (beforePrioritized && !afterPrioritized) {
+            return "failure-signal-promotion: prior FailureReport blocker goal promoted to front";
+        }
+
+        boolean beforeDeprioritized = deprioritizedGoals.contains(before);
+        boolean afterDeprioritized = deprioritizedGoals.contains(after);
+        if (!beforeDeprioritized && afterDeprioritized) {
+            return "failure-signal-demotion: previously failed goal moved to tail";
+        }
+
+        GoalTransitAnalyzer.GoalProfile beforeProfile = transitProfiles.get(before);
+        GoalTransitAnalyzer.GoalProfile afterProfile = transitProfiles.get(after);
+        boolean beforeTransit = beforeProfile != null
+                && beforeProfile.profile == GoalTransitAnalyzer.TransitProfile.TRANSIT;
+        boolean afterTransit = afterProfile != null
+                && afterProfile.profile == GoalTransitAnalyzer.TransitProfile.TRANSIT;
+        boolean beforeChoke = beforeProfile != null
+                && beforeProfile.profile == GoalTransitAnalyzer.TransitProfile.CHOKEPOINT;
+        boolean afterChoke = afterProfile != null
+                && afterProfile.profile == GoalTransitAnalyzer.TransitProfile.CHOKEPOINT;
+        boolean beforeTail = beforeTransit || beforeChoke;
+        boolean afterTail = afterTransit || afterChoke;
+        if (!beforeTail && afterTail && !prioritizedGoals.contains(after)) {
+            return "transit-tail: non-transit goal kept before TRANSIT/CHOKEPOINT goal";
+        }
+        if (beforeTail && afterTail) {
+            int beforeCrossings = beforeProfile != null ? beforeProfile.crossingCount : 0;
+            int afterCrossings = afterProfile != null ? afterProfile.crossingCount : 0;
+            if (beforeCrossings != afterCrossings) {
+                return "transit-tail: lower crossing-count first inside transit tail "
+                        + beforeCrossings + " vs " + afterCrossings;
+            }
+            return "transit-tail: equal crossing-count transit goals preserve prior order";
+        }
+        return null;
+    }
+
+    private LevelAnalyzer.GoalDependencyEdge findDependencyEdge(Position dependent, Position prerequisite) {
+        if (dependent == null || prerequisite == null || goalDependencyEdges == null) return null;
+        for (LevelAnalyzer.GoalDependencyEdge edge : goalDependencyEdges) {
+            if (dependent.equals(edge.dependentGoal) && prerequisite.equals(edge.prerequisiteGoal)) {
+                return edge;
+            }
+        }
+        if (goalDependsOn.getOrDefault(dependent, Collections.emptySet()).contains(prerequisite)) {
+            return new LevelAnalyzer.GoalDependencyEdge(dependent, prerequisite,
+                    "LevelAnalyzer.goalDependsOn", "Dependency edge exists but no detailed reason was exported.",
+                    "dependent=" + dependent + " prerequisite=" + prerequisite);
+        }
+        return null;
+    }
+
+    private List<Position> dependencyPath(Position dependent, Position prerequisite) {
+        if (dependent == null || prerequisite == null || dependent.equals(prerequisite)) return Collections.emptyList();
+        Queue<Position> queue = new LinkedList<>();
+        Map<Position, Position> parent = new HashMap<>();
+        Set<Position> visited = new HashSet<>();
+        queue.add(dependent);
+        visited.add(dependent);
+        while (!queue.isEmpty()) {
+            Position current = queue.poll();
+            for (Position dep : goalDependsOn.getOrDefault(current, Collections.emptySet())) {
+                if (!visited.add(dep)) continue;
+                parent.put(dep, current);
+                if (dep.equals(prerequisite)) {
+                    List<Position> path = new ArrayList<>();
+                    Position p = prerequisite;
+                    while (p != null) {
+                        path.add(p);
+                        if (p.equals(dependent)) break;
+                        p = parent.get(p);
+                    }
+                    Collections.reverse(path);
+                    return path;
+                }
+                queue.add(dep);
+            }
+        }
+        return Collections.emptyList();
+    }
+
+    private String dependencyPathText(List<Position> path, Level level) {
+        if (path == null || path.isEmpty()) return "none";
+        List<String> labels = new ArrayList<>();
+        for (Position p : path) labels.add(goalLabel(p, level));
+        return String.join(" -> ", labels);
+    }
+
+    private String metricComparisonText(Position before, Position after, Level level) {
+        LevelAnalyzer.GoalOrderingMetric a = goalOrderingMetrics.get(before);
+        LevelAnalyzer.GoalOrderingMetric b = goalOrderingMetrics.get(after);
+        if (a == null || b == null) {
+            return "no direct dependency; LevelAnalyzer executionOrder placed "
+                    + goalLabel(before, level) + " before " + goalLabel(after, level)
+                    + " but tie-break metrics were not exported";
+        }
+        return firstDifferingMetric(a, b) + "; before=" + goalMetricText(before, level)
+                + "; after=" + goalMetricText(after, level);
+    }
+
+    private String firstDifferingMetric(LevelAnalyzer.GoalOrderingMetric a,
+                                        LevelAnalyzer.GoalOrderingMetric b) {
+        if (a.importance != b.importance) {
+            return "importance tier (higher first) " + a.importance + " vs " + b.importance;
+        }
+        if (a.pathConflictScore != b.pathConflictScore) {
+            return "path-conflict tier (higher first) " + a.pathConflictScore + " vs " + b.pathConflictScore;
+        }
+        if (Math.abs(a.pathNarrowness - b.pathNarrowness) > 0.01) {
+            return "path-narrowness tier (higher first) "
+                    + String.format(Locale.ROOT, "%.3f", a.pathNarrowness)
+                    + " vs " + String.format(Locale.ROOT, "%.3f", b.pathNarrowness);
+        }
+        if (a.agentGoalBoxTasks != b.agentGoalBoxTasks) {
+            return "agent-box-task tier (lower first) " + metricIntText(a.agentGoalBoxTasks)
+                    + " vs " + metricIntText(b.agentGoalBoxTasks);
+        }
+        if (a.distanceFromComponentRoot != b.distanceFromComponentRoot) {
+            return "BFS-distance tier (higher first) " + a.distanceFromComponentRoot
+                    + " vs " + b.distanceFromComponentRoot;
+        }
+        return "stable DFS/input tie after equal exported metrics";
+    }
+
+    private String goalMetricText(Position goal, Level level) {
+        LevelAnalyzer.GoalOrderingMetric metric = goalOrderingMetrics.get(goal);
+        if (metric == null) return goalLabel(goal, level) + " metrics=unavailable";
+        return goalLabel(goal, level)
+                + " topo=" + metric.topologicalIndex
+                + " importance=" + metric.importance
+                + " deps=" + metric.dependencyCount
+                + " dependedBy=" + metric.dependentCount
+                + " pathConflict=" + metric.pathConflictScore
+                + " narrowness=" + String.format(Locale.ROOT, "%.3f", metric.pathNarrowness)
+                + " agentBoxTasks=" + metricIntText(metric.agentGoalBoxTasks)
+                + " bfsDistance=" + metric.distanceFromComponentRoot;
+    }
+
+    private String transitProfileDetailsText(Level level) {
+        if (transitProfiles == null || transitProfiles.isEmpty()) return "none";
+        List<String> parts = new ArrayList<>();
+        int count = 0;
+        for (GoalTransitAnalyzer.GoalProfile profile : transitProfiles.values()) {
+            if (count++ >= 80) {
+                parts.add("+" + (transitProfiles.size() - 80) + " more");
+                break;
+            }
+            parts.add(goalLabel(profile.goalPos, level)
+                    + " profile=" + profile.profile
+                    + " crossings=" + profile.crossingCount
+                    + " degree=" + profile.degree
+                    + " crossingGoals=" + positionCollectionText(profile.crossingGoals, 8, level));
+        }
+        return String.join("; ", parts);
+    }
+
+    private String positionCollectionText(Collection<Position> positions, int limit, Level level) {
+        if (positions == null || positions.isEmpty()) return "none";
+        List<String> labels = new ArrayList<>();
+        int count = 0;
+        for (Position p : positions) {
+            if (count++ >= limit) break;
+            labels.add(goalLabel(p, level));
+        }
+        if (positions.size() > limit) labels.add("+" + (positions.size() - limit) + " more");
+        return String.join("|", labels);
+    }
+
+    private String metricIntText(int value) {
+        return value >= Integer.MAX_VALUE / 8 ? "n/a" : String.valueOf(value);
+    }
+
+    private String goalLabel(Position goal, Level level) {
+        if (goal == null) return "null";
+        char boxGoal = level != null ? level.getBoxGoal(goal) : '\0';
+        if (boxGoal != '\0') return boxGoal + "@" + positionText(goal);
+        int agentGoal = level != null ? level.getAgentGoal(goal.row, goal.col) : -1;
+        if (agentGoal >= 0) return "agent" + agentGoal + "@" + positionText(goal);
+        return "@" + positionText(goal);
+    }
+
+    private Position boxPosForDiagnostic(Subgoal subgoal, State state, Level level) {
+        if (subgoal == null || subgoal.isAgentGoal || state == null || level == null) return null;
+        return subgoalManager.findBestBoxForGoal(subgoal, state, level, Collections.emptyList(), completedBoxGoals);
+    }
+
+    private void recordSubgoalSelectionSummary(List<Subgoal> candidates, Subgoal selected,
+                                               State currentState, Level level) {
+        int selectedRank = -1;
+        int eligibleCount = 0;
+        Map<String, Integer> statusCounts = new LinkedHashMap<>();
+        if (candidates != null) {
+            for (int i = 0; i < candidates.size(); i++) {
+                Subgoal candidate = candidates.get(i);
+                if (candidate == selected) selectedRank = i + 1;
+                String gate = subgoalSelectionGateReason(candidate, currentState, level);
+                if ("eligible".equals(gate)) eligibleCount++;
+                statusCounts.merge(gate, 1, Integer::sum);
+            }
+        }
+
+        Map<String, String> details = detailMap(
+                "schema", "mavis-hospital-subgoal-selection-v1",
+                "selectionId", "selection-" + (++diagSubgoalSelectionSeq),
+                "decisionLayer", "subgoal-selection",
+                "selectionBasis", "first-eligible-subgoal-in-current-priority-order",
+                "orderingBasis", orderingBasisText(),
+                "filterBasis", selectionFilterBasisText(),
+                "topologyBasis", topologyBasisText(),
+                "heuristicBasis", heuristicBasisText(),
+                "candidateCount", candidates != null ? candidates.size() : 0,
+                "eligibleCount", eligibleCount,
+                "selectedRank", selectedRank,
+                "selectedEstimatedDifficulty", estimateSubgoalDifficultyText(selected, currentState, level),
+                "selectedUnmetDependencies", countUnmetDependencies(selected.goalPos, level),
+                "selectedCompletionCount", goalCompletionCount.getOrDefault(selected.goalPos, 0),
+                "selectionStatusCounts", countMapText(statusCounts),
+                "candidateStatusSample", subgoalSelectionSample(candidates, selected, currentState, level));
+        recordDecisionEvent("subgoal-selection-summary", "info",
+                "Subgoal selection summary",
+                "The planner selected the next subgoal from the current priority queue.",
+                selected, "first-eligible-by-priority", "SELECTED", details);
+    }
+
+    private String subgoalSelectionGateReason(Subgoal subgoal, State currentState, Level level) {
+        if (subgoal == null) return "missing-subgoal";
+        if (goalDependsOn.containsKey(subgoal.goalPos) && !areDependenciesMet(subgoal.goalPos, level)) {
+            return "blocked-unmet-topology-dependencies";
+        }
+        if (!subgoal.isAgentGoal
+                && goalCompletionCount.getOrDefault(subgoal.goalPos, 0) >= MAX_GOAL_COMPLETIONS) {
+            return "skipped-cycle-completion-limit";
+        }
+        if (!subgoal.isAgentGoal && trapBlacklist.contains(subgoal.goalPos)) {
+            return "skipped-trap-blacklist";
+        }
+        if (isSyntheticBoxTarget(subgoal, level) && syntheticReliefBlacklist.contains(subgoal.goalPos)) {
+            return "skipped-synthetic-relief-blacklist";
+        }
+        if (subgoal.isSyntheticRelief() && !reliefCertificateStillBlocked(subgoal, currentState, level)) {
+            return "skipped-relief-certificate-resolved";
+        }
+        return "eligible";
+    }
+
+    private String subgoalRankingSample(List<Subgoal> subgoals, State state, Level level) {
+        if (subgoals == null || subgoals.isEmpty()) return "none";
+        List<String> sample = new ArrayList<>();
+        int cap = Math.min(DIAG_SUBGOAL_SAMPLE_LIMIT, subgoals.size());
+        for (int i = 0; i < cap; i++) {
+            sample.add(subgoalDiagnosticText(i + 1, subgoals.get(i), state, level, null));
+        }
+        if (subgoals.size() > cap) sample.add("+" + (subgoals.size() - cap) + " more");
+        return String.join("; ", sample);
+    }
+
+    private String subgoalSelectionSample(List<Subgoal> subgoals, Subgoal selected,
+                                          State state, Level level) {
+        if (subgoals == null || subgoals.isEmpty()) return "none";
+        List<String> sample = new ArrayList<>();
+        int selectedRank = -1;
+        for (int i = 0; i < subgoals.size(); i++) {
+            if (subgoals.get(i) == selected) {
+                selectedRank = i + 1;
+                break;
+            }
+        }
+        int cap = Math.min(DIAG_SUBGOAL_SAMPLE_LIMIT, subgoals.size());
+        for (int i = 0; i < cap; i++) {
+            Subgoal sg = subgoals.get(i);
+            String status = sg == selected
+                    ? "selected"
+                    : subgoalSelectionGateReason(sg, state, level);
+            if ("eligible".equals(status) && selectedRank > 0 && i + 1 > selectedRank) {
+                status = "eligible-lower-priority";
+            }
+            sample.add(subgoalDiagnosticText(i + 1, sg, state, level, status));
+        }
+        if (subgoals.size() > cap) sample.add("+" + (subgoals.size() - cap) + " more");
+        return String.join("; ", sample);
+    }
+
+    private String subgoalDiagnosticText(int rank, Subgoal sg, State state, Level level, String status) {
+        List<String> tags = new ArrayList<>();
+        if (status != null) tags.add("status=" + status);
+        if (prioritizedGoals.contains(sg.goalPos)) tags.add("prioritized");
+        if (deprioritizedGoals.contains(sg.goalPos)) tags.add("deprioritized");
+        if (deferredBlockedGoals.contains(sg.goalPos)) tags.add("deferred");
+        if (!sg.isAgentGoal && displacedGoals.contains(sg.goalPos)) tags.add("displaced");
+        if (!sg.isAgentGoal && isTransitGoal(sg.goalPos)) tags.add("transit");
+        if (isEscapeSubgoal(sg)) tags.add("escape");
+        if (sg.isSyntheticRelief()) tags.add("synthetic-relief");
+        return rank + ":" + subgoalLabel(sg)
+                + " type=" + subgoalType(sg)
+                + " diff=" + estimateSubgoalDifficultyText(sg, state, level)
+                + " topoMetric={" + goalMetricText(sg.goalPos, level) + "}"
+                + " unmetDeps=" + countUnmetDependencies(sg.goalPos, level)
+                + " completions=" + goalCompletionCount.getOrDefault(sg.goalPos, 0)
+                + (tags.isEmpty() ? "" : " tags=" + String.join("|", tags));
+    }
+
+    private String estimateSubgoalDifficultyText(Subgoal subgoal, State state, Level level) {
+        if (subgoal == null || state == null || level == null) return "unknown";
+        int difficulty = subgoalManager.estimateSubgoalDifficulty(subgoal, state, level, completedBoxGoals);
+        return difficulty >= Integer.MAX_VALUE / 8 ? "unreachable" : String.valueOf(difficulty);
+    }
+
+    private int countGoalDependencyEdges() {
+        int count = 0;
+        for (Set<Position> deps : goalDependsOn.values()) {
+            if (deps != null) count += deps.size();
+        }
+        return count;
+    }
+
+    private String countMapText(Map<String, Integer> counts) {
+        if (counts == null || counts.isEmpty()) return "none";
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            parts.add(entry.getKey() + "=" + entry.getValue());
+        }
+        return String.join(", ", parts);
+    }
+
+    private String orderingBasisText() {
+        return switch (orderingMode) {
+            case TOPOLOGICAL -> precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()
+                    ? "topology: LevelAnalyzer.executionOrder dependency-first order"
+                    : "heuristic fallback: estimated subgoal difficulty ascending";
+            case REVERSE_TOPOLOGICAL -> precomputedGoalOrder != null && !precomputedGoalOrder.isEmpty()
+                    ? "topology: reverse LevelAnalyzer.executionOrder"
+                    : "heuristic fallback: estimated subgoal difficulty ascending";
+            case DISTANCE_GREEDY -> "heuristic: estimated subgoal difficulty ascending";
+            case DISTANCE_FARTHEST -> "heuristic/topology: estimated difficulty descending for corridor/spiral risk";
+            case RANDOM -> "diversification: seeded random shuffle seed=" + currentRandomSeed;
+        };
+    }
+
+    private String topologyBasisText() {
+        List<String> parts = new ArrayList<>();
+        parts.add("goalDependencyEdges=" + countGoalDependencyEdges());
+        parts.add("explainedDependencyEdges=" + goalDependencyEdges.size());
+        parts.add("precomputedGoalOrder=" + (precomputedGoalOrder != null ? precomputedGoalOrder.size() : 0));
+        parts.add("orderingMetrics=" + goalOrderingMetrics.size());
+        parts.add("crossColorPhysicalBlockingSort=enabled");
+        parts.add("transitProfiles=" + transitProfiles.size());
+        parts.add("deferredBlockedGoals=" + deferredBlockedGoals.size());
+        parts.add("prioritizedFromFailureReport=" + prioritizedGoals.size());
+        parts.add("deprioritizedFromFailureReport=" + deprioritizedGoals.size());
+        parts.add("escapeSubgoals=" + escapeSubgoals.size());
+        return String.join("; ", parts);
+    }
+
+    private String heuristicBasisText() {
+        return heuristic.getClass().getSimpleName()
+                + "; difficulty=agent-to-box operation-side work distance + box-to-goal immovable-aware distance"
+                + "; BSP budget uses true-distance when available, otherwise Manhattan";
+    }
+
+    private String selectionFilterBasisText() {
+        return "runtime gates: topology dependencies, completed goals, cycle completion limit, trap blacklist,"
+                + " synthetic relief blacklist, and relief certificate state";
+    }
+
+    private String boxCandidateBasisText(boolean usedHungarian, boolean fixedReliefBox) {
+        if (fixedReliefBox) {
+            return "fixed synthetic-relief certificate blocker";
+        }
+        if (usedHungarian) {
+            return "Hungarian pre-assignment first, then greedy distance fallback if invalidated";
+        }
+        return "greedy distance candidate order with allocation feasibility check";
+    }
+
+    private String transactionValidationBasisText() {
+        return "post-plan validation: goal reached, regression guard, seal-risk guard,"
+                + " agent-trap guard, support validation, and subgoal eval";
     }
     
     /** Log the goal execution order. Internal planning detail, verbose only. */
@@ -2687,6 +3270,7 @@ public class PriorityPlanningStrategy implements SearchStrategy {
 
             // P0a: record the subgoal currently being attempted for the failure-report path.
             lastAttemptedSubgoalForReport = subgoal;
+            recordSubgoalSelectionSummary(subgoals, subgoal, currentState, level);
 
             // Task-Aware: Pass the full list of subgoals for global allocation checking
             List<Action> path = planSubgoal(subgoal, currentState, level, subgoals);
@@ -8005,6 +8589,9 @@ public class PriorityPlanningStrategy implements SearchStrategy {
                                           String status, String reason,
                                           Map<String, String> details) {
         Map<String, String> txDetails = detailMap(
+                "schema", "mavis-hospital-planner-transaction-v2",
+                "decisionLayer", "transaction-validation",
+                "validationBasis", transactionValidationBasisText(),
                 "transactionId", "tx-" + (++diagTransactionSeq),
                 "planStart", planStart,
                 "planEnd", planEnd,
@@ -8036,6 +8623,11 @@ public class PriorityPlanningStrategy implements SearchStrategy {
             }
         }
         Map<String, String> details = detailMap(
+                "schema", "mavis-hospital-candidate-summary-v2",
+                "decisionLayer", "box-candidate-selection",
+                "candidateBasis", boxCandidateBasisText(usedHungarian, fixedReliefBox),
+                "heuristicBasis", heuristicBasisText(),
+                "topologyBasis", topologyBasisText(),
                 "attempt", attempt,
                 "usedHungarian", usedHungarian,
                 "fixedReliefBox", fixedReliefBox,

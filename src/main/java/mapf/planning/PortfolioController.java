@@ -1531,6 +1531,10 @@ public class PortfolioController implements SearchStrategy {
                 if (features != null && features.goalDependsOn != null) {
                     priorityPlanning.setGoalDependencies(features.goalDependsOn);
                 }
+                if (features != null) {
+                    priorityPlanning.setGoalOrderingDiagnostics(
+                            features.dependencyEdges, features.orderingMetrics);
+                }
                 // Pass immovable boxes (treated as walls)
                 if (features != null && features.taskFilter != null) {
                     priorityPlanning.setImmovableBoxes(features.taskFilter.immovableBoxes);
@@ -2553,6 +2557,7 @@ public class PortfolioController implements SearchStrategy {
                     heuristic, strategyConfig, groupSubgoalManager);
                 if (groupFeatures.executionOrder != null) pp.setGoalExecutionOrder(groupFeatures.executionOrder);
                 if (groupFeatures.goalDependsOn != null) pp.setGoalDependencies(groupFeatures.goalDependsOn);
+                pp.setGoalOrderingDiagnostics(groupFeatures.dependencyEdges, groupFeatures.orderingMetrics);
                 if (groupFeatures.taskFilter != null) pp.setImmovableBoxes(groupFeatures.taskFilter.immovableBoxes);
                 if (sc.orderingMode != null) pp.setOrderingMode(sc.orderingMode);
                 if (sc.orderingMode == OrderingMode.RANDOM && sc.randomSeed != 0) pp.setRandomSeed(sc.randomSeed);
