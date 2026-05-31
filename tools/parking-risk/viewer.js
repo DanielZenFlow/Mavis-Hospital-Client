@@ -1,7 +1,7 @@
 const COLOR_HEX = {
   BLUE: '#3050ff', RED: '#ff0000', CYAN: '#00ffff',
   PURPLE: '#6000b0', GREEN: '#00ff00', ORANGE: '#ff8000',
-  PINK: '#f060c0', GREY: '#707070', LIGHTBLUE: '#70c0ff',
+  PINK: '#f060c0', GREY: '#707070', GRAY: '#707070', LIGHTBLUE: '#70c0ff',
   BROWN: '#603000', DEFAULT: '#c0c0c0',
 };
 
@@ -1272,8 +1272,8 @@ function renderBoard() {
 
       if (els.showObjects.checked) {
         var box = boxes.get(kk), agent = agents.get(kk);
-        if (box) cell.appendChild(token(box.type, box.color, 'box'));
-        if (agent) cell.appendChild(token(agent.id, agent.color, 'agent'));
+        if (box) cell.appendChild(token(box.type, objectColor(box.color)));
+        if (agent) cell.appendChild(token(String(agent.id), objectColor(agent.color), 'agentToken'));
       }
       board.appendChild(cell);
     }
@@ -1351,13 +1351,14 @@ function zoomAt(cx, cy, f) {
 
 // ---- Helpers ----
 
-function token(text, color, kind) {
-  var el = document.createElement('div');
-  el.className = 'token ' + kind;
+function token(text, color, extraClass) {
+  var el = document.createElement('span');
+  el.className = extraClass ? 'token ' + extraClass : 'token';
   el.textContent = text;
-  el.style.background = COLOR_HEX[color] || COLOR_HEX.DEFAULT;
+  el.style.background = color;
   return el;
 }
+function objectColor(color) { return COLOR_HEX[color] || COLOR_HEX.DEFAULT; }
 function goalCharEl(text) { var el = document.createElement('div'); el.className = 'goalChar'; el.textContent = text; return el; }
 function div(cls, text) { var el = document.createElement('div'); el.className = cls; el.textContent = text || ''; return el; }
 function posSet(items) { return new Set(items.map(function(p) { return key(p.r, p.c); })); }

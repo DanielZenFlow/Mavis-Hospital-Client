@@ -20,6 +20,7 @@
   --grid: #404040;
   --wall: #000;
   --goal: #dfdf00;
+  --token-font: #000000;
   --safe: rgba(30, 150, 85, 0.36);
   --caution: rgba(255, 150, 0, 0.56);
   --danger: rgba(230, 35, 35, 0.68);
@@ -509,7 +510,14 @@ h2 { margin: 14px 0 8px; font-size: 12px; text-transform: uppercase; }
   position: relative;
   width: var(--cell);
   height: var(--cell);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: var(--floor);
+  font-family: MavisMono, Consolas, monospace;
+  font-weight: 700;
+  font-size: calc(var(--cell) * 0.6);
+  line-height: 1;
   overflow: hidden;
 }
 .cell.wall { background: var(--wall); }
@@ -527,18 +535,21 @@ h2 { margin: 14px 0 8px; font-size: 12px; text-transform: uppercase; }
 .cell.danger::after { background: var(--danger); }
 .token {
   position: absolute;
-  inset: 13%;
-  display: flex;
+  width: calc(var(--cell) - 4px);
+  height: calc(var(--cell) - 4px);
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 2px;
-  color: #000;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  color: var(--token-font);
   background: #c0c0c0;
-  font-size: calc(var(--cell) * 0.44);
+  font-family: MavisMono, Consolas, monospace;
+  font-weight: 700;
+  font-size: calc(var(--cell) * 0.6);
   line-height: 1;
   z-index: 2;
 }
-.agent { border-radius: 50%; }
+.agentToken { border-radius: 50%; }
 .goalChar {
   position: absolute;
   inset: 0;
