@@ -12,6 +12,23 @@ A **Multi-Agent Path Finding (MAPF)** solver for the hospital robotics domain, b
 - **True-distance heuristic** — BFS-precomputed shortest paths respecting walls
 - **Deadlock detection & resolution** — cycle detection, corner pruning, and agent coordination
 
+## Replay Reviewer
+
+The replay reviewer is available from `target/diagnostics/replay-viewer/index.html` after diagnostics are generated.
+
+### v1.0.3
+
+- Added lifecycle timeline views for replay diagnostics, including a full timeline panel and a compact mini timeline.
+- Added primary-task lanes above lifecycle-stage lanes so transaction-level work can be read together with stage execution.
+- Added playback progress rendering in the mini timeline, current-step tracking, automatic timeline follow during replay, and drag-to-pan timeline navigation.
+- Added portfolio attempt display with strategy, result, step count, box-goal completion, and final-state hash.
+- Added run context metadata display for code version, runtime artifact hash, level fingerprint, initial-state fingerprint, and planning budget values.
+- Added support for enriched replay diagnostics, including planner transactions, candidate summaries, subgoal ordering snapshots, diagnostic focus data, and exported lifecycle metadata.
+- Added agent hover and pinned-agent views with primary task, transaction context, planner intent, server action, movement, and box interaction details.
+- Added replay search, step highlights, playback ranges, bookmarks, range export, lifecycle metadata export, and text-size controls.
+- Added structured replay validation and rollback-safe loading so invalid replay data does not leave the reviewer in a partial load state.
+- Added browser-storage-aware automatic restore so large replay files can still be opened while restore caching depends on available browser storage.
+
 ## Requirements
 
 - **Java** 17+

@@ -754,6 +754,39 @@ button:disabled {
   overflow-wrap: anywhere;
   text-align: right;
 }
+.timelineReasonList {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid rgba(216, 205, 169, 0.72);
+  border-bottom: 1px solid rgba(216, 205, 169, 0.72);
+}
+.timelineReasonRow {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.8fr) minmax(0, 1.5fr) minmax(90px, 0.9fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 0;
+  border-top: 1px solid rgba(216, 205, 169, 0.52);
+}
+.timelineReasonRow:first-child {
+  border-top: 0;
+}
+.timelineReasonRow strong {
+  color: var(--text);
+  font-size: var(--ui-font-size-sm);
+}
+.timelineReasonRow span,
+.timelineReasonRow small {
+  color: var(--text-muted);
+  font-size: var(--ui-font-size-sm);
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.timelineReasonRow small {
+  color: var(--text-soft);
+  font-weight: 800;
+  text-align: right;
+}
 .timelineDebugIssue dl {
   display: grid;
   grid-template-columns: 82px minmax(0, 1fr);
@@ -964,7 +997,8 @@ button:disabled {
   top: 0;
   left: 0;
   bottom: 0;
-  width: var(--stage-progress, 0%);
+  width: var(--stage-progress-width, 0px);
+  max-width: var(--duration-width, 100%);
   background: rgba(57, 67, 53, 0.2);
   box-shadow: inset -1px 0 0 rgba(57, 67, 53, 0.18);
   pointer-events: none;
@@ -978,6 +1012,18 @@ button:disabled {
 }
 .timelineStageBar.progress.danger::before {
   background: rgba(143, 29, 29, 0.18);
+}
+.timelinePrimaryTaskBar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: calc(var(--duration-width, 100%) - 1px);
+  bottom: 0;
+  width: 2px;
+  border-radius: 0 4px 4px 0;
+  background: rgba(31, 42, 58, 0.34);
+  pointer-events: none;
+  z-index: 4;
 }
 .timelineChapterBlock {
   height: 22px;
@@ -994,6 +1040,31 @@ button:disabled {
 }
 .timelineStageBar {
   height: 18px;
+  overflow: visible;
+}
+.timelinePrimaryTaskBar .taskText,
+.timelineStageBar .stageText {
+  position: sticky;
+  left: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  max-width: none;
+  gap: 5px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: inherit;
+  box-shadow: 0 0 0 1px rgba(251, 248, 239, 0.22);
+  white-space: nowrap;
+}
+.timelineStageBar.progress .stageText {
+  background: transparent;
+  box-shadow: none;
+}
+.timelinePrimaryTaskBar .taskText {
+  gap: 7px;
+  padding: 0 4px;
 }
 .timelineChapterBlock.success,
 .timelinePrimaryTaskBar.success,
@@ -1043,7 +1114,7 @@ button:disabled {
 .timelineChapterBlock .barIdx,
 .timelineStageBar .barIdx {
   position: relative;
-  z-index: 1;
+  z-index: 3;
   flex: 0 0 auto;
   min-width: 15px;
   height: 14px;
@@ -1064,9 +1135,9 @@ button:disabled {
 .timelineChapterBlock .barLabel,
 .timelineStageBar .barLabel {
   position: relative;
-  z-index: 1;
-  flex: 1 1 auto;
-  min-width: 0;
+  z-index: 3;
+  flex: 0 0 auto;
+  min-width: max-content;
   font-size: 10px;
   font-weight: 700;
   line-height: 1;
@@ -1076,7 +1147,7 @@ button:disabled {
 }
 .timelinePrimaryTaskBar .taskLabel {
   position: relative;
-  z-index: 1;
+  z-index: 3;
   flex: 0 0 auto;
   min-width: max-content;
   color: #1f2a3a;
@@ -1089,9 +1160,9 @@ button:disabled {
 }
 .timelinePrimaryTaskBar .taskTxList {
   position: relative;
-  z-index: 1;
+  z-index: 3;
   flex: 0 0 auto;
-  margin-left: auto;
+  margin-left: 0;
   color: rgba(31, 42, 58, 0.74);
   font-size: 8px;
   font-weight: 800;
@@ -1796,7 +1867,7 @@ button:hover { background: #2a2a2a; }
 }
 
 .hoverTip {
-  position: absolute;
+  position: fixed;
   pointer-events: none;
   background: #1a1a1a;
   color: var(--goal-fill);
@@ -1809,15 +1880,16 @@ button:hover { background: #2a2a2a; }
   z-index: 5;
   display: none;
   white-space: nowrap;
+  overflow: hidden;
 }
 .hoverTip.show { display: block; }
 .hoverTip.eventTip {
   width: max-content;
-  max-width: min(460px, calc(100vw - 40px));
   padding: 8px;
   color: #f1f3f5;
   border-color: #5a5a5a;
   white-space: normal;
+  overflow-y: auto;
 }
 .hoverTipTitle {
   display: flex;
@@ -1963,18 +2035,13 @@ button:hover { background: #2a2a2a; }
   overflow: hidden;
 }
 .timelineHeader {
-  min-height: 46px;
-  padding: 13px 16px 9px;
+  min-height: 36px;
+  padding: 8px 16px 7px;
   display: flex;
   align-items: flex-start;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
   border-bottom: 1px solid var(--panel-border-soft);
-}
-.timelineHeader h2 {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.1;
 }
 .timelineControls {
   padding: 8px 16px;

@@ -25,6 +25,7 @@ let indexedReplayEvents = new Map();
 let indexedReplayEventTotal = 0;
 let indexedDerivedActionEventTotal = 0;
 let primaryTaskContextCache = null;
+let subgoalDecisionContextCache = null;
 let focusedAgentId = null;
 let lockViewEnabled = true;
 let agentPanelHeight = 260;
@@ -39,7 +40,6 @@ let miniTimelineScrollLeft = 0;
 let timelineAutoFollowDisabled = false;
 let timelinePanSuppressClick = false;
 let timelinePlayTogglePointerHandled = false;
-let timelineDebugSummaryExpanded = false;
 let markers = new Map();
 let searchState = { query: '', results: [], index: -1 };
 let segmentState = { enabled: false, start: 0, end: 0, digest: '', digestVisible: false, source: '', timelineIndex: null, timelineKind: null };
@@ -347,6 +347,7 @@ function init() {
     if (value === '') {
       timelineAgentId = null;
       timelineMode = 'overview';
+      if (timer) timelineAutoFollowDisabled = false;
     } else {
       const raw = Number(value);
       timelineAgentId = Number.isInteger(raw) ? raw : null;
@@ -357,6 +358,7 @@ function init() {
   });
   els.timelineOverviewBtn.addEventListener('click', () => {
     timelineMode = 'overview';
+    if (timer) timelineAutoFollowDisabled = false;
     renderAgentTimeline();
   });
   els.timelineExportMetaBtn?.addEventListener('click', exportTimelineMetaJson);
@@ -378,15 +380,8 @@ function init() {
     // "click outside to close" handler: the control's own handler re-renders the
     // timeline and detaches this node, which would otherwise be misread as an
     // outside click and close the whole panel.
-    if (event.target.closest('button[data-debug-summary-toggle], button[data-lifecycle-index], button[data-lifecycle-jump-index], button[data-lifecycle-focus-index], button[data-lifecycle-play-index], button[data-timeline-play-toggle], button[data-chapter-play-index], button[data-chapter-focus-index], button[data-chapter-jump-index], button[data-chapter-index], button[data-step]')) {
+    if (event.target.closest('button[data-lifecycle-index], button[data-lifecycle-jump-index], button[data-lifecycle-focus-index], button[data-lifecycle-play-index], button[data-timeline-play-toggle], button[data-chapter-play-index], button[data-chapter-focus-index], button[data-chapter-jump-index], button[data-chapter-index], button[data-step]')) {
       event.stopPropagation();
-    }
-    const debugSummaryToggle = event.target.closest('button[data-debug-summary-toggle]');
-    if (debugSummaryToggle) {
-      event.preventDefault();
-      timelineDebugSummaryExpanded = !timelineDebugSummaryExpanded;
-      renderAgentTimeline();
-      return;
     }
     const timelinePlayToggleButton = event.target.closest('button[data-timeline-play-toggle]');
     if (timelinePlayToggleButton) {
@@ -565,7 +560,6 @@ function init() {
     }
     const r = cell.dataset.r;
     const c = cell.dataset.c;
-    const rect = els.boards.getBoundingClientRect();
     const agentToken = e.target.closest('.agentToken');
     const agentIdText = agentToken?.dataset.agentId ?? cell.dataset.agentId;
     const agentId = agentIdText !== undefined ? Number(agentIdText) : null;
@@ -576,9 +570,7 @@ function init() {
       els.hoverTip.classList.remove('eventTip');
       els.hoverTip.textContent = `(${r}, ${c})`;
     }
-    els.hoverTip.style.left = `${e.clientX - rect.left + 14}px`;
-    els.hoverTip.style.top  = `${e.clientY - rect.top  + 14}px`;
-    els.hoverTip.classList.add('show');
+    positionHoverTip(e);
     els.hoverInfo.textContent = `(${r}, ${c})`;
   });
   els.boards.addEventListener('mouseleave', () => {
@@ -606,6 +598,29 @@ function init() {
   if (localStorageAvailable() && localStorage.getItem(TUTORIAL_STORAGE_KEY) !== '1') {
     showTutorial();
   }
+}
+
+function positionHoverTip(event) {
+  if (!els.hoverTip) return;
+  const margin = 8;
+  const offset = 14;
+  const vw = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+  const vh = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+  els.hoverTip.style.maxWidth = `${Math.max(160, vw - margin * 2)}px`;
+  els.hoverTip.style.maxHeight = `${Math.max(120, vh - margin * 2)}px`;
+  els.hoverTip.style.left = `${margin}px`;
+  els.hoverTip.style.top = `${margin}px`;
+  els.hoverTip.classList.add('show');
+
+  const rect = els.hoverTip.getBoundingClientRect();
+  let left = event.clientX + offset;
+  let top = event.clientY + offset;
+  if (left + rect.width + margin > vw) left = event.clientX - rect.width - offset;
+  if (top + rect.height + margin > vh) top = event.clientY - rect.height - offset;
+  left = clamp(left, margin, Math.max(margin, vw - rect.width - margin));
+  top = clamp(top, margin, Math.max(margin, vh - rect.height - margin));
+  els.hoverTip.style.left = `${Math.round(left)}px`;
+  els.hoverTip.style.top = `${Math.round(top)}px`;
 }
 
 function closeHelpDialog() {
@@ -780,6 +795,59 @@ function clearNotification() {
   notificationTimer = null;
 }
 
+function replayTextBytes(text) {
+  const value = String(text ?? '');
+  if (typeof Blob !== 'undefined') return new Blob([value]).size;
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(value).length;
+  return value.length;
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+async function browserStorageEstimate() {
+  try {
+    if (typeof navigator === 'undefined' || !navigator.storage?.estimate) return null;
+    const estimate = await navigator.storage.estimate();
+    const quota = Number(estimate?.quota);
+    const usage = Number(estimate?.usage);
+    if (!Number.isFinite(quota) || quota <= 0 || !Number.isFinite(usage)) return null;
+    return { quota, usage };
+  } catch (error) {
+    console.warn('Unable to estimate browser storage:', error);
+    return null;
+  }
+}
+
+async function rememberedReplayStorageBytes() {
+  try {
+    const record = await readReplayStorage();
+    if (record) return replayTextBytes(JSON.stringify(record));
+  } catch (_) {
+    // IndexedDB may be unavailable; localStorage fallback is checked below.
+  }
+  if (!localStorageAvailable()) return 0;
+  return replayTextBytes(localStorage.getItem(LAST_REPLAY_LOCAL_STORAGE_KEY) || '');
+}
+
+async function replayStorageCanAccept(serializedRecord) {
+  const estimate = await browserStorageEstimate();
+  if (!estimate) return true;
+  const replacementBytes = await rememberedReplayStorageBytes();
+  const availableAfterReplace = Math.max(0, estimate.quota - estimate.usage + replacementBytes);
+  return replayTextBytes(serializedRecord) <= availableAfterReplace;
+}
+
 function localStorageAvailable() {
   try {
     const key = 'aims-replay-viewer:storage-test';
@@ -877,6 +945,9 @@ async function restoreInitialReplay() {
     }
   } catch (error) {
     console.warn('Unable to restore last opened replay:', error);
+    forgetLastOpenedReplay().catch(clearError => {
+      console.warn('Unable to clear invalid remembered replay:', clearError);
+    });
   }
 
   if (window.DEFAULT_REPLAY) {
@@ -897,11 +968,25 @@ async function saveLastOpenedReplay(text, name = '') {
     name,
     savedAt: new Date().toISOString(),
   };
+  const serialized = JSON.stringify(record);
+  if (!(await replayStorageCanAccept(serialized))) {
+    await forgetLastOpenedReplay();
+    showError(
+      `This replay is ${formatBytes(replayTextBytes(text))}; browser storage does not report enough free space for automatic restore.`,
+      'Replay loaded but not remembered'
+    );
+    return;
+  }
   try {
     await writeReplayStorage(record);
   } catch (error) {
-    if (!localStorageAvailable()) throw error;
-    localStorage.setItem(LAST_REPLAY_LOCAL_STORAGE_KEY, JSON.stringify(record));
+    if (!writeReplayLocalStorage(serialized)) {
+      await forgetLastOpenedReplay();
+      showError(
+        `This replay is ${formatBytes(replayTextBytes(text))}; browser storage could not save it for automatic restore.`,
+        'Replay loaded but not remembered'
+      );
+    }
   }
 }
 
@@ -951,6 +1036,28 @@ async function writeReplayStorage(record) {
   });
 }
 
+function writeReplayLocalStorage(serializedRecord) {
+  if (!localStorageAvailable()) return false;
+  try {
+    localStorage.setItem(LAST_REPLAY_LOCAL_STORAGE_KEY, serializedRecord);
+    return true;
+  } catch (error) {
+    console.warn('Unable to save replay in localStorage:', error);
+    return false;
+  }
+}
+
+async function forgetLastOpenedReplay() {
+  if (localStorageAvailable()) {
+    localStorage.removeItem(LAST_REPLAY_LOCAL_STORAGE_KEY);
+  }
+  try {
+    await deleteReplayStorage();
+  } catch (error) {
+    console.warn('Unable to clear IndexedDB replay storage:', error);
+  }
+}
+
 async function readReplayStorage() {
   const db = await openReplayStorage();
   return new Promise((resolve, reject) => {
@@ -962,6 +1069,22 @@ async function readReplayStorage() {
     tx.onerror = () => {
       db.close();
       reject(tx.error || new Error('Unable to read replay storage.'));
+    };
+  });
+}
+
+async function deleteReplayStorage() {
+  const db = await openReplayStorage();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LAST_REPLAY_STORE_NAME, 'readwrite');
+    tx.objectStore(LAST_REPLAY_STORE_NAME).delete(LAST_REPLAY_KEY);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('Unable to clear replay storage.'));
     };
   });
 }
@@ -1112,31 +1235,95 @@ async function loadFile(file) {
 
 function loadReplayData(data, options = {}) {
   if (!options.validated) validateReplay(data);
+  const previous = captureReplayLoadState();
   stopPlay();
-  replay = data;
-  indexReplayEvents();
-  primaryTaskContextCache = null;
-  step = 0;
-  timelineMode = 'overview';
-  timelineScrollLeft = 0;
-  lifecycleSelection = 0;
-  timelineSelectionKind = 'current';
-  timelineSelectedSegmentIndex = null;
-  timelineSelectedChapterIndex = null;
-  segmentState = { enabled: false, start: 0, end: replay.frames.length - 1, digest: '', digestVisible: false, source: '', timelineIndex: null, timelineKind: null };
-  els.slider.max = replay.frames.length - 1;
-  els.stepInput.max = replay.frames.length - 1;
-  els.segmentStartInput.max = replay.frames.length - 1;
-  els.segmentEndInput.max = replay.frames.length - 1;
-  const s = replay.summary || {};
-  renderReplayMeta(s);
-  populateAgentFocusMenu();
-  populateTimelineAgentSelect();
-  loadReplayMarkers();
-  updateSearchResults(false);
-  buildBoard();
-  render();
-  if (els.autoPlayInput.checked) startPlay();
+  try {
+    replay = data;
+    indexReplayEvents();
+    primaryTaskContextCache = null;
+    subgoalDecisionContextCache = null;
+    step = 0;
+    timelineMode = 'overview';
+    timelineScrollLeft = 0;
+    lifecycleSelection = 0;
+    timelineSelectionKind = 'current';
+    timelineSelectedSegmentIndex = null;
+    timelineSelectedChapterIndex = null;
+    segmentState = { enabled: false, start: 0, end: replay.frames.length - 1, digest: '', digestVisible: false, source: '', timelineIndex: null, timelineKind: null };
+    els.slider.max = replay.frames.length - 1;
+    els.stepInput.max = replay.frames.length - 1;
+    els.segmentStartInput.max = replay.frames.length - 1;
+    els.segmentEndInput.max = replay.frames.length - 1;
+    const s = replay.summary || {};
+    renderReplayMeta(s);
+    populateAgentFocusMenu();
+    populateTimelineAgentSelect();
+    loadReplayMarkers();
+    updateSearchResults(false);
+    buildBoard();
+    render();
+    if (els.autoPlayInput.checked) startPlay();
+  } catch (error) {
+    restoreReplayLoadState(previous);
+    try {
+      if (replay) renderReplayMeta(replay.summary || {});
+      else renderEmptyReplayMeta();
+      render();
+    } catch (restoreError) {
+      console.warn('Unable to restore previous replay after load failure:', restoreError);
+    }
+    throw error;
+  }
+}
+
+function captureReplayLoadState() {
+  return {
+    replay,
+    step,
+    highlightCoord,
+    indexedReplayEvents: new Map(indexedReplayEvents),
+    indexedReplayEventTotal,
+    indexedDerivedActionEventTotal,
+    primaryTaskContextCache,
+    subgoalDecisionContextCache,
+    focusedAgentId,
+    timelineAgentId,
+    timelineMode,
+    lifecycleSelection,
+    timelineSelectionKind,
+    timelineSelectedSegmentIndex,
+    timelineSelectedChapterIndex,
+    timelineScrollLeft,
+    miniTimelineScrollLeft,
+    timelineAutoFollowDisabled,
+    markers: new Map(markers),
+    searchState: { ...searchState, results: [...(searchState.results || [])] },
+    segmentState: { ...segmentState },
+  };
+}
+
+function restoreReplayLoadState(state) {
+  replay = state.replay;
+  step = state.step;
+  highlightCoord = state.highlightCoord;
+  indexedReplayEvents = new Map(state.indexedReplayEvents);
+  indexedReplayEventTotal = state.indexedReplayEventTotal;
+  indexedDerivedActionEventTotal = state.indexedDerivedActionEventTotal;
+  primaryTaskContextCache = state.primaryTaskContextCache;
+  subgoalDecisionContextCache = state.subgoalDecisionContextCache;
+  focusedAgentId = state.focusedAgentId;
+  timelineAgentId = state.timelineAgentId;
+  timelineMode = state.timelineMode;
+  lifecycleSelection = state.lifecycleSelection;
+  timelineSelectionKind = state.timelineSelectionKind;
+  timelineSelectedSegmentIndex = state.timelineSelectedSegmentIndex;
+  timelineSelectedChapterIndex = state.timelineSelectedChapterIndex;
+  timelineScrollLeft = state.timelineScrollLeft;
+  miniTimelineScrollLeft = state.miniTimelineScrollLeft;
+  timelineAutoFollowDisabled = state.timelineAutoFollowDisabled;
+  markers = new Map(state.markers);
+  searchState = { ...state.searchState, results: [...(state.searchState.results || [])] };
+  segmentState = { ...state.segmentState };
 }
 
 function renderReplayMeta(summary = {}) {
@@ -1149,6 +1336,11 @@ function renderReplayMeta(summary = {}) {
     ${escapeHtml(replay.generatedAt || '')}
     ${identity.html}
   `;
+}
+
+function renderEmptyReplayMeta() {
+  els.meta.removeAttribute('title');
+  els.meta.textContent = 'No replay loaded';
 }
 
 function replayRunIdentityDetails() {
@@ -1213,6 +1405,9 @@ function validateReplay(data) {
   for (const field of ['name', 'rows', 'cols', 'walls', 'boxGoals', 'agentGoals', 'agentColors', 'boxColors']) {
     if (!(field in level)) throw new Error(`Missing required field: level.${field}.`);
   }
+  if (typeof level.name !== 'string') {
+    throw new Error('level.name must be a string.');
+  }
   if (!Array.isArray(level.walls) || level.walls.length !== level.rows) {
     throw new Error('level.walls must contain one row string per level row.');
   }
@@ -1224,6 +1419,14 @@ function validateReplay(data) {
   if (!Array.isArray(level.boxGoals) || !Array.isArray(level.agentGoals)) {
     throw new Error('level.boxGoals and level.agentGoals must be arrays.');
   }
+  if (!level.agentColors || typeof level.agentColors !== 'object' || Array.isArray(level.agentColors)) {
+    throw new Error('level.agentColors must be an object.');
+  }
+  if (!level.boxColors || typeof level.boxColors !== 'object' || Array.isArray(level.boxColors)) {
+    throw new Error('level.boxColors must be an object.');
+  }
+  level.boxGoals.forEach((goal, index) => validateBoxGoal(goal, index, level));
+  level.agentGoals.forEach((goal, index) => validateAgentGoal(goal, index, level));
   for (let i = 0; i < data.frames.length; i++) {
     const frame = data.frames[i];
     if (!frame || typeof frame !== 'object') throw new Error(`Frame ${i} is not an object.`);
@@ -1231,6 +1434,70 @@ function validateReplay(data) {
     if (!Array.isArray(frame.boxes)) throw new Error(`Frame ${i} is missing boxes array.`);
     if (!Array.isArray(frame.actions)) throw new Error(`Frame ${i} is missing actions array.`);
     if (!Array.isArray(frame.accepted)) throw new Error(`Frame ${i} is missing accepted array.`);
+    validateFrameAgents(frame.agents, i, level);
+    validateFrameBoxes(frame.boxes, i, level);
+    validateFrameActions(frame, i);
+  }
+}
+
+function validateBoxGoal(goal, index, level) {
+  if (!goal || typeof goal !== 'object') throw new Error(`level.boxGoals[${index}] must be an object.`);
+  if (!formatEventValue(goal.type)) throw new Error(`level.boxGoals[${index}].type is required.`);
+  validateGridCoord(goal, `level.boxGoals[${index}]`, level);
+}
+
+function validateAgentGoal(goal, index, level) {
+  if (!goal || typeof goal !== 'object') throw new Error(`level.agentGoals[${index}] must be an object.`);
+  if (goal.agent === undefined || goal.agent === null || goal.agent === '') {
+    throw new Error(`level.agentGoals[${index}].agent is required.`);
+  }
+  validateGridCoord(goal, `level.agentGoals[${index}]`, level);
+}
+
+function validateFrameAgents(agents, frameIndex, level) {
+  const ids = new Set();
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i];
+    if (!agent || typeof agent !== 'object') throw new Error(`Frame ${frameIndex} agent ${i} must be an object.`);
+    if (!Number.isInteger(agent.id) || agent.id < 0) {
+      throw new Error(`Frame ${frameIndex} agent ${i} has invalid id.`);
+    }
+    if (ids.has(agent.id)) throw new Error(`Frame ${frameIndex} has duplicate agent id ${agent.id}.`);
+    ids.add(agent.id);
+    validateGridCoord(agent, `Frame ${frameIndex} agent ${agent.id}`, level);
+  }
+}
+
+function validateFrameBoxes(boxes, frameIndex, level) {
+  for (let i = 0; i < boxes.length; i++) {
+    const box = boxes[i];
+    if (!box || typeof box !== 'object') throw new Error(`Frame ${frameIndex} box ${i} must be an object.`);
+    if (!formatEventValue(box.type)) throw new Error(`Frame ${frameIndex} box ${i} is missing type.`);
+    validateGridCoord(box, `Frame ${frameIndex} box ${i}`, level);
+  }
+}
+
+function validateFrameActions(frame, frameIndex) {
+  for (let i = 0; i < frame.actions.length; i++) {
+    const action = frame.actions[i];
+    if (action !== null && action !== undefined && typeof action !== 'string') {
+      throw new Error(`Frame ${frameIndex} action ${i} must be a string.`);
+    }
+  }
+  for (let i = 0; i < frame.accepted.length; i++) {
+    const accepted = frame.accepted[i];
+    if (accepted !== null && accepted !== undefined && typeof accepted !== 'boolean') {
+      throw new Error(`Frame ${frameIndex} accepted ${i} must be a boolean.`);
+    }
+  }
+}
+
+function validateGridCoord(value, label, level) {
+  if (!Number.isInteger(value.r) || !Number.isInteger(value.c)) {
+    throw new Error(`${label} must have integer r and c coordinates.`);
+  }
+  if (value.r < 0 || value.r >= level.rows || value.c < 0 || value.c >= level.cols) {
+    throw new Error(`${label} coordinate (${value.r}, ${value.c}) is outside the ${level.rows}x${level.cols} level.`);
   }
 }
 
@@ -1255,6 +1522,7 @@ function render() {
     empty.className = 'empty';
     empty.textContent = 'Drop a replay JSON file to begin.';
     els.boardWrap.appendChild(empty);
+    renderEmptyReplayMeta();
     els.statusInfo.textContent = '';
     closeAgentMenu();
     closeTimelinePanel();
@@ -2289,34 +2557,10 @@ function renderLifecycleTimeline() {
   const activeChapterIndex = validTimelineChapterIndex(timelineSelectedChapterIndex, chapters) && timelineSelectionKind === 'chapter'
     ? timelineSelectedChapterIndex
     : activeDebugChapterIndex(chapters, lifecycleSelection, step);
-  const diagnosis = timelineDiagnosisSummary(segments, chapters);
-  const debugSummary = timelineDebugSummary(segments, diagnosis);
-
-  const summary = document.createElement('section');
-  summary.className = `timelineSummaryCard timelineDiagnosisCard ${escapeHtml(diagnosis.statusClass)}${timelineDebugSummaryExpanded ? ' expanded' : ''}`;
-  const toggleTitle = timelineDebugSummaryExpanded ? 'Collapse debug details' : 'Expand debug details';
-  summary.innerHTML = `
-    <div class="timelineDebugHeader">
-      <div>
-        <strong>Debug Summary</strong>
-        <small>${escapeHtml(debugSummary.headline)}</small>
-      </div>
-      <button class="timelineDebugToggle" type="button" data-debug-summary-toggle title="${escapeHtml(toggleTitle)}" aria-label="${escapeHtml(toggleTitle)}" aria-expanded="${timelineDebugSummaryExpanded ? 'true' : 'false'}">
-        <span class="timelineDebugChevron" aria-hidden="true"></span>
-      </button>
-    </div>
-    <dl class="timelineDebugSummaryGrid">
-      <dt>Start</dt><dd>${escapeHtml(debugSummary.startHere)}</dd>
-      <dt>Retries</dt><dd>${escapeHtml(debugSummary.retryPoints)}</dd>
-      <dt>Health</dt><dd>${escapeHtml(debugSummary.health)}</dd>
-    </dl>
-    ${timelineDebugSummaryExpanded ? timelineDebugDetailsHtml(debugSummary) : ''}
-  `;
   const overview = document.createElement('div');
   overview.className = 'timelineOverviewStack';
-  overview.appendChild(summary);
   overview.appendChild(renderPortfolioAttemptsCard());
-  overview.appendChild(renderTimelineMap(segments, { followCurrent: !timelineAutoFollowDisabled }));
+  overview.appendChild(renderTimelineMap(segments, { followCurrent: Boolean(timer) || !timelineAutoFollowDisabled }));
   overview.appendChild(renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, step));
   els.agentTimeline.appendChild(overview);
 }
@@ -2325,23 +2569,36 @@ function timelineDebugSummary(segments, diagnosis) {
   const summary = replay.summary || {};
   const transactions = segments.flatMap(segment => timelineNativeTransactions(segment));
   const candidates = segments.flatMap(segment => timelineMetaCandidateSummary(segment));
+  const decisionContext = subgoalDecisionContext();
   const candidateGroups = timelineCandidateProblemGroups(candidates);
   const riskyTransactions = transactions
     .filter(timelineIsRiskyTransaction)
     .sort((a, b) => timelineIssueStep(a) - timelineIssueStep(b));
   const primaryTransaction = riskyTransactions[0] || null;
   const primaryCandidate = timelinePrimaryCandidateGroup(primaryTransaction, candidateGroups);
+  const primaryDecision = timelinePrimarySubgoalDecision(decisionContext, primaryTransaction, primaryCandidate);
+  const route = timelinePlannerRouteSummary(transactions, decisionContext);
+  const initialOrdering = route.initialOrdering || decisionContext.orderings[0] || null;
   return {
     headline: timelineDebugHeadline(summary, transactions, candidateGroups),
     startHere: timelineStartHereText(primaryTransaction, primaryCandidate, diagnosis),
     retryPoints: timelineRetryPointsText(candidateGroups),
-    health: timelineDebugHealthText(transactions, candidates),
+    route,
+    choice: timelineDebugChoiceText(primaryDecision),
+    health: timelineDebugHealthText(transactions, candidates, decisionContext.selections, decisionContext.orderings),
+    orderInsight: timelineOrderInsightText(initialOrdering, route),
+    runtimeInsight: timelineRuntimeInsightText(route),
+    attention: timelineAttentionText(primaryTransaction, candidateGroups),
+    evidenceHint: timelineEvidenceHintText(initialOrdering, route),
     primaryTransaction,
     primaryCandidate,
+    primaryDecision,
     riskyTransactions,
     candidateGroups,
     transactions,
     candidates,
+    subgoalSelections: decisionContext.selections,
+    subgoalOrderings: decisionContext.orderings,
   };
 }
 
@@ -2383,7 +2640,7 @@ function timelineRetryPointsText(candidateGroups) {
   return `${retryGroups.length} point${retryGroups.length === 1 ? '' : 's'}: ${shown.join('; ')}${overflow}`;
 }
 
-function timelineDebugHealthText(transactions, candidates) {
+function timelineDebugHealthText(transactions, candidates, selections = [], orderings = []) {
   const txTotal = transactions.length;
   const committed = transactions.filter(tx => String(tx.commitStatus || '').toLowerCase().includes('commit')).length;
   const rolledBack = transactions.filter(tx => String(tx.commitStatus || '').toLowerCase().includes('roll')).length;
@@ -2396,33 +2653,436 @@ function timelineDebugHealthText(transactions, candidates) {
   const candidatePart = candidates.length === 0
     ? 'Box selection: none recorded'
     : `Box selection ${candidates.length}: ${selected} selected, ${retry} retry, ${failed} failed`;
-  return `${txPart} | ${candidatePart}`;
+  const subgoalPart = selections.length === 0 && orderings.length === 0
+    ? ''
+    : `Subgoal choices ${selections.length}: ${orderings.length} order snapshot${orderings.length === 1 ? '' : 's'}`;
+  return [txPart, candidatePart, subgoalPart].filter(Boolean).join(' | ');
 }
 
 function timelineDebugDetailsHtml(debugSummary) {
   const blocks = [];
-  if (debugSummary.primaryTransaction || debugSummary.primaryCandidate) {
-    blocks.push(timelineDebugIssueHtml('Start here', debugSummary.primaryCandidate, debugSummary.primaryTransaction));
-  }
-  const extraGroups = debugSummary.candidateGroups
-    .filter(group => group !== debugSummary.primaryCandidate)
-    .slice(0, 4);
-  for (const group of extraGroups) {
-    blocks.push(timelineDebugIssueHtml(group.retryCount > 0 ? 'Retry point' : 'Failed selection', group, null));
-  }
-  const extraTransactions = debugSummary.riskyTransactions
-    .filter(tx => tx !== debugSummary.primaryTransaction)
-    .slice(0, 3);
-  for (const tx of extraTransactions) {
-    blocks.push(timelineDebugIssueHtml('Planner transaction', null, tx));
-  }
-  blocks.push(`
-    <article class="timelineDebugIssue timelineDebugHealth">
-      <strong>Planner health</strong>
-      <p>${escapeHtml(debugSummary.health)}</p>
-    </article>
-  `);
+  blocks.push(timelineDebugOrderingHtml(debugSummary.route.initialOrdering));
+  blocks.push(timelineDebugRuntimeHtml(debugSummary.route));
+  blocks.push(timelineDebugAttentionHtml(debugSummary));
   return `<div class="timelineDebugDetails">${blocks.join('')}</div>`;
+}
+
+function timelineDebugChoiceText(decision) {
+  const selection = decision?.selection || null;
+  const ordering = decision?.ordering || null;
+  if (!selection && !ordering) return 'No subgoal choice evidence recorded.';
+  const selectionText = selection
+    ? `${timelineReadableSubgoalLabel(selection.subgoal)} selected at step ${selection.step}${selection.selectedRank != null ? `, rank ${selection.selectedRank}` : ''}${selection.eligibleCount != null ? ` of ${selection.eligibleCount} eligible` : ''}`
+    : '';
+  const orderingText = ordering
+    ? `${timelineReadableOrderingMode(ordering.orderingMode)} order${ordering.goalDependencyEdges != null ? `, ${ordering.goalDependencyEdges} dependency edges` : ''}`
+    : '';
+  return [selectionText, orderingText].filter(Boolean).join(' | ');
+}
+
+function timelineOrderInsightText(ordering, route) {
+  if (!ordering) return 'No ordering snapshot recorded.';
+  const pairReasons = parseAdjacentPairRationales(ordering.adjacentPairRationaleSample);
+  const pairText = pairReasons.slice(0, 2).map(timelineAdjacentReasonSummary).filter(Boolean).join(' | ');
+  if (pairText) return pairText;
+  const edges = ordering.goalDependencyEdges ?? extractTopologyCount(ordering.topologyBasis, 'goalDependencyEdges');
+  const transit = ordering.transitDeferredToTail ?? extractTopologyCount(ordering.topologyBasis, 'transitProfiles');
+  const first = parseSubgoalSampleEntries(ordering.orderSample)[0];
+  const leader = first ? timelineReadableSubgoalLabel(first.subgoal) : '';
+  const parts = [
+    'dependency-first topological order',
+    edges != null ? `${edges} hard-block edges` : '',
+    transit ? `${transit} transit goals delayed` : '',
+    leader ? `${leader} first` : '',
+  ].filter(Boolean);
+  const txText = route?.transactions?.length ? `; runtime made ${route.transactions.length} tx` : '';
+  return `${parts.join(' | ')}${txText}`;
+}
+
+function timelineRuntimeInsightText(route) {
+  const transactions = route?.transactions || [];
+  if (transactions.length === 0) return 'No planner transaction route recorded.';
+  const support = transactions.filter(tx => tx.supportKind);
+  const rolled = transactions.filter(tx => String(tx.commitStatus || '').toLowerCase().includes('roll'));
+  const repeatedTasks = timelineRepeatedTransactionTasks(transactions);
+  const parts = [];
+  if (support.length) parts.push(`${support.length} support split${support.length === 1 ? '' : 's'}`);
+  if (rolled.length) parts.push(`${rolled.length} rollback${rolled.length === 1 ? '' : 's'} (${timelineReadableSubgoalLabel(rolled[0].subgoal)}: ${timelineReadableReason(rolled[0].rollbackReason || rolled[0].reason)})`);
+  if (repeatedTasks.length) parts.push(`${repeatedTasks.length} repeated task${repeatedTasks.length === 1 ? '' : 's'} after support/rollback`);
+  if (parts.length === 0) parts.push('route followed the order without rollback');
+  return parts.join(' | ');
+}
+
+function timelineAttentionText(transaction, candidateGroups) {
+  const parts = [];
+  if (transaction) {
+    parts.push(`${transaction.transactionId || 'tx'} ${timelineReadableTransactionStatus(transaction)} on ${timelineReadableSubgoalLabel(transaction.subgoal)}: ${timelineReadableReason(transaction.rollbackReason || transaction.reason || transaction.commitStatus)}`);
+  }
+  const retryGroups = (candidateGroups || []).filter(group => group.retryCount > 0);
+  if (retryGroups.length) {
+    const shown = retryGroups.slice(0, 2).map(group => `step ${timelineIssueStep(group)} ${timelineCandidateTargetText(group)}`);
+    parts.push(`${retryGroups.length} retry point${retryGroups.length === 1 ? '' : 's'} (${shown.join('; ')})`);
+  }
+  return parts.join(' | ') || 'No rollback or retry hotspot recorded.';
+}
+
+function timelineEvidenceHintText(ordering, route) {
+  if (!ordering) return 'Open stage details for raw events.';
+  const rationaleCount = splitNumberedEntries(ordering.adjacentPairRationaleSample).length;
+  const dependencyCount = parseDependencyEdgeEntries(ordering.dependencyEdges).length
+    || ordering.goalDependencyEdges
+    || extractTopologyCount(ordering.topologyBasis, 'explainedDependencyEdges');
+  const txCount = route?.transactions?.length || 0;
+  return [
+    rationaleCount ? `${rationaleCount} adjacent-pair reasons` : '',
+    dependencyCount ? `${dependencyCount} dependency edges` : '',
+    txCount ? `${txCount} tx outcomes` : '',
+  ].filter(Boolean).join(' | ') || 'ordering summary recorded';
+}
+
+function timelinePlannerRouteSummary(transactions, decisionContext) {
+  const routeTransactions = uniquePlannerTransactions(transactions);
+  const initialOrdering = (decisionContext?.orderings || [])[0] || null;
+  const initialGoals = parseSubgoalSampleEntries(initialOrdering?.orderSample);
+  const committed = routeTransactions.filter(tx => String(tx.commitStatus || '').toLowerCase().includes('commit')).length;
+  const rolledBack = routeTransactions.filter(tx => String(tx.commitStatus || '').toLowerCase().includes('roll')).length;
+  const initialGoalCount = initialGoals.length || initialOrdering?.orderedSubgoalCount || 0;
+  const text = routeTransactions.length
+    ? `Initial order ${initialGoalCount || '?'} goals | runtime produced ${routeTransactions.length} planner transactions: ${committed} committed${rolledBack ? `, ${rolledBack} rolled back` : ''}`
+    : initialGoalCount
+      ? `Initial order ${initialGoalCount} goals | no planner transactions recorded`
+      : 'No dependency-order route recorded.';
+  return {
+    text,
+    transactions: routeTransactions,
+    initialOrdering,
+    initialGoals,
+    selectionCount: (decisionContext?.selections || []).length,
+    orderingCount: (decisionContext?.orderings || []).length,
+  };
+}
+
+function uniquePlannerTransactions(transactions) {
+  const byKey = new Map();
+  for (const tx of transactions || []) {
+    const key = tx.transactionId
+      || [tx.step, tx.planStartStep, tx.planEndStep, tx.subgoal, tx.commitStatus].join('|');
+    if (!byKey.has(key)) byKey.set(key, tx);
+  }
+  return [...byKey.values()].sort((a, b) =>
+    (a.planStartStep ?? a.step ?? 0) - (b.planStartStep ?? b.step ?? 0)
+    || (a.planEndStep ?? a.step ?? 0) - (b.planEndStep ?? b.step ?? 0)
+    || String(a.transactionId || '').localeCompare(String(b.transactionId || '')));
+}
+
+function timelineDebugRouteHtml(route) {
+  if (!route) return '';
+  const fields = [];
+  if (route.initialOrdering) {
+    fields.push([
+      'Initial dependency order',
+      timelineFriendlySubgoalSample(route.initialOrdering.orderSample, { limit: Math.max(9, route.initialGoals?.length || 0) }),
+    ]);
+  }
+  fields.push([
+    'Route shape',
+    `${route.selectionCount || 0} subgoal selection checkpoints | ${route.orderingCount || 0} order snapshots | ${route.transactions.length} planner transactions`,
+  ]);
+  for (const tx of route.transactions) {
+    fields.push([tx.transactionId || `tx@${timelineIssueStep(tx)}`, timelinePlannerTransactionRouteText(tx)]);
+  }
+  return `
+    <article class="timelineDebugIssue">
+      <div class="timelineDebugIssueHeader">
+        <strong>Transaction route</strong>
+        <span>${escapeHtml(route.text)}</span>
+      </div>
+      ${timelineDebugFieldRowsHtml(fields)}
+    </article>
+  `;
+}
+
+function timelineDebugOrderingHtml(ordering) {
+  if (!ordering) return '';
+  const fields = [];
+  const pairReasons = parseAdjacentPairRationales(ordering.adjacentPairRationaleSample).slice(0, 5);
+  const pairRows = pairReasons.length ? `
+    <div class="timelineReasonList">
+      ${pairReasons.map(timelineAdjacentReasonRowHtml).join('')}
+    </div>
+  ` : '';
+  fields.push(['Initial order', timelineCompactOrderSequence(ordering.orderSample, 9)]);
+  const edgeText = timelineDependencyEdgeExamplesText(ordering);
+  if (edgeText) fields.push(['Hard blocks', edgeText]);
+  const transit = timelineTransitTailText(ordering);
+  if (transit) fields.push(['Tail moved', transit]);
+  return `
+    <article class="timelineDebugIssue">
+      <div class="timelineDebugIssueHeader">
+        <strong>Order reasoning</strong>
+        <span>${escapeHtml(timelineOrderInsightText(ordering, null))}</span>
+      </div>
+      ${pairRows}
+      ${timelineDebugFieldRowsHtml(fields)}
+    </article>
+  `;
+}
+
+function timelineDebugRuntimeHtml(route) {
+  if (!route) return '';
+  const fields = [];
+  fields.push(['Shape', route.text]);
+  const support = (route.transactions || []).filter(tx => tx.supportKind).slice(0, 3);
+  if (support.length) {
+    fields.push(['Support', support.map(tx => `${tx.transactionId}: ${timelineReadableSubgoalLabel(tx.subgoal)} needed ${timelineReadableReason(tx.supportKind)}`).join(' | ')]);
+  }
+  const rolled = (route.transactions || []).filter(tx => String(tx.commitStatus || '').toLowerCase().includes('roll')).slice(0, 3);
+  if (rolled.length) {
+    fields.push(['Rollback', rolled.map(tx => `${tx.transactionId}: ${timelineReadableSubgoalLabel(tx.subgoal)} -> ${timelineReadableReason(tx.rollbackReason || tx.reason)}`).join(' | ')]);
+  }
+  const repeated = timelineRepeatedTransactionTasks(route.transactions || []).slice(0, 3);
+  if (repeated.length) fields.push(['Repeated tasks', repeated.map(item => `${item.label} (${item.count} tx)`).join(' | ')]);
+  return `
+    <article class="timelineDebugIssue">
+      <div class="timelineDebugIssueHeader">
+        <strong>Runtime changes</strong>
+        <span>${escapeHtml(timelineRuntimeInsightText(route))}</span>
+      </div>
+      ${timelineDebugFieldRowsHtml(fields)}
+    </article>
+  `;
+}
+
+function timelineDebugAttentionHtml(debugSummary) {
+  const fields = [];
+  if (debugSummary.primaryTransaction) {
+    fields.push(['Primary risk', timelinePlannerTransactionRouteText(debugSummary.primaryTransaction)]);
+  }
+  const retryGroups = (debugSummary.candidateGroups || []).filter(group => group.retryCount > 0).slice(0, 3);
+  if (retryGroups.length) {
+    fields.push(['Retry points', retryGroups.map(group => `${timelineCandidateTargetText(group)} at step ${timelineIssueStep(group)}: ${timelineCandidateReasonsText(group)}`).join(' | ')]);
+  }
+  if (!fields.length) fields.push(['Status', 'Solved without recorded rollback or retry hotspot.']);
+  return `
+    <article class="timelineDebugIssue">
+      <div class="timelineDebugIssueHeader">
+        <strong>Debug focus</strong>
+        <span>${escapeHtml(debugSummary.attention)}</span>
+      </div>
+      ${timelineDebugFieldRowsHtml(fields)}
+    </article>
+  `;
+}
+
+function timelinePlannerTransactionRouteText(tx) {
+  if (!tx) return '';
+  const task = timelineReadableSubgoalLabel(tx.taskLabel || tx.subgoal || tx.rawEvent?.ownerSubgoal || '');
+  const status = timelineReadableTransactionStatus(tx);
+  const span = tx.planStartStep != null && tx.planEndStep != null
+    ? `steps ${tx.planStartStep}-${tx.planEndStep}`
+    : tx.step != null ? `step ${tx.step}` : '';
+  const reason = timelineReadableReason(tx.rollbackReason || tx.reason || '');
+  const support = timelineReadableReason(tx.supportKind || '');
+  return [
+    task,
+    status,
+    span,
+    reason ? `reason: ${reason}` : '',
+    support ? `support: ${support}` : '',
+  ].filter(Boolean).join(' | ');
+}
+
+function timelineReadableTransactionStatus(tx) {
+  const status = String(tx?.commitStatus || '').toLowerCase();
+  if (status.includes('roll')) return 'rolled back';
+  if (status.includes('commit')) return 'committed';
+  if (status.includes('fail')) return 'failed';
+  if (status.includes('reject')) return 'rejected';
+  return status || 'transaction';
+}
+
+function timelineReadableReason(value) {
+  const text = formatEventValue(value).trim();
+  if (!text) return '';
+  return text.replace(/[-_]+/g, ' ');
+}
+
+function timelineRepeatedTransactionTasks(transactions) {
+  const counts = new Map();
+  for (const tx of transactions || []) {
+    const label = timelineReadableSubgoalLabel(tx.subgoal || tx.taskLabel || tx.rawEvent?.ownerSubgoal || '');
+    if (!label) continue;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([label, count]) => ({ label, count }));
+}
+
+function extractTopologyCount(text, key) {
+  const match = formatEventValue(text).match(new RegExp(`${key}=(-?\\d+)`));
+  return match ? Number(match[1]) : null;
+}
+
+function timelineCompactOrderSequence(value, limit = 9) {
+  const entries = parseSubgoalSampleEntries(value);
+  if (entries.length === 0) return formatEventValue(value);
+  const shown = entries.slice(0, limit)
+    .map(entry => `${entry.rank}. ${timelineReadableSubgoalLabel(entry.subgoal)}`);
+  const overflow = entries.length > shown.length ? ` | +${entries.length - shown.length} more` : '';
+  return `${shown.join(' | ')}${overflow}`;
+}
+
+function splitNumberedEntries(value) {
+  const text = formatEventValue(value);
+  if (!text) return [];
+  const matches = [...text.matchAll(/(?:^|;\s)(\d+):/g)];
+  if (matches.length === 0) return [];
+  return matches.map((match, index) => {
+    const start = match.index + (match[0].startsWith(';') ? 2 : 0);
+    const end = matches[index + 1] ? matches[index + 1].index : text.length;
+    return text.slice(start, end).trim().replace(/;\s*$/, '');
+  }).filter(Boolean);
+}
+
+function parseAdjacentPairRationales(value) {
+  return splitNumberedEntries(value).map(entry => {
+    const match = entry.match(/^(\d+):(.+?) before (.+?) because (.+?)(?:; before=|$)/);
+    if (!match) return null;
+    return {
+      rank: match[1],
+      before: match[2],
+      after: match[3],
+      reason: match[4],
+    };
+  }).filter(Boolean);
+}
+
+function timelineAdjacentReasonSummary(item) {
+  if (!item) return '';
+  const before = timelineReadableSubgoalLabel(item.before);
+  const after = timelineReadableSubgoalLabel(item.after);
+  const evidence = timelineAdjacentReasonEvidence(item.reason);
+  return `${before} before ${after}${evidence ? `: ${evidence}` : ''}`;
+}
+
+function timelineAdjacentReasonRowHtml(item) {
+  const before = timelineReadableSubgoalLabel(item.before);
+  const after = timelineReadableSubgoalLabel(item.after);
+  const explanation = timelineAdjacentReasonExplanation(item.reason);
+  const evidence = timelineAdjacentReasonEvidence(item.reason);
+  return `
+    <div class="timelineReasonRow">
+      <strong>${escapeHtml(before)} before ${escapeHtml(after)}</strong>
+      <span>${escapeHtml(explanation)}</span>
+      ${evidence ? `<small>${escapeHtml(evidence)}</small>` : ''}
+    </div>
+  `;
+}
+
+function timelineAdjacentReasonEvidence(reason) {
+  const text = String(reason || '');
+  const comparison = timelineComparisonText(text);
+  const lower = text.toLowerCase();
+  if (lower.includes('path-conflict')) return comparison ? `path-conflict ${comparison}` : 'higher path-conflict';
+  if (lower.includes('importance tier')) return comparison ? `importance ${comparison}` : 'higher importance';
+  if (lower.includes('lower crossing-count')) return comparison ? `crossings ${comparison.replace('>', '<')}` : 'lower crossing count';
+  if (lower.includes('equal crossing-count')) return 'same crossing count';
+  const direct = text.match(/direct-dependency:\s*([^\s]+)\s+depends on\s+([^\s(]+)/i);
+  if (direct) return `${direct[1]} depends on ${direct[2]}`;
+  return timelineReadableReason(text);
+}
+
+function timelineAdjacentReasonExplanation(reason) {
+  const lower = String(reason || '').toLowerCase();
+  if (lower.includes('path-conflict')) return 'The earlier goal blocks more future traffic.';
+  if (lower.includes('importance tier')) return 'The earlier goal unblocks more later goals.';
+  if (lower.includes('direct-dependency')) return 'The later goal cannot be safely filled before the earlier goal.';
+  if (lower.includes('lower crossing-count')) return 'Inside the transit tail, fewer crossings go first.';
+  if (lower.includes('equal crossing-count')) return 'Same transit pressure, so the previous order is kept.';
+  return timelineReadableReason(reason);
+}
+
+function timelineComparisonText(text) {
+  const match = String(text || '').match(/(-?\d+(?:\.\d+)?)\s+vs\s+(-?\d+(?:\.\d+)?)/);
+  if (!match) return '';
+  return `${match[1]} > ${match[2]}`;
+}
+
+function timelineTransitTailText(ordering) {
+  const profiles = parseTransitProfileDetails(ordering?.transitProfileDetails);
+  const chokepoints = profiles.filter(item => item.profile === 'CHOKEPOINT');
+  const deferred = ordering?.transitDeferredToTail ?? chokepoints.length;
+  if (!deferred && chokepoints.length === 0) return '';
+  const shown = chokepoints
+    .sort((a, b) => a.crossings - b.crossings || a.goal.localeCompare(b.goal))
+    .slice(0, 4)
+    .map(item => `${timelineReadableSubgoalLabel(item.goal)} crosses ${item.crossings}`);
+  return `${deferred} transit/chokepoint goals delayed${shown.length ? `: ${shown.join('; ')}` : ''}`;
+}
+
+function parseTransitProfileDetails(value) {
+  const text = formatEventValue(value);
+  if (!text) return [];
+  return text.split(/\s*;\s*/).map(part => {
+    const match = part.match(/^(.+?) profile=([A-Z_]+) crossings=(\d+)/);
+    return match ? { goal: match[1], profile: match[2], crossings: Number(match[3]) || 0 } : null;
+  }).filter(Boolean);
+}
+
+function timelineDependencyEdgeExamplesText(ordering) {
+  const edges = parseDependencyEdgeEntries(ordering?.dependencyEdges);
+  if (!edges.length) return '';
+  const total = ordering.goalDependencyEdges ?? edges.length;
+  const examples = edges.slice(0, 3).map(edge =>
+    `${timelineReadableSubgoalLabel(edge.dependent)} waits for ${timelineReadableSubgoalLabel(edge.prerequisite)}`
+  );
+  return `${total} hard-block edges; examples: ${examples.join('; ')}`;
+}
+
+function parseDependencyEdgeEntries(value) {
+  const text = formatEventValue(value);
+  if (!text) return [];
+  const parts = text.split(/;\s(?=(?:agent\d+|[A-Z])@[-\d,()]+ depends-on )/);
+  return parts.map(part => {
+    const match = part.match(/^(.+?) depends-on (.+?) source=([^\s]+)(?: .*?evidence=(.*))?$/);
+    return match ? {
+      dependent: match[1],
+      prerequisite: match[2],
+      source: match[3],
+      evidence: match[4] || '',
+    } : null;
+  }).filter(Boolean);
+}
+
+function timelineDebugDecisionHtml(decision) {
+  const selection = decision?.selection || null;
+  const ordering = decision?.ordering || null;
+  const title = selection
+    ? `step ${selection.step} | ${selection.subgoal || selection.selectionId || 'subgoal choice'}`
+    : `step ${ordering?.step ?? 0} | ${ordering?.orderSnapshotId || 'subgoal ordering'}`;
+  const fields = [];
+  if (selection) {
+    fields.push(['Selected', timelineSubgoalSelectionSummaryText(selection)]);
+    fields.push(['Why selected', timelineFriendlySelectionBasis(selection)]);
+    fields.push(['Gate checks', timelineFriendlySelectionGates(selection)]);
+    fields.push(['Candidate pool', timelineFriendlySubgoalSample(selection.candidateStatusSample, { limit: 5, includeStatus: true })]);
+  }
+  if (ordering) {
+    fields.push(['Priority order', timelineSubgoalOrderingSummaryText(ordering)]);
+    fields.push(['Order rule', timelineFriendlyOrderingBasis(ordering)]);
+    fields.push(['Distance model', timelineFriendlyHeuristic(ordering.heuristicBasis || selection?.heuristicBasis)]);
+    fields.push(['Order sample', timelineFriendlySubgoalSample(ordering.orderSample, { limit: 5 })]);
+  }
+  return `
+    <article class="timelineDebugIssue">
+      <div class="timelineDebugIssueHeader">
+        <strong>Focus choice reasoning</strong>
+        <span>${escapeHtml(title)}</span>
+      </div>
+      ${timelineDebugFieldRowsHtml(fields)}
+    </article>
+  `;
 }
 
 function timelineDebugIssueHtml(label, group, transaction) {
@@ -2776,25 +3436,58 @@ function packTimelineLanes(items) {
   return { placed, laneCount: Math.max(1, laneRight.length) };
 }
 
+function timelineLayerVisualRanges(items, maxStep) {
+  const sorted = items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => a.item.start - b.item.start || a.item.end - b.item.end || a.index - b.index);
+  const ranges = new Map();
+  for (let i = 0; i < sorted.length; i++) {
+    const { item, index } = sorted[i];
+    const start = Number.isFinite(item.start) ? item.start : 0;
+    const end = Number.isFinite(item.end) ? item.end : start;
+    const next = sorted.slice(i + 1).find(entry =>
+      Number.isFinite(entry.item.start) && (entry.item.start === end || (end <= start && entry.item.start === start)));
+    const nominalRight = end >= maxStep ? maxStep : end + 1;
+    const right = next && next.item.start <= nominalRight
+      ? next.item.start
+      : nominalRight;
+    ranges.set(index, {
+      start,
+      end,
+      right: Math.max(start, right),
+    });
+  }
+  return ranges;
+}
+
+function timelineRangeContainsStep(range, stepIndex) {
+  if (!range) return false;
+  if (range.right <= range.start) return stepIndex === range.start;
+  return stepIndex >= range.start && stepIndex < range.right;
+}
+
 function alignFinalTimelineEdges(taskPack, stagePack, maxStep) {
+  const actualWidthOf = item => Number.isFinite(item.durationWidth) ? item.durationWidth : item.width;
   const finalRight = Math.max(
     0,
     ...taskPack.placed
       .filter(item => item.band?.end >= maxStep)
-      .map(item => item.left + item.width),
+      .map(item => item.left + actualWidthOf(item)),
     ...stagePack.placed
       .filter(item => item.segment?.end >= maxStep)
-      .map(item => item.left + item.width)
+      .map(item => item.left + actualWidthOf(item))
   );
   if (!finalRight) return;
   for (const item of taskPack.placed) {
     if (item.band?.end >= maxStep) {
-      item.width = Math.max(item.width, finalRight - item.left);
+      item.durationWidth = Math.max(actualWidthOf(item), finalRight - item.left);
+      item.width = Math.max(item.width, item.durationWidth);
     }
   }
   for (const item of stagePack.placed) {
     if (item.segment?.end >= maxStep) {
-      item.width = Math.max(item.width, finalRight - item.left);
+      item.durationWidth = Math.max(actualWidthOf(item), finalRight - item.left);
+      item.width = Math.max(item.width, item.durationWidth);
     }
   }
 }
@@ -2819,11 +3512,13 @@ function attachTimelinePan(scroll, options = {}) {
   scroll.addEventListener('scroll', () => {
     if (scroll.__timelineIgnoreScroll) return;
     if (scroll.__timelineProgrammaticRestore) return;
+    if (scroll.__timelineRestorePending) return;
+    if (Number.isFinite(scroll.__timelineRestoringUntil) && performance.now() < scroll.__timelineRestoringUntil) return;
     scroll.__timelineUserScrolled = true;
     if (isMini) miniTimelineScrollLeft = scroll.scrollLeft;
     else {
       timelineScrollLeft = scroll.scrollLeft;
-      if (options.followCurrent) timelineAutoFollowDisabled = true;
+      if (options.followCurrent && !timer) timelineAutoFollowDisabled = true;
     }
   });
   let panning = false;
@@ -2854,7 +3549,7 @@ function attachTimelinePan(scroll, options = {}) {
     scroll.classList.remove('panning');
     if (moved) {
       timelinePanSuppressClick = true;
-      if (!isMini) timelineAutoFollowDisabled = true;
+      if (!isMini && !timer) timelineAutoFollowDisabled = true;
     }
   };
   scroll.addEventListener('pointerup', endPan);
@@ -2864,10 +3559,11 @@ function attachTimelinePan(scroll, options = {}) {
   scroll.__timelineRestoreLeft = restoreLeft;
   const applyRestoredLeft = left => {
     scroll.__timelineProgrammaticRestore = true;
+    scroll.__timelineRestoringUntil = performance.now() + 180;
     scroll.scrollLeft = left;
     if (isMini) miniTimelineScrollLeft = left;
     else timelineScrollLeft = left;
-    window.setTimeout(() => { scroll.__timelineProgrammaticRestore = false; }, 0);
+    window.setTimeout(() => { scroll.__timelineProgrammaticRestore = false; }, 80);
   };
   if (!options.followCurrent && !options.lockCurrent && !options.alignCurrentEnd) {
     applyRestoredLeft(restoreLeft);
@@ -2966,7 +3662,8 @@ function renderTimelineMap(segments, options = {}) {
   // Bars are sized by real duration; the canvas grows wider than the viewport so
   // it scrolls instead of cramming every stage into one fixed width.
   const MIN_BAR_PX = compact ? 34 : 50;
-  const MIN_TASK_BAR_PX = compact ? 120 : 180;
+  const POINT_BAR_PX = compact ? 5 : 7;
+  const MIN_TASK_LABEL_PX = compact ? 120 : 180;
   const TASK_LANE_H = compact ? 24 : 32;
   const STAGE_LANE_H = compact ? 16 : 20;
   const RULER_H = compact ? 18 : 22;
@@ -2978,45 +3675,71 @@ function renderTimelineMap(segments, options = {}) {
       ? 28 + String(label || '').length * 5.8 + String(txText || '').length * 5.2
       : 44 + String(label || '').length * 7.4 + String(txText || '').length * 6.3
   );
-  const taskScalePxPerStep = taskBands.reduce((best, band) => {
-    const duration = Math.max(1, band.end - band.start + 1);
-    if (duration < (compact ? 14 : 8)) return best;
-    const txText = band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : '';
-    return Math.max(best, taskLabelWidth(band.displayLabel, txText) / duration);
-  }, 0);
+  const stageLabelWidth = (label, ordinal) => Math.ceil(
+    compact
+      ? 30 + String(label || '').length * 4.8 + String(ordinal || '').length * 7
+      : 44 + String(label || '').length * 6.8 + String(ordinal || '').length * 7
+  );
+  const taskRanges = timelineLayerVisualRanges(taskBands, maxStep);
+  const stageRanges = timelineLayerVisualRanges(segments, maxStep);
+  const labelScalePxPerStep = Math.max(
+    ...taskBands.map((band, index) => {
+      const range = taskRanges.get(index);
+      const duration = Math.max(0, (range?.right ?? band.end) - (range?.start ?? band.start));
+      if (duration <= 2) return 0;
+      const txText = band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : '';
+      return Math.max(taskLabelWidth(band.displayLabel, txText), MIN_TASK_LABEL_PX) / duration;
+    }),
+    ...segments.map((segment, index) => {
+      const range = stageRanges.get(index);
+      const duration = Math.max(0, (range?.right ?? segment.end) - (range?.start ?? segment.start));
+      if (duration <= 2) return 0;
+      return stageLabelWidth(segment.label, index + 1) / duration;
+    }),
+    0
+  );
   const basePxPerStep = Math.max(
     clamp((compact ? MIN_BAR_PX : MIN_BAR_PX * 1.35) / avgDur, compact ? 0.5 : 0.85, 16),
-    clamp(taskScalePxPerStep, 0, compact ? 8 : 14)
+    clamp(labelScalePxPerStep, 0, 12)
   );
   const timeWidth = Math.max(viewportW, Math.round((maxStep + 1) * basePxPerStep));
   const pxPerStep = timeWidth / (maxStep + 1);
   const leftOf = start => start * pxPerStep;
-  const minWidthForLabel = (label, ordinal) => Math.max(
-    MIN_BAR_PX,
-    Math.ceil((compact ? 28 : 42) + String(label || '').length * (compact ? 4.8 : 6.8) + String(ordinal || '').length * 7)
-  );
-  const widthOf = (start, end, minWidth = MIN_BAR_PX) =>
-    Math.max((end - start + 1) * pxPerStep, minWidth);
-  const taskPack = packTimelineLanes(taskBands.map((band, index) => ({
-    band,
-    index,
-    left: leftOf(band.start),
-    width: (band.end - band.start + 1) * pxPerStep,
-    packWidth: Math.max(
-      (band.end - band.start + 1) * pxPerStep,
-      taskLabelWidth(
-        band.displayLabel,
-        band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : ''
-      ),
-      MIN_TASK_BAR_PX
-    ),
-  })));
-  const stagePack = packTimelineLanes(segments.map((segment, index) => ({
-    segment,
-    index,
-    left: leftOf(segment.start),
-    width: widthOf(segment.start, segment.end, minWidthForLabel(segment.label, index + 1)),
-  })));
+  const widthForRange = range => {
+    const strictWidth = Math.max(0, (range.right - range.start) * pxPerStep);
+    return strictWidth > 0 ? Math.max(1, strictWidth) : POINT_BAR_PX;
+  };
+  const taskPack = packTimelineLanes(taskBands.map((band, index) => {
+    const range = taskRanges.get(index) || { start: band.start, right: band.end };
+    const durationWidth = widthForRange(range);
+    const txText = band.transactions.length ? band.transactions.map(tx => tx.transactionId).join('/') : '';
+    const labelWidth = Math.max(taskLabelWidth(band.displayLabel, txText), MIN_TASK_LABEL_PX);
+    const width = Math.max(durationWidth, labelWidth);
+    return {
+      band,
+      index,
+      range,
+      left: leftOf(range.start),
+      width,
+      durationWidth,
+      packWidth: width,
+    };
+  }));
+  const stagePack = packTimelineLanes(segments.map((segment, index) => {
+    const range = stageRanges.get(index) || { start: segment.start, right: segment.end };
+    const durationWidth = widthForRange(range);
+    const labelWidth = Math.max(stageLabelWidth(segment.label, index + 1), MIN_BAR_PX);
+    const width = Math.max(durationWidth, labelWidth);
+    return {
+      segment,
+      index,
+      range,
+      left: leftOf(range.start),
+      width,
+      durationWidth,
+      packWidth: width,
+    };
+  }));
   alignFinalTimelineEdges(taskPack, stagePack, maxStep);
 
   const taskFieldH = taskBands.length ? taskPack.laneCount * TASK_LANE_H + 5 : 0;
@@ -3024,7 +3747,7 @@ function renderTimelineMap(segments, options = {}) {
   const canvasWidth = Math.ceil(Math.max(
     timeWidth,
     ...taskPack.placed.map(item => item.left + Math.max(item.width, item.packWidth || 0)),
-    ...stagePack.placed.map(item => item.left + item.width),
+    ...stagePack.placed.map(item => item.left + Math.max(item.width, item.packWidth || 0)),
   ));
   const canvasHeight = RULER_H + taskFieldH + fieldH;
 
@@ -3056,7 +3779,7 @@ function renderTimelineMap(segments, options = {}) {
     const bar = document.createElement('button');
     bar.type = 'button';
     bar.className = `timelinePrimaryTaskBar ${band.statusClass || 'note'}`;
-    if (step >= band.start && step <= band.end) bar.classList.add('active');
+    if (timelineRangeContainsStep(item.range, step)) bar.classList.add('active');
     bar.dataset.step = String(band.start);
     bar.dataset.segmentStart = String(band.start);
     bar.dataset.segmentEnd = String(band.end);
@@ -3067,10 +3790,13 @@ function renderTimelineMap(segments, options = {}) {
     bar.setAttribute('aria-label', bar.title);
     bar.style.left = `${item.left}px`;
     bar.style.width = `${item.width}px`;
+    bar.style.setProperty('--duration-width', `${item.durationWidth || item.width}px`);
     bar.style.top = `${item.lane * TASK_LANE_H + 2}px`;
     bar.innerHTML = `
-      <span class="taskLabel">${escapeHtml(band.displayLabel)}</span>
-      <span class="taskTxList">${escapeHtml(txText)}</span>
+      <span class="taskText">
+        <span class="taskLabel">${escapeHtml(band.displayLabel)}</span>
+        <span class="taskTxList">${escapeHtml(txText)}</span>
+      </span>
     `;
     taskField.appendChild(bar);
   }
@@ -3092,12 +3818,19 @@ function renderTimelineMap(segments, options = {}) {
     bar.setAttribute('aria-label', bar.title);
     bar.style.left = `${item.left}px`;
     bar.style.width = `${item.width}px`;
+    bar.style.setProperty('--duration-width', `${item.durationWidth || item.width}px`);
     bar.style.top = `${item.lane * STAGE_LANE_H + 3}px`;
     if (progress) {
       bar.classList.add('progress');
-      bar.style.setProperty('--stage-progress', `${Math.round(lifecycleStageProgress(segment) * 100)}%`);
+      const progressWidth = Math.round((item.durationWidth || item.width) * lifecycleStageProgress(segment));
+      bar.style.setProperty('--stage-progress-width', `${progressWidth}px`);
     }
-    bar.innerHTML = `<span class="barIdx">${item.index + 1}</span><span class="barLabel">${escapeHtml(segment.label)}</span>`;
+    bar.innerHTML = `
+      <span class="stageText">
+        <span class="barIdx">${item.index + 1}</span>
+        <span class="barLabel">${escapeHtml(segment.label)}</span>
+      </span>
+    `;
     field.appendChild(bar);
   }
 
@@ -3108,9 +3841,9 @@ function renderTimelineMap(segments, options = {}) {
   if (shouldAlignCurrentEnd) {
     const currentStage = [...stagePack.placed]
       .reverse()
-      .find(item => step >= item.segment.start && step <= item.segment.end)
+      .find(item => timelineRangeContainsStep(item.range, step))
       || stagePack.placed[stagePack.placed.length - 1];
-    if (currentStage) nowLeft = currentStage.left + currentStage.width;
+    if (currentStage) nowLeft = currentStage.left + (currentStage.durationWidth || currentStage.width);
   }
   now.style.left = `${Math.min(nowLeft, canvasWidth)}px`;
   now.title = `current step ${step}`;
@@ -3177,6 +3910,7 @@ function renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, 
     const supportRow = supportSummary
       ? `<dt>Support</dt><dd>${escapeHtml(supportSummary)}</dd>`
       : '';
+    const decisionRows = timelineDecisionRowsHtml(selectedSegment, { includeSamples: false });
     const primaryTaskRows = primaryTask ? `
         <dt>Primary Task</dt><dd>${escapeHtml(primaryTask.displayLabel)}</dd>
         <dt>Transaction</dt><dd>${escapeHtml(primaryTaskTransactionText(primaryTask))}</dd>
@@ -3201,6 +3935,7 @@ function renderTimelineSelectionMessage(segments, chapters, activeChapterIndex, 
         <dt>Actions</dt><dd>${escapeHtml(joinSet(selectedSegment.actionFamilies) || 'NoOp')}</dd>
         <dt>Signals</dt><dd>${escapeHtml(selectedSegment.debugReasons.join(', ') || 'ordinary execution')}</dd>
         ${supportRow}
+        ${decisionRows}
       </dl>
       ${timelineSelectionEventsHtml(selectedSegment)}
     `;
@@ -3637,6 +4372,7 @@ function lifecycleDetailCard(segment, ordinal) {
   const nativeTransaction = timelineNativeTransaction(segment);
   const candidateSummary = timelineMetaCandidateSummary(segment);
   const supportSummary = timelineSupportSummaryText(timelineSupportRollup(segment));
+  const decisionRows = timelineDecisionRowsHtml(segment, { includeSamples: true });
   card.innerHTML = `
     <div class="timelineDetailHeader">
       <strong>Stage ${ordinal}</strong>
@@ -3660,12 +4396,292 @@ function lifecycleDetailCard(segment, ordinal) {
       <dt>Transaction</dt><dd>${escapeHtml(timelineTransactionSummaryText(nativeTransaction))}</dd>
       <dt>Candidates</dt><dd>${escapeHtml(timelineCandidateSummaryText(candidateSummary))}</dd>
       <dt>Support</dt><dd>${escapeHtml(supportSummary || 'none')}</dd>
+      ${decisionRows}
       <dt>Rejected</dt><dd>${segment.rejectedCount}</dd>
       <dt>Children</dt><dd>${segment.eventCount || 0} decision / ${segment.intentCount || 0} intent</dd>
     </dl>
     ${timelineChildEventsHtml(segment)}
   `;
   return card;
+}
+
+function timelineDecisionRowsHtml(segment, options = {}) {
+  const selection = timelineBestSubgoalSelection(segment);
+  const ordering = timelineBestSubgoalOrdering(segment, selection);
+  const rows = [];
+  if (selection) {
+    rows.push(['Selected', timelineSubgoalSelectionSummaryText(selection)]);
+    rows.push(['Why selected', timelineFriendlySelectionBasis(selection)]);
+    rows.push(['Gate checks', timelineFriendlySelectionGates(selection)]);
+    if (options.includeSamples) rows.push(['Candidate pool', timelineFriendlySubgoalSample(selection.candidateStatusSample, { limit: 4, includeStatus: true })]);
+  }
+  if (ordering) {
+    rows.push(['Priority order', timelineSubgoalOrderingSummaryText(ordering)]);
+    rows.push(['Order rule', timelineFriendlyOrderingBasis(ordering)]);
+    if (options.includeSamples) {
+      rows.push(['Distance model', timelineFriendlyHeuristic(ordering.heuristicBasis || selection?.heuristicBasis)]);
+      rows.push(['Order sample', timelineFriendlySubgoalSample(ordering.orderSample, { limit: 4 })]);
+    }
+  } else if (selection?.heuristicBasis && options.includeSamples) {
+    rows.push(['Distance model', timelineFriendlyHeuristic(selection.heuristicBasis)]);
+  }
+  return rows
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(formatEventValue(value))}</dd>`)
+    .join('');
+}
+
+function timelineBestSubgoalSelection(segment) {
+  const selections = timelineMetaSubgoalSelections(segment);
+  if (selections.length === 0) return null;
+  const primaryLabel = segment.primaryTask?.label || primaryTaskLabelFromSegment(segment);
+  if (primaryLabel) {
+    const match = selections.find(selection => {
+      const subgoal = cleanPrimaryTaskLabel(selection.ownerSubgoal || selection.subgoal);
+      return subgoal && subgoal === primaryLabel;
+    });
+    if (match) return match;
+  }
+  return selections[0];
+}
+
+function timelinePrimarySubgoalDecision(context, transaction = null, candidateGroup = null) {
+  const selections = context?.selections || [];
+  const orderings = context?.orderings || [];
+  if (selections.length === 0 && orderings.length === 0) return { selection: null, ordering: null };
+  const anchorStep = timelinePrimaryDecisionAnchorStep(transaction, candidateGroup, selections, orderings);
+  const targetLabel = timelinePrimaryDecisionTargetLabel(transaction, candidateGroup);
+  let selection = null;
+  if (targetLabel) {
+    selection = selections
+      .filter(item => timelineSubgoalSelectionMatches(item, targetLabel))
+      .sort((a, b) => Math.abs((a.step ?? 0) - anchorStep) - Math.abs((b.step ?? 0) - anchorStep))[0] || null;
+  }
+  if (!selection) {
+    selection = selections
+      .filter(item => (item.step ?? 0) <= anchorStep)
+      .sort((a, b) => b.step - a.step)[0] || selections[0] || null;
+  }
+  const orderingAnchor = selection?.step ?? anchorStep;
+  let ordering = orderings
+    .filter(item => (item.step ?? 0) <= orderingAnchor)
+    .sort((a, b) => b.step - a.step)[0] || orderings[0] || null;
+  if (targetLabel) {
+    const mentioning = orderings
+      .filter(item => timelineOrderingMentions(item, targetLabel))
+      .sort((a, b) => Math.abs((a.step ?? 0) - orderingAnchor) - Math.abs((b.step ?? 0) - orderingAnchor))[0] || null;
+    if (mentioning) ordering = mentioning;
+  }
+  return { selection, ordering };
+}
+
+function timelinePrimaryDecisionAnchorStep(transaction, candidateGroup, selections, orderings) {
+  if (candidateGroup) return timelineIssueStep(candidateGroup);
+  if (transaction) return transaction.planStartStep ?? timelineIssueStep(transaction);
+  return selections?.[0]?.step ?? orderings?.[0]?.step ?? 0;
+}
+
+function timelinePrimaryDecisionTargetLabel(transaction, candidateGroup) {
+  const txLabel = cleanPrimaryTaskLabel(transaction?.taskLabel || transaction?.subgoal || '');
+  if (txLabel) return txLabel;
+  const candidateSubgoal = cleanPrimaryTaskLabel(candidateGroup?.subgoal || '');
+  if (candidateSubgoal) return candidateSubgoal;
+  if (candidateGroup?.agentId != null && candidateGroup?.boxType && candidateGroup?.goal) {
+    const goal = timelineGoalText(candidateGroup.goal);
+    if (goal) return cleanPrimaryTaskLabel(`agent${candidateGroup.agentId}->${candidateGroup.boxType}@${goal}`);
+  }
+  return '';
+}
+
+function timelineSubgoalSelectionMatches(selection, targetLabel) {
+  if (!selection || !targetLabel) return false;
+  const candidates = [
+    selection.ownerSubgoal,
+    selection.subgoal,
+    selection.boxType && selection.goal ? `agent${selection.agentId}->${selection.boxType}@${timelineGoalText(selection.goal)}` : '',
+  ].map(cleanPrimaryTaskLabel).filter(Boolean);
+  return candidates.includes(targetLabel);
+}
+
+function timelineOrderingMentions(ordering, targetLabel) {
+  if (!ordering || !targetLabel) return false;
+  return formatEventValue(ordering.orderSample || '').replace(/\s+/g, '').includes(targetLabel);
+}
+
+function timelineBestSubgoalOrdering(segment, selection = null) {
+  const localOrderings = timelineMetaSubgoalOrderings(segment);
+  if (localOrderings.length > 0) {
+    return nearestSubgoalOrdering(localOrderings, selection?.step ?? segment.start);
+  }
+  if (!selection) return null;
+  const context = subgoalDecisionContext();
+  const anchor = selection?.step ?? segment.start;
+  const before = context.orderings.filter(ordering => ordering.step <= anchor);
+  if (before.length > 0) return before[before.length - 1];
+  return context.orderings[0] || null;
+}
+
+function nearestSubgoalOrdering(orderings, anchorStep) {
+  let best = orderings[0] || null;
+  let bestDistance = Infinity;
+  for (const ordering of orderings) {
+    const distance = Math.abs((ordering.step ?? 0) - (anchorStep ?? 0));
+    if (distance < bestDistance) {
+      best = ordering;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function timelineSubgoalSelectionSummaryText(selection) {
+  if (!selection) return 'none';
+  const pool = selection.candidateCount != null || selection.eligibleCount != null
+    ? `${selection.eligibleCount ?? '?'} eligible of ${selection.candidateCount ?? '?'} candidates`
+    : '';
+  const parts = [
+    `${timelineReadableSubgoalLabel(selection.subgoal)} was selected`,
+    selection.selectionId ? `id ${selection.selectionId}` : '',
+    selection.step != null ? `step ${selection.step}` : '',
+    selection.selectedRank != null ? `rank ${selection.selectedRank}` : '',
+    pool,
+    selection.selectedEstimatedDifficulty ? `diff ${selection.selectedEstimatedDifficulty}` : '',
+    selection.selectedUnmetDependencies != null ? `${selection.selectedUnmetDependencies} unmet dependencies` : '',
+  ].filter(Boolean);
+  return parts.join(' | ') || 'subgoal selection recorded';
+}
+
+function timelineSubgoalOrderingSummaryText(ordering) {
+  if (!ordering) return 'none';
+  const ordered = ordering.orderedSubgoalCount != null || ordering.rawSubgoalCount != null
+    ? `${ordering.orderedSubgoalCount ?? '?'} of ${ordering.rawSubgoalCount ?? '?'} goals ordered`
+    : '';
+  const parts = [
+    ordering.orderSnapshotId ? `id ${ordering.orderSnapshotId}` : '',
+    timelineReadableOrderingMode(ordering.orderingMode),
+    ordered,
+    ordering.goalDependencyEdges != null ? `${ordering.goalDependencyEdges} dependency edges` : '',
+    ordering.completedBoxGoals != null ? `${ordering.completedBoxGoals} completed goals` : '',
+    ordering.transitDeferredToTail != null ? `${ordering.transitDeferredToTail} transit deferred` : '',
+    ordering.physicalBlockingPromotions != null ? `${ordering.physicalBlockingPromotions} barrier promotions` : '',
+  ].filter(Boolean);
+  return parts.join(' | ') || 'subgoal ordering recorded';
+}
+
+function timelineFriendlySelectionBasis(selection) {
+  const basis = String(selection?.selectionBasis || selection?.reason || '').toLowerCase();
+  if (basis.includes('first-eligible')) {
+    return 'The planner scans the current priority order and takes the first subgoal that passes all runtime gates.';
+  }
+  if (basis.includes('priority')) {
+    return 'The selected subgoal is the highest-priority candidate that is currently allowed to run.';
+  }
+  return formatEventValue(selection?.selectionBasis || selection?.reason) || 'Selection basis was not recorded.';
+}
+
+function timelineFriendlySelectionGates(selection) {
+  if (!selection) return '';
+  const parts = [];
+  if (selection.selectedUnmetDependencies != null) {
+    parts.push(`${selection.selectedUnmetDependencies} unmet dependencies for the chosen subgoal`);
+  }
+  if (selection.selectionStatusCounts) parts.push(`pool status: ${selection.selectionStatusCounts}`);
+  if (selection.selectedCompletionCount != null && selection.selectedCompletionCount > 0) {
+    parts.push(`${selection.selectedCompletionCount} prerequisites already completed for this candidate`);
+  }
+  const raw = String(selection.filterBasis || '').toLowerCase();
+  const gates = [];
+  if (raw.includes('topology')) gates.push('topology dependencies');
+  if (raw.includes('completed')) gates.push('already-completed goals');
+  if (raw.includes('cycle')) gates.push('cycle limit');
+  if (raw.includes('trap')) gates.push('trap blacklist');
+  if (raw.includes('synthetic')) gates.push('synthetic-relief blacklist');
+  if (raw.includes('relief certificate')) gates.push('relief certificate state');
+  if (gates.length) parts.push(`checked ${gates.join(', ')}`);
+  return parts.join(' | ') || formatEventValue(selection.filterBasis);
+}
+
+function timelineFriendlyOrderingBasis(ordering) {
+  if (!ordering) return '';
+  const mode = timelineReadableOrderingMode(ordering.orderingMode);
+  const basis = String(ordering.orderingBasis || '').toLowerCase();
+  if (basis.includes('levelanalyzer') || basis.includes('dependency-first')) {
+    return `${mode} ordering from the LevelAnalyzer dependency graph; dependency-first goals stay ahead, while transit-dependent goals are pushed later.`;
+  }
+  if (basis.includes('topology')) {
+    return `${mode} ordering based on topology dependencies.`;
+  }
+  return formatEventValue(ordering.orderingBasis || ordering.orderingMode);
+}
+
+function timelineFriendlyHeuristic(value) {
+  const text = formatEventValue(value);
+  if (!text) return '';
+  const lower = text.toLowerCase();
+  if (lower.includes('truedistanceheuristic') || lower.includes('true-distance')) {
+    return 'Difficulty uses true distance when available, otherwise Manhattan. The score combines agent-to-box operation-side work and box-to-goal immovable-aware distance.';
+  }
+  return text;
+}
+
+function timelineFriendlySubgoalSample(value, options = {}) {
+  const entries = parseSubgoalSampleEntries(value);
+  if (entries.length === 0) return formatEventValue(value);
+  const limit = Math.max(1, options.limit || 5);
+  const shown = entries.slice(0, limit).map(entry => {
+    const details = [];
+    const status = options.includeStatus ? timelineFriendlySampleStatus(entry) : '';
+    if (status) details.push(status);
+    if (entry.diff) details.push(`diff ${entry.diff}`);
+    if (entry.unmetDeps !== '') details.push(`deps ${entry.unmetDeps}`);
+    if (entry.completions !== '' && entry.completions !== '0') details.push(`completed ${entry.completions}`);
+    return `${entry.rank}. ${timelineReadableSubgoalLabel(entry.subgoal)}${details.length ? ` (${details.join(', ')})` : ''}`;
+  });
+  const overflow = entries.length > limit ? `; +${entries.length - limit} more` : '';
+  return `${shown.join('; ')}${overflow}`;
+}
+
+function parseSubgoalSampleEntries(value) {
+  const text = formatEventValue(value);
+  if (!text) return [];
+  return text.split(/\s*;\s*/).map(part => {
+    const match = part.match(/^(\d+):([^\s]+)\s*(.*)$/);
+    if (!match) return null;
+    const fields = {};
+    const rest = match[3] || '';
+    for (const field of rest.matchAll(/([A-Za-z][A-Za-z0-9]*)=([^ ]+)/g)) {
+      fields[field[1]] = field[2];
+    }
+    return {
+      rank: match[1],
+      subgoal: match[2],
+      type: fields.type || '',
+      diff: fields.diff || '',
+      unmetDeps: fields.unmetDeps ?? '',
+      completions: fields.completions ?? '',
+      tags: fields.tags || '',
+    };
+  }).filter(Boolean);
+}
+
+function timelineFriendlySampleStatus(entry) {
+  const tags = String(entry?.tags || '').toLowerCase();
+  if (tags.includes('selected')) return 'selected';
+  if (tags.includes('eligible-lower-priority')) return 'eligible, lower priority';
+  if (tags.includes('transit')) return 'transit';
+  if (tags.includes('failed')) return 'failed';
+  return '';
+}
+
+function timelineReadableSubgoalLabel(value) {
+  const label = cleanPrimaryTaskLabel(value);
+  return label ? formatPrimaryTaskLabel(label) : formatEventValue(value || 'subgoal');
+}
+
+function timelineReadableOrderingMode(value) {
+  const raw = formatEventValue(value);
+  if (!raw) return 'priority';
+  return raw.toLowerCase() === 'topological' ? 'topological' : raw.toLowerCase();
 }
 
 function timelineTransactionSummaryText(transaction) {
@@ -3743,8 +4759,8 @@ function replayPlannerTransactions() {
       const kind = String(event?.kind || event?.type || '').toLowerCase();
       if (!kind.includes('planner-transaction')) continue;
       const taskLabel = primaryTaskLabelFromEvent(event, { allowSubgoalFallback: true });
-      const start = numberOrNull(event.planStart) ?? i;
-      const end = numberOrNull(event.planEnd) ?? i;
+      const start = numberOrNull(event.planStart ?? event.planStartStep) ?? i;
+      const end = numberOrNull(event.planEnd ?? event.planEndStep) ?? i;
       const rawStatus = formatEventValue(event.commitStatus || event.verdict || '');
       const status = rawStatus ? rawStatus.toLowerCase() : 'transaction';
       transactions.push({
@@ -4286,6 +5302,8 @@ function lifecycleMacroLabel(event) {
   if (phase.includes('CLEARED') || kind.includes('support-blocker')) return 'Path Clearing';
   if (phase.includes('PARALLEL')) return 'Parallel Execution';
   if (kind.includes('planner-transaction')) return 'Planner Transaction';
+  if (kind.includes('subgoal-selection')) return 'Subgoal Selection';
+  if (kind.includes('subgoal-ordering')) return 'Subgoal Ordering';
   if (kind.includes('candidate-summary')) return 'Candidate Summary';
   if (kind.includes('box-selection')) return 'Box Selection';
   if (kind.includes('bsp')) return 'BSP Search';
@@ -4407,6 +5425,8 @@ function timelineMetaSpan(segment, index, allSegments = []) {
     transaction: timelineMetaTransaction(segment, index, allSegments, stateDiff),
     transactions: timelineNativeTransactions(segment),
     candidateSummary: timelineMetaCandidateSummary(segment),
+    subgoalSelections: timelineMetaSubgoalSelections(segment),
+    subgoalOrderings: timelineMetaSubgoalOrderings(segment),
     decisionEvents: decisionChildren.slice(0, MAX_EXPORTED_DECISION_EVENTS).map(timelineMetaEvent),
   };
 }
@@ -4626,8 +5646,8 @@ function timelineNativeTransactionFromEvent(item, event, segment) {
     phase: formatEventValue(event.phase) || joinSet(segment.phases, 2) || 'execution',
     subgoal: formatEventValue(event.subgoal) || segment.subgoal || '',
     subgoalTypes: event.subgoalType ? [formatEventValue(event.subgoalType)] : sortedArray(segment.subgoalTypes),
-    planStartStep: numberOrNull(event.planStart) ?? segment.start,
-    planEndStep: numberOrNull(event.planEnd) ?? item.step,
+    planStartStep: numberOrNull(event.planStart ?? event.planStartStep) ?? segment.start,
+    planEndStep: numberOrNull(event.planEnd ?? event.planEndStep) ?? item.step,
     planDelta: numberOrNull(event.planDelta),
     plannedPathSteps: numberOrNull(event.plannedPathSteps),
     commitStatus: status ? status.toLowerCase() : transactionCommitStatus(segment),
@@ -4753,6 +5773,118 @@ function timelineMetaCandidateSummary(segment) {
         rawEvent: compactMetaEvent(event),
       };
     });
+}
+
+function subgoalDecisionContext() {
+  if (subgoalDecisionContextCache) return subgoalDecisionContextCache;
+  const selections = [];
+  const orderings = [];
+  if (replay?.frames) {
+    for (let i = 0; i < replay.frames.length; i++) {
+      for (const event of stepEvents(replay.frames[i], i)) {
+        const kind = String(event?.kind || event?.type || event?.category || '').toLowerCase();
+        if (kind.includes('subgoal-selection-summary')) {
+          selections.push(compactSubgoalSelection({ step: i, event }));
+        } else if (kind.includes('subgoal-ordering-snapshot')) {
+          orderings.push(compactSubgoalOrdering({ step: i, event }));
+        }
+      }
+    }
+  }
+  subgoalDecisionContextCache = {
+    selections: selections.sort((a, b) => a.step - b.step || String(a.selectionId).localeCompare(String(b.selectionId))),
+    orderings: orderings.sort((a, b) => a.step - b.step || String(a.orderSnapshotId).localeCompare(String(b.orderSnapshotId))),
+  };
+  return subgoalDecisionContextCache;
+}
+
+function timelineMetaSubgoalSelections(segment) {
+  const children = Array.isArray(segment?.children) ? segment.children : [];
+  return children
+    .filter(item => String(item.event?.kind || '').toLowerCase().includes('subgoal-selection-summary'))
+    .map(compactSubgoalSelection);
+}
+
+function timelineMetaSubgoalOrderings(segment) {
+  const children = Array.isArray(segment?.children) ? segment.children : [];
+  return children
+    .filter(item => String(item.event?.kind || '').toLowerCase().includes('subgoal-ordering-snapshot'))
+    .map(compactSubgoalOrdering);
+}
+
+function compactSubgoalSelection(item) {
+  const event = item?.event || {};
+  return {
+    step: item?.step,
+    selectionId: formatEventValue(event.selectionId),
+    decisionLayer: formatEventValue(event.decisionLayer),
+    subgoal: formatEventValue(event.subgoal),
+    subgoalType: formatEventValue(event.subgoalType),
+    goal: event.goal ?? null,
+    boxType: formatEventValue(event.boxType),
+    agentId: eventAgentId(event),
+    ownerAgentId: numberOrNull(event.ownerAgentId),
+    ownerAgent: formatEventValue(event.ownerAgent),
+    ownerSubgoal: formatEventValue(event.ownerSubgoal),
+    verdict: formatEventValue(event.verdict),
+    reason: formatEventValue(event.reason),
+    selectionBasis: formatEventValue(event.selectionBasis),
+    orderingBasis: formatEventValue(event.orderingBasis),
+    filterBasis: formatEventValue(event.filterBasis),
+    topologyBasis: formatEventValue(event.topologyBasis),
+    heuristicBasis: formatEventValue(event.heuristicBasis),
+    candidateCount: numberOrNull(event.candidateCount),
+    eligibleCount: numberOrNull(event.eligibleCount),
+    selectedRank: numberOrNull(event.selectedRank),
+    selectedEstimatedDifficulty: formatEventValue(event.selectedEstimatedDifficulty),
+    selectedUnmetDependencies: numberOrNull(event.selectedUnmetDependencies),
+    selectedCompletionCount: numberOrNull(event.selectedCompletionCount),
+    selectionStatusCounts: formatEventValue(event.selectionStatusCounts),
+    candidateStatusSample: formatEventValue(event.candidateStatusSample),
+    rawEvent: compactMetaEvent(event),
+  };
+}
+
+function compactSubgoalOrdering(item) {
+  const event = item?.event || {};
+  return {
+    step: item?.step,
+    orderSnapshotId: formatEventValue(event.orderSnapshotId),
+    decisionLayer: formatEventValue(event.decisionLayer),
+    phase: formatEventValue(event.phase),
+    verdict: formatEventValue(event.verdict),
+    reason: formatEventValue(event.reason),
+    orderingMode: formatEventValue(event.orderingMode),
+    orderingBasis: formatEventValue(event.orderingBasis),
+    topologyBasis: formatEventValue(event.topologyBasis),
+    heuristicBasis: formatEventValue(event.heuristicBasis),
+    rawSubgoalCount: numberOrNull(event.rawSubgoalCount),
+    orderedSubgoalCount: numberOrNull(event.orderedSubgoalCount),
+    precomputedGoalOrderSize: numberOrNull(event.precomputedGoalOrderSize),
+    goalDependencyEdges: numberOrNull(event.goalDependencyEdges),
+    completedBoxGoals: numberOrNull(event.completedBoxGoals),
+    suspendedBoxGoals: numberOrNull(event.suspendedBoxGoals),
+    suspendedTransitGoals: numberOrNull(event.suspendedTransitGoals),
+    displacedGoals: numberOrNull(event.displacedGoals),
+    deprioritizedGoalHints: numberOrNull(event.deprioritizedGoalHints),
+    prioritizedGoalHints: numberOrNull(event.prioritizedGoalHints),
+    escapeSubgoalHints: numberOrNull(event.escapeSubgoalHints),
+    transitProfiles: numberOrNull(event.transitProfiles),
+    suspendedRemoved: numberOrNull(event.suspendedRemoved),
+    physicalBlockingPromotions: numberOrNull(event.physicalBlockingPromotions),
+    deprioritizedMovedToTail: numberOrNull(event.deprioritizedMovedToTail),
+    prioritizedMovedToFront: numberOrNull(event.prioritizedMovedToFront),
+    escapePrepended: numberOrNull(event.escapePrepended),
+    transitDeferredToTail: numberOrNull(event.transitDeferredToTail),
+    dependencyEdges: formatEventValue(event.dependencyEdges),
+    orderingMetricSample: formatEventValue(event.orderingMetricSample),
+    adjacentPairRationaleSample: formatEventValue(event.adjacentPairRationaleSample),
+    transitProfileDetails: formatEventValue(event.transitProfileDetails),
+    orderStageSample: formatEventValue(event.orderStageSample),
+    physicalBlockingPromotionDetails: formatEventValue(event.physicalBlockingPromotionDetails),
+    orderSample: formatEventValue(event.orderSample),
+    rawEvent: compactMetaEvent(event),
+  };
 }
 
 function booleanOrString(value) {
@@ -5833,7 +6965,8 @@ function normalizeEvent(event) {
     'helperAgent', 'ownerExecutorMismatch',
     'subgoal', 'subgoalType', 'verdict', 'action', 'actualAction',
     'stepInSegment', 'segmentSteps', 'from', 'to', 'activeSubgoal',
-    'transactionId', 'commitStatus', 'planStart', 'planEnd', 'planDelta',
+    'transactionId', 'commitStatus', 'planStart', 'planEnd',
+    'planStartStep', 'planEndStep', 'planDelta', 'validationBasis',
     'plannedPathSteps', 'supportKind', 'supportPlanStart', 'supportPlanEnd',
     'satisfiedBoxGoalsAfter', 'futureSubgoal',
     'blocker', 'blockerType', 'targetBlocker', 'parking', 'releasedTo',
@@ -5843,6 +6976,19 @@ function normalizeEvent(event) {
     'suspendedTransitGoals', 'usableBoxCandidates',
     'operationSideFallbackCandidates', 'allocationFailedCandidates',
     'agentPosition', 'frozenGoals', 'candidateRejectCounts', 'candidateSamples',
+    'selectionId', 'orderSnapshotId', 'decisionLayer', 'selectionBasis',
+    'orderingMode', 'orderingBasis', 'filterBasis', 'topologyBasis',
+    'heuristicBasis', 'candidateCount', 'eligibleCount', 'selectedRank',
+    'selectedEstimatedDifficulty', 'selectedUnmetDependencies',
+    'selectedCompletionCount', 'selectionStatusCounts', 'candidateStatusSample',
+    'rawSubgoalCount', 'orderedSubgoalCount', 'precomputedGoalOrderSize',
+    'goalDependencyEdges', 'suspendedBoxGoals', 'displacedGoals',
+    'deprioritizedGoalHints', 'prioritizedGoalHints', 'escapeSubgoalHints',
+    'transitProfiles', 'suspendedRemoved', 'physicalBlockingPromotions',
+    'deprioritizedMovedToTail', 'prioritizedMovedToFront', 'escapePrepended',
+    'transitDeferredToTail', 'dependencyEdges', 'orderingMetricSample',
+    'adjacentPairRationaleSample', 'transitProfileDetails', 'orderStageSample',
+    'physicalBlockingPromotionDetails', 'orderSample',
     'bspAlgorithm', 'bspReason', 'bspExplored', 'bspBudget',
     'failedRounds', 'blockersBefore', 'blockersAfter',
     'accessDepthBefore', 'accessDepthAfter', 'ordinaryBlockersAfter',
@@ -5937,6 +7083,9 @@ function startPlay() {
   const bounds = activeSegmentBounds();
   if (bounds && (step < bounds.start || step > bounds.end)) {
     setStep(bounds.start);
+  }
+  if (els.timelinePanel && !els.timelinePanel.hidden && timelineMode === 'overview') {
+    timelineAutoFollowDisabled = false;
   }
   els.playBtn.textContent = 'Pause';
   els.playBtn.classList.add('active');
