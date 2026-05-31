@@ -9,8 +9,13 @@ const els = {
   app: document.querySelector('.app'),
   meta: document.getElementById('meta'),
   fileInput: document.getElementById('fileInput'),
-  groupTabs: document.getElementById('groupTabs'),
-  reportList: document.getElementById('reportList'),
+  directoryInput: document.getElementById('directoryInput'),
+  levelSearchInput: document.getElementById('levelSearchInput'),
+  prevLevelBtn: document.getElementById('prevLevelBtn'),
+  nextLevelBtn: document.getElementById('nextLevelBtn'),
+  clearLibraryBtn: document.getElementById('clearLibraryBtn'),
+  libraryInfo: document.getElementById('libraryInfo'),
+  levelList: document.getElementById('levelList'),
   boards: document.getElementById('boards'),
   panViewport: document.getElementById('panViewport'),
   panSurface: document.getElementById('panSurface'),
@@ -26,6 +31,11 @@ const els = {
   showDanger: document.getElementById('showDanger'),
   showGoals: document.getElementById('showGoals'),
   showObjects: document.getElementById('showObjects'),
+  notificationToast: document.getElementById('notificationToast'),
+  notificationTitle: document.getElementById('notificationTitle'),
+  notificationMessage: document.getElementById('notificationMessage'),
+  notificationCloseBtn: document.getElementById('notificationCloseBtn'),
+  buildVersion: document.getElementById('buildVersion'),
 };
 
 const BASE_CELL = 24;
@@ -33,11 +43,22 @@ const MIN_ZOOM = 0.3;
 const MAX_ZOOM = 4.0;
 const STORAGE_KEY = 'parkingRiskLastReport';
 const DIR_HANDLE_KEY = 'parkingRiskReportsDir';
+const VIEWER_VERSION = 'v1.0.0';
+const PARKING_RISK_DB_NAME = 'parking-risk';
+const PARKING_RISK_DB_VERSION = 2;
+const HANDLE_STORE_NAME = 'handles';
+const VIEWER_STORE_NAME = 'viewer-state';
+const LEVEL_LIBRARY_KEY = 'level-library';
+const LEVEL_LIBRARY_LOCAL_STORAGE_KEY = 'parking-risk:level-library';
+var notificationTimer = null;
 
 const state = {
   reports: window.PARKING_RISK_REPORTS || [],
   activeIndex: 0,
-  group: 'all',
+  levelEntries: [],
+  selectedEntryId: null,
+  openDirectorySource: null,
+  directoryAutoOpen: true,
   zoom: 1,
   pan: { x: 0, y: 0 },
   dirHandle: null,
@@ -46,12 +67,21 @@ const state = {
 init();
 
 function init() {
+  if (els.buildVersion) els.buildVersion.textContent = VIEWER_VERSION;
+  initInputs();
+  initNotifications();
+  initBoardNavigation();
+
   scanReportsDir().then(function() {
     return loadReportsDirManifest();
   }).then(function() {
     return loadManifestReports();
   }).then(function() {
-    renderReportList();
+    syncInitialReportEntries();
+  }).then(function() {
+    return restoreStoredEntries();
+  }).then(function() {
+    renderLevelList();
     var lastName = localStorage.getItem(STORAGE_KEY);
     var idx = 0;
     if (lastName && state.reports.length > 0) {
@@ -60,26 +90,73 @@ function init() {
     }
     if (state.reports.length > 0) loadReport(idx);
     else showEmpty();
+  }).catch(function(err) {
+    showError(errorMessage(err), 'Unable to initialize viewer');
+    showEmpty();
   });
+}
 
+function syncInitialReportEntries() {
+  for (var i = 0; i < state.reports.length; i++) syncReportEntry(state.reports[i]);
+}
+
+function initInputs() {
   els.fileInput.addEventListener('change', function(e) {
     var file = e.target.files && e.target.files[0];
-    if (file) loadLvlFile(file);
+    if (file) loadSingleFile(file, requestReportsDirFromUserGesture());
+    els.fileInput.value = '';
   });
 
-  els.groupTabs.addEventListener('click', function(e) {
-    var btn = e.target.closest('.groupBtn');
-    if (!btn) return;
-    state.group = btn.dataset.group;
-    var all = els.groupTabs.querySelectorAll('.groupBtn');
-    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
-    btn.classList.add('active');
-    renderReportList();
+  els.directoryInput.addEventListener('change', function(e) {
+    var files = Array.prototype.slice.call(e.target.files || []).filter(isLevelFile);
+    if (files.length > 0) loadDirectoryFiles(files, '', requestReportsDirFromUserGesture());
+    else showError('No .lvl files were found in that directory.', 'Nothing to load');
+    els.directoryInput.value = '';
+  });
+
+  els.levelSearchInput.addEventListener('input', renderLevelList);
+  els.prevLevelBtn.addEventListener('click', function() { switchLevel(-1); });
+  els.nextLevelBtn.addEventListener('click', function() { switchLevel(1); });
+  els.clearLibraryBtn.addEventListener('click', clearLevelLibrary);
+  els.levelList.addEventListener('click', function(e) {
+    var deleteButton = closestElement(e.target, 'button[data-entry-delete-id]');
+    if (deleteButton) {
+      e.preventDefault();
+      deleteEntryById(deleteButton.dataset.entryDeleteId);
+      return;
+    }
+
+    var levelButton = closestElement(e.target, 'button[data-entry-id]');
+    if (levelButton) {
+      e.preventDefault();
+      var entry = state.levelEntries.find(function(item) { return item.id === levelButton.dataset.entryId; });
+      loadEntryById(levelButton.dataset.entryId, entry && entry.content ? requestReportsDirFromUserGesture() : null);
+      return;
+    }
+
+    var toggleButton = closestElement(e.target, 'button[data-directory-source]');
+    if (toggleButton) {
+      e.preventDefault();
+      toggleDirectory(toggleButton.dataset.directorySource);
+    }
   });
 
   for (var k = 0; k < [els.showSafe, els.showCaution, els.showDanger, els.showGoals, els.showObjects].length; k++) {
     [els.showSafe, els.showCaution, els.showDanger, els.showGoals, els.showObjects][k].addEventListener('change', renderBoard);
   }
+}
+
+function initNotifications() {
+  els.notificationCloseBtn.addEventListener('click', clearNotification);
+  window.addEventListener('error', function(event) {
+    showError(event.message || 'Unexpected viewer error.', 'Viewer error');
+  });
+  window.addEventListener('unhandledrejection', function(event) {
+    showError(errorMessage(event.reason), 'Viewer error');
+  });
+}
+
+function initBoardNavigation() {
   els.togglePanel.addEventListener('click', function() {
     els.app.classList.toggle('collapsed');
     requestAnimationFrame(resetView);
@@ -98,7 +175,7 @@ function init() {
     els.hoverTip.style.left = (e.clientX - rect.left + 14) + 'px';
     els.hoverTip.style.top = (e.clientY - rect.top + 14) + 'px';
     els.hoverTip.classList.add('show');
-    els.hoverInfo.textContent = 'Java coordinates: (' + r + ', ' + c + ') - ' + info.summary;
+    els.hoverInfo.textContent = '(' + r + ', ' + c + ') - ' + info.summary;
   });
   els.boards.addEventListener('mouseleave', function() { els.hoverTip.classList.remove('show'); });
 
@@ -145,34 +222,358 @@ function upsertReport(report, preferFront) {
   return state.reports.length - 1;
 }
 
-function renderReportList() {
-  var rows = state.reports.map(function(r, i) { return { report: r, index: i }; });
-  if (state.group !== 'all') {
-    rows = rows.filter(function(x) {
-      var p = (x.report.path || '').replace(/\\/g, '/');
-      // Show if path matches the group, OR if it's an ad-hoc report (no known group prefix)
-      if (p.indexOf(state.group + '/') === 0 || p.indexOf(state.group + '\\') === 0) return true;
-      if (p.indexOf('levels/') !== 0 && p.indexOf('levels\\') !== 0 &&
-          p.indexOf('complevels/') !== 0 && p.indexOf('complevels\\') !== 0) return true;
-      return false;
-    });
+function makeEntryFromFile(file, content, fallbackSource) {
+  var path = file.webkitRelativePath || file.name;
+  var source = directoryRootName(file) || fallbackSource || 'File';
+  return normalizeEntry({
+    name: stem(file.name),
+    fileName: file.name,
+    path: path,
+    source: source,
+    content: content,
+    kind: 'level',
+    persistent: true,
+  });
+}
+
+function makeEntryFromReport(report) {
+  var path = report.path || (report.name + '.lvl');
+  return normalizeEntry({
+    name: report.name || stem(path),
+    fileName: fileName(path) || ((report.name || 'report') + '.lvl'),
+    path: path,
+    source: sourceFromPath(path) || 'Reports',
+    content: '',
+    reportName: report.name,
+    kind: 'report',
+    persistent: false,
+  });
+}
+
+function syncReportEntry(report) {
+  if (!report || !report.name) return;
+  var reportEntry = makeEntryFromReport(report);
+  var reportKey = entryKey(reportEntry);
+  var existing = state.levelEntries.find(function(entry) { return entryKey(entry) === reportKey; });
+  if (existing && existing.content) {
+    existing.reportName = report.name;
+    renderLevelList();
+    return;
   }
-  els.reportList.innerHTML = '';
-  if (rows.length === 0) return;
-  for (var i = 0; i < rows.length; i++) {
-    var row = document.createElement('div');
-    row.className = 'reportRow' + (rows[i].index === state.activeIndex ? ' active' : '');
-    row.innerHTML = '<span>' + escapeHtml(rows[i].report.name) + '</span><span class="path">' + escapeHtml(rows[i].report.path) + '</span>';
-    row.addEventListener('click', (function(idx) { return function() { loadReport(idx); }; })(rows[i].index));
-    els.reportList.appendChild(row);
+  addLevelEntries([reportEntry], { persist: false });
+}
+
+function addLevelEntries(entries, options) {
+  options = options || {};
+  var shouldPersist = options.persist !== false;
+  var selectedKey = state.selectedEntryId ? entryKey(state.levelEntries.find(function(entry) { return entry.id === state.selectedEntryId; })) : '';
+  var byKey = new Map();
+  for (var i = 0; i < state.levelEntries.length; i++) {
+    var current = normalizeEntry(state.levelEntries[i]);
+    byKey.set(entryKey(current), current);
+  }
+  for (var j = 0; j < entries.length; j++) {
+    var normalized = normalizeEntry(entries[j]);
+    byKey.set(entryKey(normalized), normalized);
+  }
+  state.levelEntries = Array.from(byKey.values()).sort(function(a, b) {
+    return a.path.localeCompare(b.path, undefined, { sensitivity: 'base' });
+  });
+  if (selectedKey && !state.levelEntries.some(function(entry) { return entry.id === state.selectedEntryId; })) {
+    var replacement = state.levelEntries.find(function(entry) { return entryKey(entry) === selectedKey; });
+    if (replacement) state.selectedEntryId = replacement.id;
+  }
+  renderLevelList();
+  if (shouldPersist) {
+    persistStoredEntries().catch(function(error) {
+      console.warn('Unable to store level library:', error);
+      showError('The directory was read, but the browser could not remember it for the next refresh.', 'Storage unavailable');
+    });
   }
 }
 
-function loadReport(index) {
+function normalizeEntry(entry) {
+  var path = String(entry.path || entry.fileName || entry.name || 'level.lvl');
+  var displayFileName = entry.fileName || fileName(path) || ((entry.name || stem(path)) + '.lvl');
+  var source = sourceFromPath(path) || entry.source || 'Levels';
+  var normalized = {
+    name: entry.name || stem(displayFileName),
+    fileName: displayFileName,
+    path: path,
+    source: source,
+    content: String(entry.content || ''),
+    reportName: entry.reportName || '',
+    kind: entry.kind || (entry.reportName ? 'report' : 'level'),
+    persistent: entry.persistent !== false,
+  };
+  return Object.assign(normalized, { id: levelEntryId(normalized) });
+}
+
+function levelEntryId(entry) {
+  return 'level:' + entryKey(entry);
+}
+
+function entryKey(entry) {
+  if (!entry) return '';
+  var path = canonicalPath(entry.path || entry.fileName || entry.name);
+  var grouped = path.match(/(?:^|\/)(levels|complevels|complevels26)\/(.+\.lvl)$/);
+  if (grouped) return grouped[1] + '/' + grouped[2];
+  var source = normalizePathPart(entry.source || 'Levels');
+  return source + '/' + (path || normalizePathPart(entry.fileName || entry.name || 'level.lvl'));
+}
+
+function sourceFromPath(path) {
+  var grouped = canonicalPath(path).match(/(?:^|\/)(levels|complevels|complevels26)\/.+\.lvl$/);
+  return grouped ? grouped[1] : '';
+}
+
+function canonicalPath(path) {
+  return normalizePathPart(path).replace(/^\.\//, '');
+}
+
+function normalizePathPart(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/\/+/g, '/')
+    .replace(/^\/+|\/+$/g, '')
+    .toLowerCase();
+}
+
+function renderLevelList() {
+  var filtered = filteredLevelEntries();
+  var groups = groupedEntries(filtered);
+  syncOpenDirectorySource(groups);
+
+  els.levelList.innerHTML = '';
+  for (var i = 0; i < groups.length; i++) {
+    var group = groups[i];
+    var isOpen = group.source === state.openDirectorySource;
+    var card = document.createElement('section');
+    card.className = 'directoryCard' + (isOpen ? ' open' : ' collapsed');
+
+    var header = document.createElement('div');
+    header.className = 'directoryCardHeader';
+    var title = document.createElement('strong');
+    title.textContent = group.source;
+    var count = document.createElement('span');
+    count.textContent = group.entries.length + ' level' + (group.entries.length === 1 ? '' : 's');
+    var toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'directoryToggleBtn';
+    toggle.dataset.directorySource = group.source;
+    toggle.setAttribute('aria-expanded', String(isOpen));
+    toggle.title = isOpen ? 'Collapse directory' : 'Show directory';
+    toggle.textContent = isOpen ? 'v' : '>';
+    header.appendChild(title);
+    header.appendChild(count);
+    header.appendChild(toggle);
+
+    var rows = document.createElement('div');
+    rows.className = 'directoryLevels';
+    rows.hidden = !isOpen;
+    for (var j = 0; j < group.entries.length; j++) {
+      var entry = group.entries[j];
+      var row = document.createElement('div');
+      row.className = 'levelRow' + (entry.id === state.selectedEntryId ? ' active' : '');
+      row.title = entry.path;
+
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'levelRowMain';
+      button.dataset.entryId = entry.id;
+      var name = document.createElement('strong');
+      name.textContent = entry.fileName || fileName(entry.path) || (entry.name + '.lvl');
+      button.appendChild(name);
+
+      var deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'levelDeleteBtn';
+      deleteButton.dataset.entryDeleteId = entry.id;
+      deleteButton.title = 'Remove ' + name.textContent + ' from list';
+      deleteButton.setAttribute('aria-label', 'Remove ' + name.textContent + ' from list');
+      deleteButton.textContent = 'x';
+
+      row.appendChild(button);
+      row.appendChild(deleteButton);
+      rows.appendChild(row);
+    }
+
+    card.appendChild(header);
+    card.appendChild(rows);
+    els.levelList.appendChild(card);
+  }
+
+  if (state.levelEntries.length === 0) {
+    els.libraryInfo.textContent = 'Add a directory to list .lvl files here.';
+  } else if (filtered.length === 0) {
+    els.libraryInfo.textContent = 'No matches in ' + state.levelEntries.length + ' read levels.';
+  } else if (groups.length > 1) {
+    var openGroup = groups.find(function(group) { return group.source === state.openDirectorySource; });
+    els.libraryInfo.textContent = openGroup
+      ? filtered.length + '/' + state.levelEntries.length + ' matches. Showing ' + openGroup.source + '.'
+      : filtered.length + '/' + state.levelEntries.length + ' matches. All directories collapsed.';
+  } else {
+    els.libraryInfo.textContent = filtered.length + '/' + state.levelEntries.length + ' levels shown.';
+  }
+  updateLevelNavButtons(filtered);
+}
+
+function filteredLevelEntries() {
+  var query = normalizeText(els.levelSearchInput.value);
+  return state.levelEntries.filter(function(entry) { return levelMatchesQuery(entry, query); });
+}
+
+function levelMatchesQuery(entry, query) {
+  if (!query) return true;
+  return normalizeText(entry.name + ' ' + entry.path + ' ' + entry.source).indexOf(query) >= 0;
+}
+
+function groupedEntries(entries) {
+  var bySource = new Map();
+  for (var i = 0; i < entries.length; i++) {
+    var source = entries[i].source || 'Levels';
+    if (!bySource.has(source)) bySource.set(source, []);
+    bySource.get(source).push(entries[i]);
+  }
+  return Array.from(bySource.entries())
+    .sort(function(a, b) { return a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }); })
+    .map(function(item) {
+      return {
+        source: item[0],
+        entries: item[1].sort(function(a, b) {
+          return (a.fileName || a.path).localeCompare(b.fileName || b.path, undefined, { sensitivity: 'base' });
+        }),
+      };
+    });
+}
+
+function syncOpenDirectorySource(groups) {
+  if (groups.length === 0) {
+    state.openDirectorySource = null;
+    return;
+  }
+  if (state.openDirectorySource && groups.some(function(group) { return group.source === state.openDirectorySource; })) return;
+  if (!state.directoryAutoOpen) {
+    state.openDirectorySource = null;
+    return;
+  }
+  if (state.selectedEntryId) {
+    var selectedGroup = groups.find(function(group) {
+      return group.entries.some(function(entry) { return entry.id === state.selectedEntryId; });
+    });
+    if (selectedGroup) {
+      state.openDirectorySource = selectedGroup.source;
+      return;
+    }
+  }
+  state.openDirectorySource = groups[0].source;
+}
+
+function toggleDirectory(source) {
+  if (!source) return;
+  if (state.openDirectorySource === source) {
+    state.openDirectorySource = null;
+    state.directoryAutoOpen = false;
+  } else {
+    state.openDirectorySource = source;
+    state.directoryAutoOpen = true;
+  }
+  renderLevelList();
+}
+
+function updateLevelNavButtons(filtered) {
+  filtered = filtered || filteredLevelEntries();
+  var disabled = filtered.length <= 1;
+  els.prevLevelBtn.disabled = disabled;
+  els.nextLevelBtn.disabled = disabled;
+}
+
+function switchLevel(direction) {
+  var filtered = filteredLevelEntries();
+  if (filtered.length === 0) {
+    showError('No levels match the current filter.', 'No level to switch');
+    return;
+  }
+  var currentIndex = filtered.findIndex(function(entry) { return entry.id === state.selectedEntryId; });
+  var nextIndex = currentIndex < 0
+    ? (direction < 0 ? filtered.length - 1 : 0)
+    : (currentIndex + direction + filtered.length) % filtered.length;
+  loadEntry(filtered[nextIndex], filtered[nextIndex].content ? requestReportsDirFromUserGesture() : null);
+}
+
+function scrollActiveLevelIntoView() {
+  requestAnimationFrame(function() {
+    var active = els.levelList.querySelector('.levelRow.active');
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}
+
+function clearLevelLibrary() {
+  state.levelEntries = state.levelEntries.filter(function(entry) { return entry.kind === 'report'; });
+  state.selectedEntryId = null;
+  state.openDirectorySource = null;
+  state.directoryAutoOpen = true;
+  renderLevelList();
+  persistStoredEntries().catch(function(error) {
+    console.warn('Unable to clear stored level library:', error);
+  });
+}
+
+function deleteEntryById(entryId) {
+  var entry = state.levelEntries.find(function(item) { return item.id === entryId; });
+  if (!entry) {
+    showError('This level entry is no longer available.', 'Unable to delete level');
+    return;
+  }
+  var label = entry.fileName || fileName(entry.path) || entry.name || 'this level';
+  if (!window.confirm('Remove ' + label + ' from the level list?\n\nThis does not delete the .lvl file or report from disk.')) return;
+
+  var filteredBefore = filteredLevelEntries();
+  var deletedIndex = filteredBefore.findIndex(function(item) { return item.id === entryId; });
+  var wasSelected = state.selectedEntryId === entryId;
+  state.levelEntries = state.levelEntries.filter(function(item) { return item.id !== entryId; });
+  if (wasSelected) state.selectedEntryId = null;
+  if (!state.levelEntries.some(function(item) { return item.source === state.openDirectorySource; })) {
+    state.openDirectorySource = null;
+    state.directoryAutoOpen = true;
+  }
+
+  persistStoredEntries().catch(function(error) {
+    console.warn('Unable to store level library after deletion:', error);
+  });
+
+  if (wasSelected) {
+    var filteredAfter = filteredLevelEntries();
+    if (filteredAfter.length > 0) {
+      var nextIndex = deletedIndex < 0 ? 0 : Math.min(deletedIndex, filteredAfter.length - 1);
+      loadEntry(filteredAfter[nextIndex], filteredAfter[nextIndex].content ? requestReportsDirFromUserGesture() : null);
+    } else {
+      renderLevelList();
+    }
+  } else {
+    renderLevelList();
+  }
+}
+
+function loadReport(index, entryId) {
   state.activeIndex = index;
   var r = currentReport();
-  if (r) localStorage.setItem(STORAGE_KEY, r.name);
-  renderReportList(); renderMeta(); renderBoard(); resetView();
+  if (r) {
+    localStorage.setItem(STORAGE_KEY, r.name);
+    if (entryId) state.selectedEntryId = entryId;
+    else selectEntryForReport(r);
+  }
+  renderLevelList(); renderMeta(); renderBoard(); resetView();
+}
+
+function selectEntryForReport(report) {
+  var reportKey = entryKey(makeEntryFromReport(report));
+  var entry = state.levelEntries.find(function(item) { return entryKey(item) === reportKey; });
+  if (entry) {
+    state.selectedEntryId = entry.id;
+    state.openDirectorySource = entry.source || state.openDirectorySource;
+    state.directoryAutoOpen = true;
+  }
 }
 
 function renderMeta() {
@@ -195,19 +596,168 @@ function cacheBust(path) {
 
 // ---- .lvl loading + in-browser analysis ----
 
-async function loadLvlFile(file) {
+async function loadSingleFile(file, reportsDirPromise) {
   try {
     var text = await file.text();
-    var level = parseLvl(text, file.name.replace(/\.lvl$/i, ''));
-    var report = analyzeLevel(level);
-    state.activeIndex = upsertReport(report, true);
-    localStorage.setItem(STORAGE_KEY, report.name);
-    renderReportList(); renderMeta(); renderBoard(); resetView();
-    await saveReportToDir(report);
+    var entry = makeEntryFromFile(file, text, 'File');
+    addLevelEntries([entry]);
+    await loadEntry(entry, reportsDirPromise);
   } catch (err) {
-    els.meta.innerHTML = '<b>Error:</b> ' + escapeHtml(err.message || String(err));
+    showError(errorMessage(err), 'Unable to load level');
     console.error(err);
   }
+}
+
+async function loadDirectoryFiles(files, sourceLabel, reportsDirPromise) {
+  try {
+    var entries = await Promise.all(files.map(async function(file) {
+      var text = await file.text();
+      return makeEntryFromFile(file, text, sourceLabel || directoryRootName(file) || 'Directory');
+    }));
+    addLevelEntries(entries);
+    if (entries.length > 0) {
+      await loadEntry(entries[0], reportsDirPromise);
+      showNotice(entries.length + ' .lvl files added to the level list.', 'Directory read');
+    }
+  } catch (err) {
+    showError(errorMessage(err), 'Unable to load directory');
+    console.error(err);
+  }
+}
+
+async function loadEntryById(entryId, reportsDirPromise) {
+  var entry = state.levelEntries.find(function(item) { return item.id === entryId; });
+  if (!entry) {
+    showError('This level entry is no longer available. Read the directory again.', 'Unable to read level');
+    return;
+  }
+  await loadEntry(entry, reportsDirPromise);
+}
+
+async function loadEntry(entry, reportsDirPromise) {
+  var normalized = normalizeEntry(entry);
+  if (!normalized.content.trim()) {
+    var reportIndex = state.reports.findIndex(function(report) { return report.name === normalized.reportName; });
+    if (reportIndex >= 0) {
+      loadReport(reportIndex, normalized.id);
+    } else {
+      showError((normalized.fileName || normalized.name) + ' has no readable .lvl content. Read the file or directory again.', 'Unable to read level');
+    }
+    return;
+  }
+
+  try {
+    var level = parseLvl(normalized.content, normalized.path);
+    var report = analyzeLevel(level);
+    report.path = normalized.path;
+    report.source = normalized.source;
+    state.selectedEntryId = normalized.id;
+    state.openDirectorySource = normalized.source || state.openDirectorySource;
+    state.directoryAutoOpen = true;
+    state.activeIndex = upsertReport(report, true);
+    localStorage.setItem(STORAGE_KEY, report.name);
+    syncReportEntry(report);
+    renderLevelList(); renderMeta(); renderBoard(); resetView(); scrollActiveLevelIntoView();
+    await saveReportToDir(report, reportsDirPromise);
+  } catch (err) {
+    showError(errorMessage(err), 'Unable to compute parking risk');
+    console.error(err);
+  }
+}
+
+async function restoreStoredEntries() {
+  try {
+    var entries = await readStoredEntries();
+    if (entries.length > 0) addLevelEntries(entries, { persist: false });
+  } catch (error) {
+    console.warn('Unable to restore level library:', error);
+  }
+}
+
+async function persistStoredEntries() {
+  var entries = state.levelEntries
+    .filter(function(entry) { return entry.persistent !== false && entry.content; })
+    .map(function(entry) {
+      return {
+        id: entry.id,
+        name: entry.name,
+        fileName: entry.fileName,
+        path: entry.path,
+        source: entry.source,
+        content: entry.content,
+        persistent: true,
+        kind: 'level',
+        reportName: entry.reportName || '',
+      };
+    });
+
+  var record = { entries: entries, savedAt: new Date().toISOString() };
+  try {
+    await writeStoredEntriesToIndexedDb(record);
+  } catch (error) {
+    if (!localStorageAvailable()) throw error;
+    localStorage.setItem(LEVEL_LIBRARY_LOCAL_STORAGE_KEY, JSON.stringify(record));
+  }
+}
+
+async function readStoredEntries() {
+  try {
+    var record = await readStoredEntriesFromIndexedDb();
+    if (Array.isArray(record && record.entries)) return record.entries.map(normalizeEntry);
+  } catch (error) {
+    console.warn('IndexedDB level library unavailable:', error);
+  }
+
+  if (!localStorageAvailable()) return [];
+  var raw = localStorage.getItem(LEVEL_LIBRARY_LOCAL_STORAGE_KEY);
+  if (!raw) return [];
+  var record = JSON.parse(raw);
+  return Array.isArray(record && record.entries) ? record.entries.map(normalizeEntry) : [];
+}
+
+function openParkingRiskDB() {
+  return new Promise(function(resolve, reject) {
+    if (!('indexedDB' in window)) {
+      reject(new Error('IndexedDB is not available.'));
+      return;
+    }
+    var req = indexedDB.open(PARKING_RISK_DB_NAME, PARKING_RISK_DB_VERSION);
+    req.onupgradeneeded = function() {
+      var db = req.result;
+      if (!db.objectStoreNames.contains(HANDLE_STORE_NAME)) db.createObjectStore(HANDLE_STORE_NAME);
+      if (!db.objectStoreNames.contains(VIEWER_STORE_NAME)) db.createObjectStore(VIEWER_STORE_NAME);
+    };
+    req.onsuccess = function() { resolve(req.result); };
+    req.onerror = function() { reject(req.error || new Error('Unable to open parking-risk storage.')); };
+  });
+}
+
+async function writeStoredEntriesToIndexedDb(record) {
+  var db = await openParkingRiskDB();
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(VIEWER_STORE_NAME, 'readwrite');
+    tx.objectStore(VIEWER_STORE_NAME).put(record, LEVEL_LIBRARY_KEY);
+    tx.oncomplete = function() { db.close(); resolve(); };
+    tx.onerror = function() {
+      db.close();
+      reject(tx.error || new Error('Unable to store level library.'));
+    };
+  });
+}
+
+async function readStoredEntriesFromIndexedDb() {
+  var db = await openParkingRiskDB();
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(VIEWER_STORE_NAME, 'readonly');
+    var request = tx.objectStore(VIEWER_STORE_NAME).get(LEVEL_LIBRARY_KEY);
+    request.onsuccess = function() { resolve(request.result || null); };
+    request.onerror = function() { reject(request.error || new Error('Unable to read level library.')); };
+    tx.oncomplete = function() { db.close(); };
+    tx.onerror = function() {
+      db.close();
+      reject(tx.error || new Error('Unable to read level library.'));
+    };
+  });
 }
 
 // ---- Scan reports/ directory for saved files ----
@@ -254,12 +804,13 @@ async function scanReportsDir() {
         if (!match) continue;
         var report = JSON.parse(match[1]);
         upsertReport(report, false);
+        syncReportEntry(report);
       } catch (_) { /* skip unreadable files */ }
     }
   } catch (_) { /* dir not accessible */ }
 }
 
-// ---- File System Access API — save directly to reports/ ----
+// ---- File System Access API - save directly to reports/ ----
 
 // Load the auto-updated manifest from reports/ if present.
 // The reports/ copy is updated automatically when a new report is saved via the viewer.
@@ -304,6 +855,7 @@ function loadManifestReports() {
       script.onload = function() {
         var report = window.__PARKING_RISK_REPORT__;
         upsertReport(report, false);
+        syncReportEntry(report);
         window.__PARKING_RISK_REPORT__ = undefined;
         document.head.removeChild(script);
         loadNext(idx + 1).then(resolve);
@@ -321,19 +873,31 @@ function loadManifestReports() {
 async function resolveReportsDirHandle(handle, createIfMissing) {
   if (!handle || handle.kind !== 'directory') return null;
   if (handle.name === 'reports') return handle;
-  try {
-    return await handle.getDirectoryHandle('reports', { create: false });
-  } catch (_) {}
+  if (await isParkingRiskToolDir(handle)) {
+    try {
+      return await handle.getDirectoryHandle('reports', { create: Boolean(createIfMissing) });
+    } catch (_) {
+      return null;
+    }
+  }
   try {
     var parkingRisk = await handle.getDirectoryHandle('parking-risk', { create: false });
-    return await parkingRisk.getDirectoryHandle('reports', { create: false });
+    if (await isParkingRiskToolDir(parkingRisk)) {
+      return await parkingRisk.getDirectoryHandle('reports', { create: Boolean(createIfMissing) });
+    }
   } catch (_) {}
-  if (createIfMissing && handle.name === 'parking-risk') {
-    try {
-      return await handle.getDirectoryHandle('reports', { create: true });
-    } catch (_) {}
-  }
   return null;
+}
+
+async function isParkingRiskToolDir(handle) {
+  if (!handle || handle.kind !== 'directory' || handle.name !== 'parking-risk') return false;
+  try {
+    await handle.getFileHandle('viewer.js', { create: false });
+    await handle.getFileHandle('index.html', { create: false });
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function getReportsDir() {
@@ -350,35 +914,39 @@ async function getReportsDir() {
       }
     }
   } catch (_) {}
-  if (typeof window.showDirectoryPicker !== 'function') return null;
+  return null;
+}
+
+function requestReportsDirFromUserGesture() {
+  if (state.dirHandle) return Promise.resolve(state.dirHandle);
+  if (typeof window.showDirectoryPicker !== 'function') return Promise.resolve(null);
   try {
-    window.alert('Select the reports folder, or select the parking-risk folder that contains reports.');
-    var handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'parking-risk-reports' });
-    var reportsDir = await resolveReportsDirHandle(handle, true);
-    if (!reportsDir) {
-      window.alert('That folder is not reports and does not contain a reports folder. The report will be downloaded instead.');
-      return null;
-    }
-    state.dirHandle = reportsDir;
-    await writeDirHandleToDB(reportsDir);
-    return reportsDir;
-  } catch (_) { return null; }
+    return window.showDirectoryPicker({ mode: 'readwrite', id: 'parking-risk-tool-reports' })
+      .then(async function(handle) {
+        var reportsDir = await resolveReportsDirHandle(handle, true);
+        if (!reportsDir) {
+          window.alert('Select tools/parking-risk, or select tools/parking-risk/reports. The report was not saved.');
+          return null;
+        }
+        state.dirHandle = reportsDir;
+        await writeDirHandleToDB(reportsDir);
+        return reportsDir;
+      })
+      .catch(function() { return null; });
+  } catch (_) {
+    return Promise.resolve(null);
+  }
 }
 
 function dirHandleDB() {
-  return new Promise(function(resolve, reject) {
-    var req = indexedDB.open('parking-risk', 1);
-    req.onupgradeneeded = function() { req.result.createObjectStore('handles'); };
-    req.onsuccess = function() { resolve(req.result); };
-    req.onerror = function() { reject(req.error); };
-  });
+  return openParkingRiskDB();
 }
 
 async function readDirHandleFromDB() {
   var db = await dirHandleDB();
   return new Promise(function(resolve, reject) {
-    var tx = db.transaction('handles', 'readonly');
-    var req = tx.objectStore('handles').get(DIR_HANDLE_KEY);
+    var tx = db.transaction(HANDLE_STORE_NAME, 'readonly');
+    var req = tx.objectStore(HANDLE_STORE_NAME).get(DIR_HANDLE_KEY);
     req.onsuccess = function() { resolve(req.result); };
     req.onerror = function() { reject(req.error); };
     tx.oncomplete = function() { db.close(); };
@@ -388,20 +956,21 @@ async function readDirHandleFromDB() {
 async function writeDirHandleToDB(handle) {
   var db = await dirHandleDB();
   return new Promise(function(resolve, reject) {
-    var tx = db.transaction('handles', 'readwrite');
-    tx.objectStore('handles').put(handle, DIR_HANDLE_KEY);
+    var tx = db.transaction(HANDLE_STORE_NAME, 'readwrite');
+    tx.objectStore(HANDLE_STORE_NAME).put(handle, DIR_HANDLE_KEY);
     tx.oncomplete = function() { db.close(); resolve(); };
     tx.onerror = function() { reject(tx.error); };
   });
 }
 
-async function saveReportToDir(report) {
+async function saveReportToDir(report, reportsDirPromise) {
   var name = report.name || 'unknown';
-  var filename = 'parking-risk-' + name + '.js';
+  var filename = 'parking-risk-' + safeFileStem(name) + '.js';
   var payload = JSON.stringify(report, null, 2);
-  var content = '// parking-risk report — auto-generated\n// level: ' + name + '\nwindow.__PARKING_RISK_REPORT__ = ' + payload + ';\n';
+  var content = '// parking-risk report - auto-generated\n// level: ' + name + '\nwindow.__PARKING_RISK_REPORT__ = ' + payload + ';\n';
 
-  var dir = await getReportsDir();
+  var dir = reportsDirPromise ? await reportsDirPromise : await getReportsDir();
+  if (!dir) dir = await getReportsDir();
   if (dir) {
     try {
       var fileHandle = await dir.getFileHandle(filename, { create: true });
@@ -422,17 +991,16 @@ async function saveReportToDir(report) {
       } catch (_) {}
 
       appendMetaLine('Saved to reports/' + filename);
+      showNotice('Saved to tools/parking-risk/reports/' + filename, 'Report saved');
       return;
-    } catch (_) { state.dirHandle = null; }
+    } catch (err) {
+      state.dirHandle = null;
+      console.warn('Unable to save report:', err);
+      showError('The report was computed, but the viewer could not write to tools/parking-risk/reports. Select the parking-risk folder again on the next save.', 'Report not saved');
+    }
   }
-  // Fallback download
-  var blob = new Blob([content], { type: 'application/javascript' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
-  appendMetaLine('Could not write to reports; downloaded ' + filename + ' instead.');
+  showError('Grant access to tools/parking-risk or tools/parking-risk/reports to write this report locally.', 'Report not saved');
+  appendMetaLine('Report not saved. Grant access to tools/parking-risk or tools/parking-risk/reports to write reports/' + filename + '.');
 }
 
 function appendMetaLine(text) {
@@ -441,9 +1009,10 @@ function appendMetaLine(text) {
 
 // ---- .lvl parser ----
 
-function parseLvl(text, fallbackName) {
+function parseLvl(text, sourcePath) {
+  var fallbackPath = sourcePath || 'level.lvl';
   var lines = text.split(/\r?\n/);
-  var section = null, levelName = fallbackName;
+  var section = null, levelName = stem(fallbackPath);
   var colorLines = [], initialLines = [], goalLines = [];
 
   for (var i = 0; i < lines.length; i++) {
@@ -500,7 +1069,7 @@ function parseLvl(text, fallbackName) {
   }
 
   return {
-    name: levelName, path: fallbackName + '.lvl', rows: rows, cols: cols,
+    name: levelName, path: fallbackPath, rows: rows, cols: cols,
     walls: wallList, agents: agents, boxes: boxes, agentGoals: agentGoals, boxGoals: boxGoals,
     goalCells: goalList, immovableBoxes: immovableList, agentColors: agentColors, boxColors: boxColors,
     _sets: { walls: walls, goals: goalCells, immovable: immovable, boxes: boxSet, agents: agentSet },
@@ -795,3 +1364,83 @@ function posSet(items) { return new Set(items.map(function(p) { return key(p.r, 
 function key(r, c) { return r + ',' + c; }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, function(ch) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]; }); }
+function errorMessage(error) { return error && error.message ? error.message : String(error || 'Unknown error.'); }
+
+function showError(message, title) {
+  showNotification(message, title || 'Something needs attention', 0);
+}
+
+function showNotice(message, title) {
+  showNotification(message, title || 'Done', 2000);
+}
+
+function showNotification(message, title, timeoutMs) {
+  if (!els.notificationToast) return;
+  if (notificationTimer) window.clearTimeout(notificationTimer);
+  notificationTimer = null;
+  els.notificationTitle.textContent = title;
+  els.notificationMessage.textContent = message;
+  els.notificationToast.hidden = false;
+  if (timeoutMs) notificationTimer = window.setTimeout(clearNotification, timeoutMs);
+}
+
+function clearNotification() {
+  if (!els.notificationToast) return;
+  if (notificationTimer) window.clearTimeout(notificationTimer);
+  notificationTimer = null;
+  els.notificationToast.hidden = true;
+  els.notificationTitle.textContent = 'Something needs attention';
+  els.notificationMessage.textContent = '';
+}
+
+function localStorageAvailable() {
+  try {
+    var keyName = 'parking-risk:storage-test';
+    localStorage.setItem(keyName, '1');
+    localStorage.removeItem(keyName);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function directoryRootName(file) {
+  var path = file.webkitRelativePath || '';
+  var parts = path.split('/');
+  return parts[0] || '';
+}
+
+function isLevelFile(file) {
+  return Boolean(file && file.name && file.name.toLowerCase().endsWith('.lvl'));
+}
+
+function stem(path) {
+  var f = fileName(path);
+  return f.replace(/\.[^.]+$/, '') || f || 'Level';
+}
+
+function fileName(path) {
+  return String(path || '').split(/[\\/]/).pop() || '';
+}
+
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function closestElement(target, selector) {
+  var node = target;
+  while (node && node !== document) {
+    if (node instanceof Element && node.matches && node.matches(selector)) return node;
+    node = node.parentElement || node.parentNode;
+  }
+  return null;
+}
+
+function safeFileStem(value) {
+  var stemValue = String(value || 'unknown')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return stemValue || 'unknown';
+}
